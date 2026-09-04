@@ -20,6 +20,8 @@ For some example applications and tools that use MLX Swift LM, check out [MLX Sw
 
 ## Documentation
 
+- [FMLXText: model-specific tokenizer and native runtime pairing](docs/checkpoint-text.md)
+
 Developers can use these examples in their own programs -- just import the swift package!
 
 - [Porting and implementing models](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/porting)

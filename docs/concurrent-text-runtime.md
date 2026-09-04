@@ -51,7 +51,10 @@ for try await event in generation.events {
 }
 ```
 
-The caller owns tokenization, chat templates, stop IDs and detokenization.
+Raw callers own tokenization, chat templates, stop IDs and detokenization.
+The owned [FMLXText product](checkpoint-text.md) supplies checkpoint-specific text
+processing and a paired native loader without putting tokenizer policy inside
+the scheduler or requiring Mirage/Bright Eyes to implement it themselves.
 `Request.speculative` defaults to true when a compatible drafter is configured.
 Capabilities and execution/fallback events disclose the selected path. Nonzero
 temperature and quantized target KV use ordinary decoding. MTP prefix reuse is

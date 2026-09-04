@@ -13,6 +13,7 @@ let package = Package(
         .visionOS(.v1),
     ],
     products: [
+        .library(name: "FMLXText", targets: ["FMLXText"]),
         .library(
             name: "MLXLLM",
             targets: ["MLXLLM"]),
@@ -61,6 +62,7 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
+        .package(url: "https://github.com/DePasqualeOrg/swift-tokenizers.git", exact: "0.7.3"),
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.6")),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
@@ -68,6 +70,21 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "602.0.0" ..< "604.0.0"),
     ],
     targets: [
+        .target(
+            name: "FMLXText",
+            dependencies: [
+                "MLXLLM", "MLXLMCommon",
+                .product(name: "Tokenizers", package: "swift-tokenizers"),
+            ],
+            path: "Libraries/FMLXText"
+        ),
+        .testTarget(
+            name: "FMLXTextTests",
+            dependencies: [
+                "FMLXText", "MLXLMCommon", "MLXLLM", .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Tests/FMLXTextTests"
+        ),
         .target(
             name: "MLXLLM",
             dependencies: [

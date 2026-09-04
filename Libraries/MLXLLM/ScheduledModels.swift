@@ -51,8 +51,8 @@ extension Qwen35Model: ScheduledTextModel {
     }
 }
 
-/// Local-only loader for the runtime's audited text architectures. Tokenizer loading stays
-/// with the existing TokenizerLoader integrations; this never downloads a checkpoint.
+/// Local-only weight loader for the runtime's audited text architectures. FMLXText's
+/// NativeTextModel pairs it with checkpoint-specific tokenization. Neither downloads assets.
 public enum NativeTextModelLoader {
     /// Loads a standalone, preconverted MLX Qwen MTP head; the caller supplies its matching target.
     public static func loadMTP(directory: URL) async throws -> sending Qwen35MTPDraftModel {
