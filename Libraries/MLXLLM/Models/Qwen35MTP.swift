@@ -65,7 +65,12 @@ final class Qwen35MTPPredictor: Module {
     }
 }
 
-public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
+public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel {
+    public var targetArchitectureID: String { "qwen3_5:\(configuration.hiddenSize)" }
+    public var cacheBytesPerToken: Int {
+        max(configuration.mtpNumHiddenLayers, 1) * configuration.kvHeads
+            * (configuration.headDim ?? configuration.hiddenSize / configuration.attentionHeads) * 8
+    }
     public let configuration: Qwen35TextConfiguration
     public let maximumBlockSize: Int? = 2
     public let requiresSharedTargetKV = false
@@ -94,6 +99,25 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
 
     public func makeState(parameters: GenerateParameters?) -> MTPDrafterState {
         MTPDrafterState(cache: mtp.newCache())
+    }
+
+    public func prepareDrafterChunk(
+        target: any LanguageModel, shiftedTokens: MLXArray, targetHidden: MLXArray,
+        isFinal: Bool, state: inout MTPDrafterState, sampler: any LogitSampler
+    ) {
+        let (targetEmbedTokens, lmHead) = targetEmbeddingAndHead(target)
+        let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
+        let hidden = mtp(
+            inputsEmbeds: inputEmbedding(shiftedTokens), hiddenStates: targetHidden,
+            cache: state.cache, positionOffset: state.nextPosition)
+        state.nextPosition += shiftedTokens.dim(1)
+        if isFinal {
+            state.seedHidden = hidden[0..., (-1)..., 0...]
+            state.seedToken = sampleMTPSeed(
+                hidden: state.seedHidden!,
+                targetEmbedTokens: targetEmbedTokens, lmHead: lmHead, sampler: sampler)
+        }
+        eval([hidden] + state.cache.flatMap { $0.innerState() })
     }
 
     public func prepareDrafterState(

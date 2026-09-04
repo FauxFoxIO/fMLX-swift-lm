@@ -112,6 +112,27 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         blockSize: Int,
         components: GenerationComponents = .init()
     ) throws {
+        try self.init(
+            input: input, mainModel: mainModel, drafter: drafter, mainCache: mainCache,
+            parameters: parameters, blockSize: blockSize, components: components, scheduled: false)
+    }
+
+    package init(
+        scheduledPrompt: [Int], mainModel: any LanguageModel,
+        drafter: any IncrementalMTPDrafterModel, mainCache: [KVCache],
+        parameters: GenerateParameters, blockSize: Int
+    ) throws {
+        try self.init(
+            input: LMInput(tokens: MLXArray(scheduledPrompt)), mainModel: mainModel,
+            drafter: drafter, mainCache: mainCache, parameters: parameters,
+            blockSize: blockSize, components: .init(), scheduled: true)
+    }
+
+    private init(
+        input: LMInput, mainModel: any LanguageModel, drafter: any MTPDrafterModel,
+        mainCache: [KVCache]?, parameters: GenerateParameters, blockSize: Int,
+        components: GenerationComponents, scheduled: Bool
+    ) throws {
         precondition(
             blockSize >= 2,
             "MTPSpeculativeTokenIterator requires blockSize >= 2 (1 bonus + K-1 drafted)")
@@ -165,6 +186,13 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             self.mainCacheStorage.rollback(probe)
         }
 
+        if scheduled {
+            guard !drafter.requiresGreedySampling || parameters.temperature == 0 else {
+                throw KVCacheError(message: "Scheduled Qwen MTP requires greedy sampling")
+            }
+            processor?.prompt(input.text.tokens)
+            return
+        }
         let prefillStart = Date.timeIntervalSinceReferenceDate
         var mtpPrefill = parameters.prefill
         if drafter.requiresPromptPrefill {
@@ -184,6 +212,55 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                     "Qwen MTP currently requires temperature == 0; generating without speculation"
             )
         }
+    }
+
+    /// Advances target and shifted-prompt drafter caches together without retaining full prompt hidden states.
+    package mutating func prepareScheduledChunk(_ tokens: [Int], nextPromptToken: Int?) throws {
+        guard let drafter = drafter as? any IncrementalMTPDrafterModel,
+            var draftState = drafterState
+        else {
+            throw KVCacheError(message: "Drafter does not support incremental prompt preparation")
+        }
+        let input = MLXArray(tokens).expandedDimensions(axis: 0)
+        var incoming = LMOutput.State()
+        incoming[mtpEmitFlagKey] = true
+        let result = mainModel(.init(tokens: input), cache: mainCache, state: incoming)
+        mainCacheStorage.commitProcessedTokens(tokens.count)
+        guard let hidden = result.state?[mtpLastHiddenStatesKey] else {
+            throw KVCacheError(message: "Target did not emit incremental MTP hidden states")
+        }
+        mainState = result.state
+        let shiftedTail: Int
+        if let nextPromptToken {
+            shiftedTail = nextPromptToken
+        } else {
+            var logits = result.logits[0..., -1, 0...]
+            logits = processor?.process(logits: logits) ?? logits
+            let token = sampler.sample(logits: logits)
+            processor?.didSample(token: token)
+            y = .init(tokens: token)
+            shiftedTail = token.item(Int.self)
+            pendingTokens.append(shiftedTail)
+        }
+        let shifted = MLXArray(Array(tokens.dropFirst()) + [shiftedTail]).expandedDimensions(
+            axis: 0)
+        drafter.prepareDrafterChunk(
+            target: mainModel, shiftedTokens: shifted,
+            targetHidden: hidden, isFinal: nextPromptToken == nil,
+            state: &draftState, sampler: sampler)
+        drafterState = draftState
+        eval(
+            [result.logits] + mainCache.flatMap { $0.innerState() }
+                + draftState.cache.flatMap { $0.innerState() })
+    }
+
+    package var scheduledResidentArrays: [MLXArray] {
+        mainCache.flatMap { $0.innerState() }
+            + (drafterState?.cache.flatMap { $0.innerState() } ?? [])
+            + [
+                drafterState?.seedHidden, drafterState?.seedToken,
+                mainState?[mtpLastHiddenStatesKey],
+            ].compactMap { $0 }
     }
 
     static let missingSharedKVSourcesReason =

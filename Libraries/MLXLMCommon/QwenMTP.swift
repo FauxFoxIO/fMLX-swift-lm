@@ -11,6 +11,19 @@ package func qwenMTPSanitizeWeights(
     shiftNormWeights: Bool
 ) -> [String: MLXArray] {
     var sanitized = weights.filter { key, _ in key.hasPrefix("mtp.") }
+    // Standalone MLX heads save the MTP module without its outer namespace.
+    if sanitized.isEmpty, weights["fc.weight"] != nil,
+        weights["pre_fc_norm_hidden.weight"] != nil
+    {
+        let roots = [
+            "fc.", "layers.", "norm.", "pre_fc_norm_embedding.", "pre_fc_norm_hidden.",
+            "embed_tokens.",
+        ]
+        sanitized = Dictionary(
+            uniqueKeysWithValues: weights.compactMap { key, value in
+                roots.contains(where: { key.hasPrefix($0) }) ? ("mtp." + key, value) : nil
+            })
+    }
 
     for layer in 0 ..< max(mtpNumHiddenLayers, 1) {
         let prefix = "mtp.layers.\(layer).mlp"

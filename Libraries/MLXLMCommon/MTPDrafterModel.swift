@@ -183,6 +183,15 @@ public protocol StatefulMTPDrafterModel: MTPDrafterModel {
     )
 }
 
+/// A stateful drafter whose prompt preparation can advance at scheduler boundaries.
+public protocol IncrementalMTPDrafterModel: StatefulMTPDrafterModel {
+    var targetArchitectureID: String { get }
+    var cacheBytesPerToken: Int { get }
+    func prepareDrafterChunk(
+        target: any LanguageModel, shiftedTokens: MLXArray, targetHidden: MLXArray,
+        isFinal: Bool, state: inout MTPDrafterState, sampler: any LogitSampler)
+}
+
 extension StatefulMTPDrafterModel {
     public func prepareDrafterState(
         target _: any LanguageModel,

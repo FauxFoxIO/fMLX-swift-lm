@@ -71,6 +71,28 @@ func testQwen35StandaloneMTPDoesNotDoubleShiftConvertedNorms() throws {
 }
 
 @Test
+func testQwen35StandaloneBareMTPNamesPreserveConvertedNorms() throws {
+    let cfg = try JSONDecoder().decode(
+        MLXLLM.Qwen35TextConfiguration.self,
+        from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+    let drafter = MLXLLM.Qwen35MTPDraftModel(cfg, preconvertedNorms: true)
+    let weights = [
+        "fc.weight": MLXArray.zeros([16, 32]),
+        "pre_fc_norm_hidden.weight": MLXArray.ones([16]),
+        "norm.weight": MLXArray.ones([16]),
+        "layers.0.self_attn.q_proj.scales": MLXArray.ones([32, 1]),
+        "model.embed_tokens.weight": MLXArray.zeros([16, 16]),
+    ]
+    let sanitized = drafter.sanitize(weights: weights)
+    #expect(sanitized.count == 4)
+    #expect(sanitized["mtp.fc.weight"]?.shape == [16, 32])
+    #expect(sanitized["mtp.layers.0.self_attn.q_proj.scales"] != nil)
+    #expect(
+        try #require(sanitized["mtp.norm.weight"]).asArray(Float.self)
+            == Array(repeating: 1, count: 16))
+}
+
+@Test
 func testQwen35MTPDraftSanitizeStacksPerExpertMoEWeights() throws {
     let cfg = try JSONDecoder().decode(
         MLXLLM.Qwen35TextConfiguration.self,
@@ -113,6 +135,37 @@ func testQwen35MTPDraftInstantiatesDedicatedEmbeddingWhenConfigured() throws {
 
 @Suite(.serialized)
 struct Qwen35MTPMetalTests {
+    @Test
+    func testScheduledMTPChunkedPrefillMatchesReferenceAndGreedy() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let target = withRandomState(MLXRandom.RandomState(seed: 112)) {
+            MLXLLM.Qwen35TextModel(cfg)
+        }
+        let drafter = withRandomState(MLXRandom.RandomState(seed: 113)) {
+            MLXLLM.Qwen35MTPDraftModel(cfg)
+        }
+        let prompt = [1, 2, 3, 4, 5]
+        let parameters = GenerateParameters(maxTokens: 12, temperature: 0)
+        var reference = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray(prompt)), mainModel: target, drafter: drafter,
+            parameters: parameters, blockSize: 2)
+        let expected = Array(reference)
+        var chunked = try MTPSpeculativeTokenIterator(
+            scheduledPrompt: prompt,
+            mainModel: target, drafter: drafter, mainCache: target.newCache(parameters: nil),
+            parameters: parameters, blockSize: 2)
+        try chunked.prepareScheduledChunk([1, 2], nextPromptToken: 3)
+        try chunked.prepareScheduledChunk([3, 4], nextPromptToken: 5)
+        try chunked.prepareScheduledChunk([5], nextPromptToken: nil)
+        #expect(Array(chunked) == expected)
+        var greedy = try TokenIterator(
+            input: LMInput(tokens: MLXArray(prompt)),
+            model: target, parameters: parameters)
+        #expect(Array(greedy) == expected)
+    }
+
     @Test
     func testQwen35MTPPredictorAdvancesEveryLayerCachePerToken() throws {
         let cfg = try JSONDecoder().decode(

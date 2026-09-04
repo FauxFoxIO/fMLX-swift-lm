@@ -150,10 +150,19 @@ public class LlamaModelInner: Module {
 }
 
 /// Model for Llama and Mistral model types.
-public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
+public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider, ScheduledTextModel {
 
     public let vocabularySize: Int
     public let kvHeads: [Int]
+
+    public var scheduledCacheBytesPerToken: Int {
+        configuration.hiddenLayers * configuration.kvHeads * configuration.resolvedHeadDimensions
+            * 8
+    }
+
+    public func scheduledForward(_ tokens: MLXArray, cache: [KVCache]) throws -> MLXArray {
+        callAsFunction(tokens, cache: cache)
+    }
 
     public let model: LlamaModelInner
 
