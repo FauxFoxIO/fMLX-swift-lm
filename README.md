@@ -103,6 +103,9 @@ print(try await session.respond(to: "How about a great place to eat?"))
 
 For alternative integration approaches (custom downloaders, alternative tokenizer packages, local-only weights), see the [using documentation](Libraries/MLXLMCommon/Documentation.docc/using.md).
 
+Applications that need an in-process installed-model catalog, resumable downloads, and persistent
+cache management can use [`FMLXModelManagement`](docs/model-management.md).
+
 ## `FoundationModels` integration
 
 `MLXFoundationModels` is a bridge between MLX models and Apple's `FoundationModels` framework: build an `MLXLanguageModel`, pass it to `LanguageModelSession`, and generate through the standard `FoundationModels` API. Requires the macOS/iOS/visionOS 27.0 SDK.
