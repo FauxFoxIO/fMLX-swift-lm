@@ -69,6 +69,23 @@ public enum NativeTextModelLoader {
         return model
     }
 
+    /// Loads the MTP head embedded in a Qwen 3.5-family target checkpoint.
+    /// Returns `nil` when the checkpoint does not declare an embedded head.
+    public static func loadEmbeddedMTP(directory: URL) async throws
+        -> sending Qwen35MTPDraftModel?
+    {
+        let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
+        let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
+        guard ["qwen3_5", "qwen3_5_moe"].contains(base.modelType) else { return nil }
+        let configuration = try JSONDecoder().decode(Qwen35Configuration.self, from: data)
+        guard configuration.textConfig.mtpNumHiddenLayers > 0 else { return nil }
+        let model = Qwen35MTPDraftModel(configuration, preconvertedNorms: true)
+        try await loadWeights(
+            modelDirectory: directory, model: model,
+            perLayerQuantization: base.perLayerQuantization)
+        return model
+    }
+
     public static func load(directory: URL) async throws -> sending any ScheduledTextModel {
         let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
         let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)

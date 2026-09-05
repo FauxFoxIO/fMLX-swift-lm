@@ -22,6 +22,7 @@ public struct NativeTextModel: Sendable {
         let text = try await CheckpointTextProcessor.load(
             directory: directory, extraEOSTokens: extraEOSTokens)
         let model = try await NativeTextModelLoader.load(directory: directory)
+        let drafter = try await NativeTextModelLoader.loadEmbeddedMTP(directory: directory)
         try Task.checkCancellation()
         try text.verifyAssets(directory: directory)
         guard model.vocabularySize == text.vocabularySize else {
@@ -36,7 +37,7 @@ public struct NativeTextModel: Sendable {
             forTokenizerDirectory: directory, modelFormat: model.toolCallFormat)
         let reasoningConfig = model.reasoningConfig
         let runtime = try ConcurrentTextRuntime(
-            model: model, identity: identity, configuration: configuration)
+            model: model, identity: identity, configuration: configuration, drafter: drafter)
         return Self(
             text: text, runtime: runtime, cacheIdentity: identity,
             toolCallFormat: toolCallFormat, reasoningConfig: reasoningConfig,

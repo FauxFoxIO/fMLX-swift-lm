@@ -14,6 +14,7 @@ let package = Package(
     ],
     products: [
         .library(name: "FMLXText", targets: ["FMLXText"]),
+        .library(name: "FMLXModelManagement", targets: ["FMLXModelManagement"]),
         .library(
             name: "MLXLLM",
             targets: ["MLXLLM"]),
@@ -70,6 +71,15 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "602.0.0" ..< "604.0.0"),
     ],
     targets: [
+        .target(
+            name: "FMLXModelManagement",
+            path: "Libraries/FMLXModelManagement"
+        ),
+        .testTarget(
+            name: "FMLXModelManagementTests",
+            dependencies: ["FMLXModelManagement"],
+            path: "Tests/FMLXModelManagementTests"
+        ),
         .target(
             name: "FMLXText",
             dependencies: [
