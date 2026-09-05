@@ -65,7 +65,9 @@ final class Qwen35MTPPredictor: Module {
     }
 }
 
-public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel {
+public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel,
+    ScheduledMTPPrefixCachingDrafter
+{
     public var targetArchitectureID: String { "qwen3_5:\(configuration.hiddenSize)" }
     public var cacheBytesPerToken: Int {
         max(configuration.mtpNumHiddenLayers, 1) * configuration.kvHeads

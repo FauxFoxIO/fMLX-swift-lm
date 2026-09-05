@@ -12,7 +12,7 @@ chat policy, package product change, or deployment-floor increase is required.
 | Llama/Mistral, Qwen3 | Chunked prefill and continuous batched decode | Simple or affine 4/8-bit attention KV |
 | Qwen3.5/3.8 text and hybrid wrappers | Batched projections with independent attention and packed recurrent rows | Exact Mamba caches; multimodal inputs excluded |
 | Qwen MTP | Per-request target/drafter state, bounded shifted-prompt prefill, existing rollback machinery | Matching trained head, greedy sampling, block size two; unquantized target KV |
-| Prefix snapshots | Immutable hot copies and optional persistent restart restore | Simple, affine quantized, Mamba; MTP requests start cold |
+| Prefix snapshots | Immutable hot copies and optional persistent restart restore | Simple, affine quantized, Mamba; Qwen MTP uses paired in-memory snapshots only |
 | Public Core ML/ANE | Isolated feasibility and transfer probe | No production acceleration claim; see public-accelerator-evidence.md |
 
 Batched decode evaluates projections and MLPs across rows, then each row's
@@ -54,9 +54,12 @@ for try await event in generation.events {
 The caller owns tokenization, chat templates, stop IDs and detokenization.
 `Request.speculative` defaults to true when a compatible drafter is configured.
 Capabilities and execution/fallback events disclose the selected path. Nonzero
-temperature and quantized target KV use ordinary decoding. MTP prefix reuse is
-disabled because target-only snapshots cannot reconstruct the drafter's shifted
-prompt state. The separate trained head's bare parameter keys are normalized to
+temperature and quantized target KV use ordinary decoding. Qwen MTP reuses paired
+target/drafter snapshots at existing chunk boundaries. The drafter needs one
+lookahead token inside the allowed prefix, so a 128-token chunk size and 2048-token
+prefix permit 1920 tokens of reuse. Other drafters must explicitly support this
+state-copy contract; MTP disk restore remains unavailable. The separate trained
+head's bare parameter keys are normalized to
 `mtp.*`; already-converted normalization values are preserved.
 
 Call `cancel(id)` when breaking stream iteration early. Consumer cancellation
@@ -91,6 +94,8 @@ models. Cancelling a waiting turn releases it without cancelling a peer.
 Prefix identity includes immutable model, tokenizer, template, adapter and cache
 layout revisions. A mismatch forces cold generation. Snapshots never alias a
 request's mutable cache. Requests must leave a prompt suffix after their prefix.
+Ordinary and MTP snapshots share one hot-cache byte budget and LRU, but never
+restore each other's state. A cache miss or insufficient prefix budget stays cold.
 The persistent store validates identity/layout, tensor metadata, byte lengths and
 SHA-256 integrity before reconstructing arrays. Corruption becomes a cold miss.
 Disk limits and LRU eviction apply per identity/layout namespace. Files publish

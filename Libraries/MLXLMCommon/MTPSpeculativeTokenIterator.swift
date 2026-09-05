@@ -49,6 +49,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     var processor: LogitProcessor?
     let sampler: LogitSampler
 
+    // Pure greedy rows share one evaluation without advancing processor state.
+    package var jointGreedyVerificationEnabled = true
+    package private(set) var jointGreedyVerificationCount = 0
+
     public var tokenCount: Int { telemetry.emittedTokenCount }
     public let maxTokens: Int?
     /// Total tokens proposed per round (`blockSize - 1` drafted, plus the
@@ -120,18 +124,25 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     package init(
         scheduledPrompt: [Int], mainModel: any LanguageModel,
         drafter: any IncrementalMTPDrafterModel, mainCache: [KVCache],
-        parameters: GenerateParameters, blockSize: Int
+        parameters: GenerateParameters, blockSize: Int, prefix: ScheduledPrefix? = nil
     ) throws {
+        if let prefix {
+            guard drafter is any ScheduledMTPPrefixCachingDrafter,
+                mainModel is any ScheduledTextModel, parameters.temperature == 0,
+                prefix.processedTokenCount < scheduledPrompt.count
+            else { throw KVCacheError(message: "Incompatible scheduled MTP prefix") }
+        }
         try self.init(
             input: LMInput(tokens: MLXArray(scheduledPrompt)), mainModel: mainModel,
             drafter: drafter, mainCache: mainCache, parameters: parameters,
-            blockSize: blockSize, components: .init(), scheduled: true)
+            blockSize: blockSize, components: .init(), scheduled: true, scheduledPrefix: prefix)
+        if prefix != nil { eval(scheduledResidentArrays) }
     }
 
     private init(
         input: LMInput, mainModel: any LanguageModel, drafter: any MTPDrafterModel,
         mainCache: [KVCache]?, parameters: GenerateParameters, blockSize: Int,
-        components: GenerationComponents, scheduled: Bool
+        components: GenerationComponents, scheduled: Bool, scheduledPrefix: ScheduledPrefix? = nil
     ) throws {
         precondition(
             blockSize >= 2,
@@ -139,18 +150,31 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         let kvCachePlan = try parameters.kvCachePlan()
         let mainCache = try kvCachePlan.validated(
-            mainCache ?? (try mainModel.newCache(parameters: parameters)))
+            scheduledPrefix?.mainCache.map { $0.copy() }
+                ?? mainCache ?? (try mainModel.newCache(parameters: parameters)))
         self.y = input.text
         self.mainModel = mainModel
         self.drafter = drafter
 
-        self.mainCacheStorage = KVCacheStorage(mainCache, plan: kvCachePlan)
-        self.drafterState = (drafter as? any StatefulMTPDrafterModel)?
-            .makeState(parameters: parameters)
+        self.mainCacheStorage = KVCacheStorage(
+            mainCache, plan: kvCachePlan,
+            processedTokenCount: scheduledPrefix?.processedTokenCount)
+        if let scheduledPrefix {
+            self.drafterState = MTPDrafterState(
+                cache: scheduledPrefix.drafterCache.map { $0.copy() },
+                nextPosition: scheduledPrefix.processedTokenCount)
+        } else {
+            self.drafterState = (drafter as? any StatefulMTPDrafterModel)?
+                .makeState(parameters: parameters)
+        }
 
         self.sampler = parameters.sampler()
         try components.validate(parameters: parameters)
         self.processor = components.logitProcessor(parameters: parameters)
+        if scheduledPrefix != nil, processor != nil {
+            throw KVCacheError(
+                message: "Scheduled MTP prefix restore requires pure greedy sampling")
+        }
 
         self.maxTokens = parameters.maxTokens
         // A round presents `blockSize` positions at once, and a sliding layer can only show a
@@ -215,7 +239,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     }
 
     /// Advances target and shifted-prompt drafter caches together without retaining full prompt hidden states.
-    package mutating func prepareScheduledChunk(_ tokens: [Int], nextPromptToken: Int?) throws {
+    package mutating func prepareScheduledChunk(
+        _ tokens: [Int], nextPromptToken: Int?, evaluateIntermediateLogits: Bool = false
+    ) throws {
         guard let drafter = drafter as? any IncrementalMTPDrafterModel,
             var draftState = drafterState
         else {
@@ -249,8 +275,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             targetHidden: hidden, isFinal: nextPromptToken == nil,
             state: &draftState, sampler: sampler)
         drafterState = draftState
+        let logitsToEvaluate =
+            nextPromptToken == nil || evaluateIntermediateLogits ? [result.logits] : []
         eval(
-            [result.logits] + mainCache.flatMap { $0.innerState() }
+            logitsToEvaluate + mainCache.flatMap { $0.innerState() }
                 + draftState.cache.flatMap { $0.innerState() })
     }
 
@@ -261,6 +289,60 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 drafterState?.seedHidden, drafterState?.seedToken,
                 mainState?[mtpLastHiddenStatesKey],
             ].compactMap { $0 }
+    }
+
+    /// Actor-local, evaluated state. Each restore creates new cache wrappers.
+    package struct ScheduledPrefix {
+        fileprivate let mainCache: [KVCache]
+        fileprivate let drafterCache: [KVCache]
+        package let processedTokenCount: Int
+    }
+
+    package var scheduledPrefixCacheBytes: Int? {
+        guard drafter is any ScheduledMTPPrefixCachingDrafter,
+            mainModel is any ScheduledTextModel, sampler is ArgMaxSampler, processor == nil,
+            !passthrough, tokenCount == 0, pendingTokens.isEmpty,
+            !mainCacheStorage.roundIsOpen, mainCacheStorage.processedTokenCount > 0,
+            let state = drafterState, state.nextPosition == mainCacheStorage.processedTokenCount,
+            state.seedToken == nil, state.seedHidden == nil, state.proposalAppended == 0,
+            !mainCache.isEmpty, !state.cache.isEmpty,
+            state.cache.allSatisfy({ type(of: $0) == KVCacheSimple.self }),
+            mainCache.allSatisfy({
+                if type(of: $0) == KVCacheSimple.self { return true }
+                guard type(of: $0) == MambaCache.self, let cache = $0 as? MambaCache else {
+                    return false
+                }
+                return !cache.hasSpeculativeCheckpoint
+                    && cache.leftPadding == nil && cache.lengths == nil
+                    && cache.state.count == 2 && cache.state.allSatisfy { !$0.shape.isEmpty }
+            })
+        else { return nil }
+        var bytes = 0
+        for array in (mainCache + state.cache).flatMap({ $0.innerState() }) {
+            let (sum, overflow) = bytes.addingReportingOverflow(array.nbytes)
+            guard !overflow else { return nil }
+            bytes = sum
+        }
+        return bytes
+    }
+
+    package func snapshotScheduledPrefix() -> ScheduledPrefix? {
+        guard scheduledPrefixCacheBytes != nil, let state = drafterState else { return nil }
+        let caches = mainCache.map { cache in
+            var snapshot = cache.copy()
+            if cache is MambaCache {
+                // Materialize recurrent views so a small state cannot retain a full prompt buffer.
+                snapshot.state = cache.state.map {
+                    take($0, MLXArray(0 ..< $0.dim(0)), axis: 0)
+                }
+            }
+            return snapshot
+        }
+        let prefix = ScheduledPrefix(
+            mainCache: caches, drafterCache: state.cache.map { $0.copy() },
+            processedTokenCount: mainCacheStorage.processedTokenCount)
+        eval((prefix.mainCache + prefix.drafterCache).flatMap { $0.innerState() })
+        return prefix
     }
 
     static let missingSharedKVSourcesReason =
@@ -575,36 +657,52 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let mainLogits = mainResult.logits
         mainState = mainResult.state
 
-        eval(flatDraftTokens)
-        let draftTokensList = flatDraftTokens.asArray(Int.self)
-
         var accepted = 0
         var finalToken: MLXArray?
-        for i in 0 ..< numDraft {
-            var logits = mainLogits[0..., verifyStart + i, 0...]
-            logits = processor?.process(logits: logits) ?? logits
-            let targetToken = sampler.sample(logits: logits)
-            eval(targetToken)
-            let targetTokenValue = targetToken.item(Int.self)
-            processor?.didSample(token: targetToken)
-            pendingTokens.append(targetTokenValue)
-            guard targetTokenValue == draftTokensList[i] else {
-                finalToken = targetToken
-                break
+        if jointGreedyVerificationEnabled, processor == nil, sampler is ArgMaxSampler,
+            mainLogits.ndim == 3, mainLogits.dim(0) == 1,
+            verifyStart >= 0, mainLogits.dim(1) >= verifyStart + numDraft + 1
+        {
+            let targets = sampler.sample(
+                logits: mainLogits[0, verifyStart ..< verifyStart + numDraft + 1, 0...])
+            eval(flatDraftTokens, targets)
+            let draftTokensList = flatDraftTokens.asArray(Int.self)
+            let targetTokensList = targets.asArray(Int.self)
+            while accepted < numDraft, targetTokensList[accepted] == draftTokensList[accepted] {
+                accepted += 1
             }
-            accepted += 1
-        }
+            pendingTokens.append(contentsOf: targetTokensList.prefix(accepted + 1))
+            finalToken = targets[accepted ..< accepted + 1]
+            jointGreedyVerificationCount += 1
+        } else {
+            eval(flatDraftTokens)
+            let draftTokensList = flatDraftTokens.asArray(Int.self)
+            for i in 0 ..< numDraft {
+                var logits = mainLogits[0..., verifyStart + i, 0...]
+                logits = processor?.process(logits: logits) ?? logits
+                let targetToken = sampler.sample(logits: logits)
+                eval(targetToken)
+                let targetTokenValue = targetToken.item(Int.self)
+                processor?.didSample(token: targetToken)
+                pendingTokens.append(targetTokenValue)
+                guard targetTokenValue == draftTokensList[i] else {
+                    finalToken = targetToken
+                    break
+                }
+                accepted += 1
+            }
 
-        // Only the all-accepted path samples the bonus row. On rejection the
-        // mismatching target sample above is already the emitted correction.
-        if finalToken == nil {
-            var logits = mainLogits[0..., verifyStart + accepted, 0...]
-            logits = processor?.process(logits: logits) ?? logits
-            let bonus = sampler.sample(logits: logits)
-            eval(bonus)
-            processor?.didSample(token: bonus)
-            pendingTokens.append(bonus.item(Int.self))
-            finalToken = bonus
+            // Only the all-accepted path samples the bonus row. On rejection the
+            // mismatching target sample above is already the emitted correction.
+            if finalToken == nil {
+                var logits = mainLogits[0..., verifyStart + accepted, 0...]
+                logits = processor?.process(logits: logits) ?? logits
+                let bonus = sampler.sample(logits: logits)
+                eval(bonus)
+                processor?.didSample(token: bonus)
+                pendingTokens.append(bonus.item(Int.self))
+                finalToken = bonus
+            }
         }
         let emittedFinalToken = finalToken!
         committedPendingTokenCount = accepted

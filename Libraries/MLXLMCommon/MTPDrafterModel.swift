@@ -192,6 +192,10 @@ public protocol IncrementalMTPDrafterModel: StatefulMTPDrafterModel {
         isFinal: Bool, state: inout MTPDrafterState, sampler: any LogitSampler)
 }
 
+/// Opt-in for copying nonfinal prompt state: only cache and nextPosition may be live.
+/// Chunk preparation must not mutate model-owned state or consume the sampler before isFinal.
+package protocol ScheduledMTPPrefixCachingDrafter: IncrementalMTPDrafterModel {}
+
 extension StatefulMTPDrafterModel {
     public func prepareDrafterState(
         target _: any LanguageModel,
