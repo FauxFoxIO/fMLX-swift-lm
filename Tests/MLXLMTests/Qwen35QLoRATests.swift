@@ -103,4 +103,84 @@ final class Qwen35QLoRATests: XCTestCase {
     private func fp16Adapter(_ shape: [Int]) -> MLXArray {
         MLXArray.full(shape, values: MLXArray(0.001), dtype: .float16)
     }
+
+    func testPreparedQuantizedVerificationTracksAdapterLifecycle() throws {
+        let config = try configuration()
+        let model = withRandomState(MLXRandom.RandomState(seed: 331)) {
+            Qwen35TextModel(config)
+        }
+        model.update(parameters: model.parameters().mapValues { $0.asType(.bfloat16) })
+        quantize(model: model, groupSize: 32, bits: 4)
+        model.train(false)
+        try model.prepare()
+        let layer = try XCTUnwrap(
+            model.modules().compactMap { $0 as? Qwen35DecoderLayer }.first(where: \.isLinear))
+        let gdn = try XCTUnwrap(layer.linearAttn)
+        XCTAssertTrue(gdn.hasFusedInputProjection)
+        let input = MLXArray((0 ..< 128).map { Float($0 % 17 + 1) / 17 })
+            .reshaped(1, 2, 64).asType(.bfloat16)
+
+        func verify() throws -> [Float] {
+            let seed = MambaCache()
+            eval(
+                layer(
+                    MLXArray.ones([1, 3, 64], dtype: .bfloat16), attentionMask: .causal,
+                    ssmMask: nil, cache: seed))
+            let compiledCache = try XCTUnwrap(seed.copy() as? MambaCache)
+            let referenceCache = try XCTUnwrap(seed.copy() as? MambaCache)
+            layer.compiledVerificationEnabled = true
+            let actual = layer(
+                input, attentionMask: .none, ssmMask: nil, cache: compiledCache,
+                checkpointAfter: 1)
+            eval(actual, compiledCache)
+            XCTAssertTrue(layer.hasCompiledVerificationLayer)
+            layer.compiledVerificationEnabled = false
+            let expected = layer(
+                input, attentionMask: .none, ssmMask: nil, cache: referenceCache,
+                checkpointAfter: 1)
+            eval(expected, referenceCache)
+            XCTAssertTrue(allClose(actual, expected, rtol: 1e-4, atol: 1e-4).item(Bool.self))
+            for (a, b) in zip(compiledCache.state, referenceCache.state) {
+                XCTAssertTrue(allClose(a, b, rtol: 1e-4, atol: 1e-4).item(Bool.self))
+            }
+            XCTAssertTrue(compiledCache.restoreSpeculativeCheckpoint())
+            XCTAssertTrue(referenceCache.restoreSpeculativeCheckpoint())
+            XCTAssertEqual(compiledCache.offset, referenceCache.offset)
+            for (a, b) in zip(compiledCache.state, referenceCache.state) {
+                XCTAssertTrue(allClose(a, b, rtol: 1e-4, atol: 1e-4).item(Bool.self))
+            }
+            return actual.asType(.float32).asArray(Float.self)
+        }
+
+        let baseline = try verify()
+        let rank = 4
+        let adapter = LoRAContainer(
+            configuration: .init(
+                numLayers: 2,
+                loraParameters: .init(
+                    rank: rank, scale: 1, keys: ["linear_attn.in_proj_qkv"])),
+            parameters: ModuleParameters.unflattened([
+                "model.layers.0.linear_attn.in_proj_qkv.lora_a": MLXArray.full(
+                    [64, rank], values: MLXArray(0.1), dtype: .float16),
+                "model.layers.0.linear_attn.in_proj_qkv.lora_b": MLXArray.full(
+                    [rank, 256], values: MLXArray(0.1), dtype: .float16),
+            ]))
+        try adapter.load(into: model)
+        XCTAssertFalse(layer.hasCompiledVerificationLayer)
+        XCTAssertFalse(gdn.hasFusedInputProjection)
+        XCTAssertNotEqual(try verify(), baseline)
+
+        adapter.unload(from: model)
+        XCTAssertFalse(layer.hasCompiledVerificationLayer)
+        XCTAssertEqual(try verify(), baseline)
+        model.invalidateCompiledTraces()
+        try model.prepare()
+        XCTAssertTrue(gdn.hasFusedInputProjection)
+        XCTAssertEqual(try verify(), baseline)
+
+        try adapter.fuse(with: model)
+        XCTAssertFalse(layer.hasCompiledVerificationLayer)
+        XCTAssertFalse(gdn.inProjQKV is QLoRALinear)
+        XCTAssertNotEqual(try verify(), baseline)
+    }
 }

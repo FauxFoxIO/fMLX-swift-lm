@@ -100,6 +100,7 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
     var returnPreservedStateWhenOmittingDrafterState: Bool = false
     var prepareLogitsStateValue: Int?
     var emittedPositionDelta: Int?
+    var logitPeak: Float = 100
 
     private(set) var callCount: Int = 0
     private(set) var lastIncomingEmitFlag: Bool? = nil
@@ -219,7 +220,7 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
         for i in 0 ..< positions {
             let tokIdx = perPositionIndex + i
             let tok = tokIdx < nextLogitTokens.count ? Int(nextLogitTokens[tokIdx]) : 0
-            data[i * vocab + tok] = 100
+            data[i * vocab + tok] = logitPeak
         }
         perPositionIndex += positions
         return MLXArray(data, [1, positions, vocab])
@@ -478,6 +479,125 @@ func testMTPIteratorEmptySharedKVFallsBackToPassthrough() throws {
     #expect(iter.next() == nil)
     #expect(drafter.draftBlockCallCount == 0)
     #expect(iter.passthroughReason == "main model did not emit shared target K/V")
+}
+
+@Suite(.serialized)
+struct MTPJointGreedyVerificationTests {
+    @Test(arguments: [0, 1, 2, 3], [false, true])
+    func acceptedPrefix(accepted: Int, enabled: Bool) throws {
+        let verify =
+            Array(repeating: Int32(5), count: accepted) + [9]
+            + Array(repeating: Int32(1), count: 3 - accepted)
+        let model = MockMainModel(nextLogitTokens: [0, 0, 5] + verify)
+        var iterator = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+            mainModel: model, drafter: MockDrafter(draftedTokenValue: 5),
+            parameters: GenerateParameters(maxTokens: 8, temperature: 0), blockSize: 4)
+        iterator.jointGreedyVerificationEnabled = enabled
+
+        let tokens = (0 ..< accepted + 2).compactMap { _ in iterator.next() }
+        #expect(tokens == Array(repeating: 5, count: accepted + 1) + [9])
+        #expect(iterator.acceptedCount == accepted)
+        #expect(iterator.proposedCount == 3)
+        #expect(iterator.jointGreedyVerificationCount == (enabled ? 1 : 0))
+        iterator.finalizeGeneration()
+        #expect(iterator.mainCacheStorage.processedTokenCount == 3 + tokens.count - 1)
+    }
+
+    @Test
+    func singleTokenTail() throws {
+        let model = MockMainModel(nextLogitTokens: [0, 0, 5, 11])
+        var iterator = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+            mainModel: model, drafter: MockDrafter(draftedTokenValue: 11),
+            parameters: GenerateParameters(maxTokens: 2, temperature: 0), blockSize: 4)
+        iterator.jointGreedyVerificationEnabled = true
+        #expect([iterator.next(), iterator.next(), iterator.next()] == [5, 11, nil])
+        #expect(iterator.jointGreedyVerificationCount == 0)
+        #expect(iterator.proposedCount == 0)
+    }
+
+    @Test
+    func processorKeepsSequentialSampling() throws {
+        let model = MockMainModel(nextLogitTokens: [0, 0, 5, 5, 9, 1, 2])
+        var iterator = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+            mainModel: model, drafter: MockDrafter(draftedTokenValue: 5),
+            parameters: GenerateParameters(maxTokens: 8, temperature: 0), blockSize: 4)
+        let processor = EmissionLog()
+        iterator._setProcessorForTesting(processor)
+        iterator.jointGreedyVerificationEnabled = true
+        #expect([iterator.next(), iterator.next(), iterator.next()] == [5, 5, 9])
+        #expect(processor.recordedTokens == [5, 9])
+        #expect(iterator.jointGreedyVerificationCount == 0)
+    }
+
+    @Test(arguments: [Float(0.9), 1])
+    func stochasticSamplingPreservesRandomStream(topP: Float) throws {
+        var outputs: [[Int]] = []
+        for enabled in [false, true] {
+            let model = MockMainModel(nextLogitTokens: [])
+            model.logitPeak = 0
+            var iterator = try MTPSpeculativeTokenIterator(
+                input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+                mainModel: model, drafter: MockDrafter(draftedTokenValue: 5),
+                parameters: GenerateParameters(
+                    maxTokens: 20, temperature: 0.6, topP: topP, seed: 914), blockSize: 4)
+            iterator.jointGreedyVerificationEnabled = enabled
+            var tokens: [Int] = []
+            while let token = iterator.next() { tokens.append(token) }
+            tokens.append(iterator.sampler.sample(logits: MLXArray.zeros([1, 20])).item(Int.self))
+            #expect(iterator.jointGreedyVerificationCount == 0)
+            outputs.append(tokens)
+            iterator.finalizeGeneration()
+        }
+        #expect(outputs[0] == outputs[1])
+    }
+
+    @Test(arguments: [1, 2, 3, 5, 8, 13, 48])
+    func earlyStopAndWrappedCache(stopAfter: Int) throws {
+        var outputs: [[Int]] = []
+        var timelines: [Int] = []
+        for enabled in [false, true] {
+            let model = PositionScriptedMainModel(
+                script: mixedAcceptanceScript(drafted: 7), slidingWindow: 8)
+            var iterator = try MTPSpeculativeTokenIterator(
+                input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+                mainModel: model, drafter: MockDrafter(draftedTokenValue: 7),
+                mainCache: model.newCache(parameters: nil),
+                parameters: GenerateParameters(maxTokens: 48, temperature: 0), blockSize: 4)
+            iterator.jointGreedyVerificationEnabled = enabled
+            var tokens: [Int] = []
+            while tokens.count < stopAfter, let token = iterator.next() {
+                tokens.append(token)
+                #expect(iterator.mainCacheStorage.nativeAttentionOffsetsAreAligned)
+            }
+            iterator.finalizeGeneration()
+            #expect(iterator.mainCacheStorage.nativeAttentionOffsetsAreAligned)
+            #expect((iterator.jointGreedyVerificationCount > 0) == (enabled && stopAfter > 1))
+            outputs.append(tokens)
+            timelines.append(iterator.mainCacheStorage.processedTokenCount)
+        }
+        #expect(outputs[0] == outputs[1])
+        #expect(timelines[0] == timelines[1])
+        #expect(timelines[1] >= 3 + stopAfter - 1)
+        #expect(timelines[1] <= 3 + stopAfter)
+    }
+
+    @Test(arguments: [DType.float32, .float16, .bfloat16])
+    func batchedArgMaxPreservesTiesAndTokenShape(dtype: DType) {
+        let logits = MLXArray([Float(2), 2, 1, 0, 3, 3, -1, -2, -1], [1, 3, 3])
+            .asType(dtype)
+        let sampler = ArgMaxSampler()
+        let joint = sampler.sample(logits: logits[0, 0..., 0...])
+        for row in 0 ..< 3 {
+            let sequential = sampler.sample(logits: logits[0..., row, 0...])
+            let slice = joint[row ..< row + 1]
+            #expect(slice.shape == sequential.shape)
+            #expect(slice.dtype == sequential.dtype)
+            #expect(slice.asArray(Int.self) == sequential.asArray(Int.self))
+        }
+    }
 }
 
 // MARK: - Pending buffer drain order

@@ -23,8 +23,19 @@ private let computeGatedDeltaG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXA
 
 // MARK: - Metal Kernel
 
-private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
+private func makeGatedDeltaKernel(hasMask: Bool, checkpoint: Bool = false) -> MLXFast.MLXFastKernel?
+{
     let maskSource = hasMask ? "mask[b_idx * T + t]" : "true"
+    let checkpointSource =
+        checkpoint
+        ? """
+        if (t == 0) {
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            checkpoint_state[(n * Dv + dv_idx) * Dk + s_idx] = static_cast<StT>(state[i]);
+          }
+        }
+        """ : ""
 
     let source = """
             auto n = thread_position_in_grid.z;
@@ -93,6 +104,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
               } else {
                 y[dv_idx] = static_cast<InT>(0);
               }
+              \(checkpointSource)
               // Increment data pointers to next time step
               q_ += Hk * Dk;
               k_ += Hk * Dk;
@@ -112,12 +124,12 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
         inputNames.append("mask")
     }
 
-    let suffix = hasMask ? "_mask" : ""
+    let suffix = checkpoint ? "_checkpoint" : hasMask ? "_mask" : ""
 
     return MLXFast.metalKernel(
         name: "gated_delta_step\(suffix)",
         inputNames: inputNames,
-        outputNames: ["y", "state_out"],
+        outputNames: ["y", "state_out"] + (checkpoint ? ["checkpoint_state"] : []),
         source: source
     )
 }
@@ -127,10 +139,12 @@ private final class GatedDeltaKernelManager: Sendable {
 
     let kernel: MLXFast.MLXFastKernel?
     let kernelMasked: MLXFast.MLXFastKernel?
+    let kernelCheckpoint: MLXFast.MLXFastKernel?
 
     private init() {
         kernel = makeGatedDeltaKernel(hasMask: false)
         kernelMasked = makeGatedDeltaKernel(hasMask: true)
+        kernelCheckpoint = makeGatedDeltaKernel(hasMask: false, checkpoint: true)
     }
 }
 
@@ -187,6 +201,49 @@ func gatedDeltaKernel(
 }
 
 // MARK: - Ops Fallback
+
+func gatedDeltaCheckpointKernel(
+    q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
+) -> (MLXArray, MLXArray, MLXArray) {
+    let (batch, length, keyHeads, keyDimension) = k.shape4
+    let valueHeads = v.dim(2)
+    let valueDimension = v.dim(3)
+    precondition(length == 2 && keyDimension % 32 == 0 && state.dtype == .float32)
+    let outputs = GatedDeltaKernelManager.shared.kernelCheckpoint!(
+        [q, k, v, g, beta, state, MLXArray(length)],
+        template: [
+            ("InT", q.dtype), ("StT", state.dtype), ("Dk", keyDimension),
+            ("Dv", valueDimension), ("Hk", keyHeads), ("Hv", valueHeads),
+        ],
+        grid: (32, valueDimension, batch * valueHeads), threadGroup: (32, 4, 1),
+        outputShapes: [[batch, length, valueHeads, valueDimension], state.shape, state.shape],
+        outputDTypes: [q.dtype, state.dtype, state.dtype])
+    return (outputs[0], outputs[1], outputs[2])
+}
+
+package func gatedDeltaUpdateCheckpoint(
+    q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
+    aLog: MLXArray, dtBias: MLXArray, state: MLXArray?
+) -> (MLXArray, MLXArray, MLXArray) {
+    precondition(q.dim(1) == 2)
+    let state =
+        (state ?? MLXArray.zeros([q.dim(0), v.dim(2), v.dim(3), q.dim(3)], dtype: .float32))
+        .asType(.float32)
+    guard GatedDeltaKernelManager.shared.kernelCheckpoint != nil else {
+        let (firstOutput, checkpoint) = gatedDeltaUpdate(
+            q: q[0..., ..<1, 0..., 0...], k: k[0..., ..<1, 0..., 0...],
+            v: v[0..., ..<1, 0..., 0...], a: a[0..., ..<1, 0...],
+            b: b[0..., ..<1, 0...], aLog: aLog, dtBias: dtBias, state: state)
+        let (secondOutput, finalState) = gatedDeltaUpdate(
+            q: q[0..., 1..., 0..., 0...], k: k[0..., 1..., 0..., 0...],
+            v: v[0..., 1..., 0..., 0...], a: a[0..., 1..., 0...],
+            b: b[0..., 1..., 0...], aLog: aLog, dtBias: dtBias, state: checkpoint)
+        return (concatenated([firstOutput, secondOutput], axis: 1), finalState, checkpoint)
+    }
+    return gatedDeltaCheckpointKernel(
+        q: q, k: k, v: v, g: computeGatedDeltaG(aLog, a, dtBias),
+        beta: sigmoid(b).asType(.float32), state: state)
+}
 
 private func gatedDeltaStepOps(
     q: MLXArray,

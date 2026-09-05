@@ -368,7 +368,8 @@ final class Qwen35GatedDeltaNet: Module {
         convState: MLXArray,
         recState: MLXArray?,
         mask: MLXArray?,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        fusedCheckpoint: Bool = false
     ) -> (
         output: MLXArray,
         convState: MLXArray,
@@ -410,30 +411,38 @@ final class Qwen35GatedDeltaNet: Module {
         let newRecState: MLXArray
         let checkpoint: (conv: MLXArray, recurrent: MLXArray)?
         if let split = checkpointAfter, split > 0, split < S {
-            let prefixMask = mask.map { $0[0..., ..<split] }
-            let suffixMask = mask.map { $0[0..., split...] }
-            let (prefixOut, prefixState) = gatedDeltaUpdate(
-                q: qNormed[0..., ..<split, 0..., 0...],
-                k: kNormed[0..., ..<split, 0..., 0...],
-                v: v[0..., ..<split, 0..., 0...],
-                a: a[0..., ..<split, 0...],
-                b: b[0..., ..<split, 0...],
-                aLog: aLog,
-                dtBias: dtBias,
-                state: recState,
-                mask: prefixMask)
-            let (suffixOut, suffixState) = gatedDeltaUpdate(
-                q: qNormed[0..., split..., 0..., 0...],
-                k: kNormed[0..., split..., 0..., 0...],
-                v: v[0..., split..., 0..., 0...],
-                a: a[0..., split..., 0...],
-                b: b[0..., split..., 0...],
-                aLog: aLog,
-                dtBias: dtBias,
-                state: prefixState,
-                mask: suffixMask)
-            out = concatenated([prefixOut, suffixOut], axis: 1)
-            newRecState = suffixState
+            let prefixState: MLXArray
+            if fusedCheckpoint, S == 2, split == 1, mask == nil, headKDim % 32 == 0 {
+                (out, newRecState, prefixState) = gatedDeltaUpdateCheckpoint(
+                    q: qNormed, k: kNormed, v: v, a: a, b: b,
+                    aLog: aLog, dtBias: dtBias, state: recState)
+            } else {
+                let prefixMask = mask.map { $0[0..., ..<split] }
+                let suffixMask = mask.map { $0[0..., split...] }
+                let (prefixOut, intermediateState) = gatedDeltaUpdate(
+                    q: qNormed[0..., ..<split, 0..., 0...],
+                    k: kNormed[0..., ..<split, 0..., 0...],
+                    v: v[0..., ..<split, 0..., 0...],
+                    a: a[0..., ..<split, 0...],
+                    b: b[0..., ..<split, 0...],
+                    aLog: aLog,
+                    dtBias: dtBias,
+                    state: recState,
+                    mask: prefixMask)
+                let (suffixOut, suffixState) = gatedDeltaUpdate(
+                    q: qNormed[0..., split..., 0..., 0...],
+                    k: kNormed[0..., split..., 0..., 0...],
+                    v: v[0..., split..., 0..., 0...],
+                    a: a[0..., split..., 0...],
+                    b: b[0..., split..., 0...],
+                    aLog: aLog,
+                    dtBias: dtBias,
+                    state: intermediateState,
+                    mask: suffixMask)
+                out = concatenated([prefixOut, suffixOut], axis: 1)
+                newRecState = suffixState
+                prefixState = intermediateState
+            }
 
             let checkpointConv: MLXArray
             if convKernelSize > 1 {
@@ -725,6 +734,19 @@ final class Qwen35DecoderLayer: Module {
         positionOffset: Int? = nil,
         checkpointAfter: Int? = nil
     ) -> MLXArray {
+        if compiledVerificationEnabled, x.dim(1) == 2, checkpointAfter == 1, ssmMask == nil,
+            positionOffset == nil,
+            mlp is Qwen3NextMLP
+        {
+            if isLinear, let mambaCache = cache as? MambaCache,
+                mambaCache[0] != nil, mambaCache[1] != nil
+            {
+                return verifyLinearLayer(x, cache: mambaCache)
+            }
+            if !isLinear, let cache, usesPlainAttentionCacheRoute(cache) {
+                return decodeAttentionLayer(x, mask: attentionMask, cache: cache)
+            }
+        }
         // Single-token unmasked decode runs the layer as one traced function
         // (two for full attention, split at the KV write). Everything else
         // takes the general body below.
@@ -753,6 +775,46 @@ final class Qwen35DecoderLayer: Module {
     }
 
     // MARK: - Compiled decode blocks
+
+    var compiledVerificationEnabled = true
+    var fusedVerificationCheckpointEnabled = true
+    var hasCompiledVerificationLayer: Bool {
+        compiledVerificationLayer.isCompiled || compiledCheckpointVerificationLayer.isCompiled
+    }
+
+    private let compiledVerificationLayer = CompiledTrace<Qwen35DecoderLayer> { layer, args in
+        layer.verificationLayerBody(args, fusedCheckpoint: false)
+    }
+
+    private let compiledCheckpointVerificationLayer = CompiledTrace<Qwen35DecoderLayer> {
+        layer, args in
+        layer.verificationLayerBody(args, fusedCheckpoint: true)
+    }
+
+    private func verificationLayerBody(_ args: [MLXArray], fusedCheckpoint: Bool) -> [MLXArray] {
+        let (r, conv, recurrent, checkpoint) = linearAttn!.forward(
+            inputLayerNorm(args[0]), convState: args[1], recState: args[2],
+            mask: nil, checkpointAfter: 1, fusedCheckpoint: fusedCheckpoint)
+        let h = args[0] + r
+        return [
+            h + mlpForward(postAttentionLayerNorm(h)), conv, recurrent,
+            checkpoint!.conv, checkpoint!.recurrent,
+        ]
+    }
+
+    // Keep the committed-token checkpoint explicit; cache mutation stays outside the trace.
+    private func verifyLinearLayer(_ x: MLXArray, cache: MambaCache) -> MLXArray {
+        let trace =
+            fusedVerificationCheckpointEnabled
+            ? compiledCheckpointVerificationLayer : compiledVerificationLayer
+        let out = trace(self, [x, cache[0]!, cache[1]!])
+        cache[0] = out[1]
+        cache[1] = out[2]
+        cache.saveSpeculativeCheckpoint(
+            convState: out[3], recurrentState: out[4], advancedBy: 1)
+        cache.advance(2)
+        return out[0]
+    }
 
     // Every body stays inside this layer, so each trace's default state (the
     // layer's own weights) is complete.

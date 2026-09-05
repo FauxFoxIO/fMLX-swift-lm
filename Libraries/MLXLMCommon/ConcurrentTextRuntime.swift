@@ -126,6 +126,7 @@ public actor ConcurrentTextRuntime {
         public let stopTokenIDs: Set<Int>
         public let priority: Priority
         /// Cache this many initial tokens. Must leave at least one prompt token to evaluate.
+        /// MTP reuses whole chunks whose one-token lookahead also lies within this prefix.
         public let prefixTokenCount: Int
         /// A mismatch disables reuse and publication for this request; generation stays cold.
         public let cacheIdentity: PrefixCacheIdentity?
@@ -235,9 +236,18 @@ public actor ConcurrentTextRuntime {
     }
 
     private struct Prefix {
+        enum State {
+            case ordinary([KVCache])
+            case speculative(MTPSpeculativeTokenIterator.ScheduledPrefix)
+        }
         let tokens: [Int]
-        let cache: [KVCache]
+        let state: State
         let bytes: Int
+
+        var speculative: Bool {
+            if case .speculative = state { return true }
+            return false
+        }
     }
 
     /// Transfers exclusive model ownership. Load/quantize/apply adapters before this call.
@@ -301,7 +311,9 @@ public actor ConcurrentTextRuntime {
                 ? "No matching trained MTP head supplied"
                 : configuration.cacheQuantization != nil
                     ? "MTP with quantized target KV is not qualified"
-                    : "Greedy sampling only; MTP prefix restore and batched verification are unavailable",
+                    : drafter is any ScheduledMTPPrefixCachingDrafter
+                        ? "Greedy sampling only; MTP disk prefix restore and batched verification are unavailable"
+                        : "Greedy sampling only; MTP prefix restore and batched verification are unavailable",
             fusedBatching: batching, executionMode: batching ? .batchedDecode : .interleaved,
             limitation: batching
                 ? nil : "Model has not opted into batched projection/row-native attention")
@@ -542,21 +554,26 @@ public actor ConcurrentTextRuntime {
                     throw ConcurrentTextRuntimeError.unsupportedCache
                 }
                 if usesMTP(slot.request), let drafter = ownedDrafter {
+                    let prefix = takePrefix(for: slot.request, speculative: true)
+                    let snapshot: MTPSpeculativeTokenIterator.ScheduledPrefix?
+                    if case .speculative(let state) = prefix?.state {
+                        snapshot = state
+                    } else {
+                        snapshot = nil
+                    }
                     slot.iterator = try MTPSpeculativeTokenIterator(
                         scheduledPrompt: slot.request.tokens, mainModel: model, drafter: drafter,
                         mainCache: slot.cache,
                         parameters: GenerateParameters(
                             maxTokens: slot.request.maxTokens,
-                            temperature: 0, seed: slot.request.seed), blockSize: 2)
-                } else if slot.request.cacheIdentity == identity,
-                    let index = prefixes.indices.filter({
-                        prefixes[$0].tokens.count <= slot.request.prefixTokenCount
-                            && slot.request.tokens.starts(with: prefixes[$0].tokens)
-                    }).max(by: { prefixes[$0].tokens.count < prefixes[$1].tokens.count })
+                            temperature: 0, seed: slot.request.seed), blockSize: 2, prefix: snapshot
+                    )
+                    slot.cache = slot.iterator!.mainCache
+                    slot.position = snapshot?.processedTokenCount ?? 0
+                } else if let prefix = takePrefix(for: slot.request, speculative: false),
+                    case .ordinary(let cache) = prefix.state
                 {
-                    let prefix = prefixes.remove(at: index)
-                    prefixes.append(prefix)
-                    slot.cache = prefix.cache.map { $0.copy() }
+                    slot.cache = cache.map { $0.copy() }
                     eval(slot.cache.flatMap { $0.innerState() })
                     slot.position = prefix.tokens.count
                 } else if slot.request.cacheIdentity == identity, let persistentStore {
@@ -584,9 +601,11 @@ public actor ConcurrentTextRuntime {
                                 ? "MTP requires greedy sampling"
                                 : "MTP requires unquantized target KV"), to: slot)
                 }
-                if slot.iterator != nil, slot.request.prefixTokenCount > 0 {
+                if slot.iterator != nil, slot.request.prefixTokenCount > 0,
+                    !(ownedDrafter is any ScheduledMTPPrefixCachingDrafter)
+                {
                     try emit(
-                        .fallback(reason: "MTP requires cold target and drafter prompt caches"),
+                        .fallback(reason: "This MTP drafter requires cold prompt caches"),
                         to: slot)
                 }
             } catch {
@@ -597,6 +616,19 @@ public actor ConcurrentTextRuntime {
 
     private func usesMTP(_ request: Request) -> Bool {
         request.speculative && request.temperature == 0 && capabilities.speculativeDecoding
+    }
+
+    private func takePrefix(for request: Request, speculative: Bool) -> Prefix? {
+        guard request.cacheIdentity == identity,
+            let index = prefixes.indices.filter({
+                prefixes[$0].speculative == speculative
+                    && prefixes[$0].tokens.count <= request.prefixTokenCount
+                    && request.tokens.starts(with: prefixes[$0].tokens)
+            }).max(by: { prefixes[$0].tokens.count < prefixes[$1].tokens.count })
+        else { return nil }
+        let prefix = prefixes.remove(at: index)
+        prefixes.append(prefix)
+        return prefix
     }
 
     private func step(_ slot: Slot) throws {
@@ -622,7 +654,9 @@ public actor ConcurrentTextRuntime {
         }
         let logits = try model.scheduledForward(
             MLXArray(tokens).expandedDimensions(axis: 0), cache: slot.cache)
-        eval([logits] + slot.cache.flatMap { $0.innerState() })
+        let needsLogits = !isPrefill || slot.position + tokens.count == request.tokens.count
+        // Intermediate chunks only contribute cache state; their vocabulary scores are unused.
+        eval((needsLogits ? [logits] : []) + slot.cache.flatMap { $0.innerState() })
         try compress(slot)
         let bytes = slot.cache.flatMap { $0.innerState() }.reduce(0) { $0 + $1.nbytes }
         guard bytes <= slot.reservation - configuration.workingMemoryBytes else {
@@ -647,9 +681,20 @@ public actor ConcurrentTextRuntime {
             try slot.iterator!.prepareScheduledChunk(
                 Array(slot.request.tokens[slot.position ..< end]),
                 nextPromptToken: end < slot.request.tokens.count ? slot.request.tokens[end] : nil)
+            guard
+                slot.iterator!.scheduledResidentArrays.reduce(0, { $0 + $1.nbytes })
+                    <= slot.reservation
+            else { throw ConcurrentTextRuntimeError.memoryBudgetExceeded }
             slot.position = end
             try emit(
                 .prefill(processedTokens: end, totalTokens: slot.request.tokens.count), to: slot)
+            if slot.request.prefixTokenCount > 0,
+                end == ((slot.request.prefixTokenCount - 1) / configuration.prefillChunkSize)
+                    * configuration.prefillChunkSize,
+                slot.request.cacheIdentity == identity
+            {
+                checkpointSpeculative(slot)
+            }
             if end < slot.request.tokens.count { return }
         }
         guard let token = slot.iterator!.next() else {
@@ -731,12 +776,30 @@ public actor ConcurrentTextRuntime {
             persistentCacheFailures += 1
         }
         guard bytes <= configuration.prefixCacheBytes,
-            !prefixes.contains(where: { $0.tokens == tokens })
+            !prefixes.contains(where: { !$0.speculative && $0.tokens == tokens })
         else { return }
         while prefixBytes > configuration.prefixCacheBytes - bytes { prefixes.removeFirst() }
         let cache = slot.cache.map { $0.copy() }
         eval(cache.flatMap { $0.innerState() })
-        prefixes.append(Prefix(tokens: tokens, cache: cache, bytes: bytes))
+        prefixes.append(Prefix(tokens: tokens, state: .ordinary(cache), bytes: bytes))
+    }
+
+    private func checkpointSpeculative(_ slot: Slot) {
+        guard let iterator = slot.iterator, let cacheBytes = iterator.scheduledPrefixCacheBytes
+        else {
+            return
+        }
+        // The shifted drafter cache includes the next prompt token, unlike the target cache.
+        let count = slot.position + 1
+        let (tokenBytes, tokenOverflow) = count.multipliedReportingOverflow(
+            by: MemoryLayout<Int>.stride)
+        let (bytes, overflow) = cacheBytes.addingReportingOverflow(tokenBytes)
+        guard !tokenOverflow, !overflow, bytes <= configuration.prefixCacheBytes else { return }
+        let tokens = Array(slot.request.tokens.prefix(count))
+        guard !prefixes.contains(where: { $0.speculative && $0.tokens == tokens }) else { return }
+        while prefixBytes > configuration.prefixCacheBytes - bytes { prefixes.removeFirst() }
+        guard let snapshot = iterator.snapshotScheduledPrefix() else { return }
+        prefixes.append(Prefix(tokens: tokens, state: .speculative(snapshot), bytes: bytes))
     }
 
     private func emit(_ event: Event, to slot: Slot) throws {
