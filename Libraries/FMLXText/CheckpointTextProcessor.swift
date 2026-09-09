@@ -37,6 +37,9 @@ public struct CheckpointTextProcessor: Sendable {
     public let stopStrings: Set<String>
     public let tokenizerRevision: String
     public let chatTemplateRevision: String
+    public let temperature: Float
+    public let topP: Float
+    public let topK: Int
     public var hasChatTemplate: Bool { tokenizer.hasChatTemplate }
 
     func verifyAssets(directory: URL) throws {
@@ -89,6 +92,17 @@ public struct CheckpointTextProcessor: Sendable {
         let generation = try assets.files["generation_config.json"].map {
             try decoder.decode(GenerationConfigFile.self, from: $0)
         }
+        let temperature = generation?.doSample == false
+            ? 0 : generation?.temperature ?? 0.6
+        let topP = generation?.topP ?? 1
+        let topK = generation?.topK ?? 0
+        guard temperature.isFinite, temperature >= 0,
+              topP.isFinite, topP > 0, topP <= 1,
+              topK >= 0 else {
+            throw CheckpointTextError.invalidConfiguration(
+                "generation_config.json contains invalid sampling parameters"
+            )
+        }
         var stops = generation?.eosTokenIds.map { Set($0.values) } ?? base.effectiveEOSTokenIds
         for special in [tokenizer.bosToken, tokenizer.eosToken, tokenizer.unknownToken].compactMap({
             $0
@@ -117,7 +131,8 @@ public struct CheckpointTextProcessor: Sendable {
             tokenizer: tokenizer, vocabularySize: vocabularySize, contextWindowTokens: window,
             stopTokenIDs: stops, stopStrings: generation?.stopStrings ?? [],
             tokenizerRevision: assets.digest(names: TextAssets.names),
-            chatTemplateRevision: assets.digest(names: TextAssets.templateNames))
+            chatTemplateRevision: assets.digest(names: TextAssets.templateNames),
+            temperature: temperature, topP: topP, topK: topK)
     }
 
     public func encode(_ text: String, addSpecialTokens: Bool = true) throws -> [Int] {

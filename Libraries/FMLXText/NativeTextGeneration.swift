@@ -4,10 +4,25 @@ import Foundation
 import MLXLMCommon
 
 extension NativeTextModel {
+    public struct TextProgress: Sendable, Hashable {
+        public enum Phase: Sendable, Hashable {
+            case prefill
+            case generating
+        }
+
+        public let phase: Phase
+        public let completedTokens: Int
+        public let totalTokens: Int?
+        public let generatedTokens: Int
+        public let tokensPerSecond: Double?
+        public let elapsedSeconds: Double
+    }
+
     public enum TextEvent: Sendable {
         case text(String)
         case reasoning(String)
         case toolCall(ToolCall)
+        case progress(TextProgress)
         case completed(
             inputTokens: Int, outputTokens: Int, cachedTokens: Int, reason: GenerateStopReason)
     }
@@ -34,6 +49,9 @@ extension NativeTextModel {
                     }
                     var outputTokens = 0
                     var cachedTokens = 0
+                    let generationStartedAt = Date()
+                    var decodeStartedAt: Date?
+                    var lastProgressAt = Date.distantPast
                     func emit(_ event: TextEvent) throws {
                         try Task.checkCancellation()
                         switch continuation.yield(event) {
@@ -67,8 +85,35 @@ extension NativeTextModel {
                         try Task.checkCancellation()
                         switch event {
                         case .admitted(let count): cachedTokens = count
+                        case .prefill(let processed, let total):
+                            let elapsed = Date().timeIntervalSince(generationStartedAt)
+                            try emit(.progress(TextProgress(
+                                phase: .prefill,
+                                completedTokens: processed,
+                                totalTokens: total,
+                                generatedTokens: outputTokens,
+                                tokensPerSecond: nil,
+                                elapsedSeconds: elapsed
+                            )))
                         case .token(let token):
                             outputTokens += 1
+                            let now = Date()
+                            if decodeStartedAt == nil { decodeStartedAt = now }
+                            let elapsed = max(
+                                now.timeIntervalSince(decodeStartedAt ?? now),
+                                0.001
+                            )
+                            if now.timeIntervalSince(lastProgressAt) >= 0.5 {
+                                lastProgressAt = now
+                                try emit(.progress(TextProgress(
+                                    phase: .generating,
+                                    completedTokens: outputTokens,
+                                    totalTokens: request.maxTokens,
+                                    generatedTokens: outputTokens,
+                                    tokensPerSecond: Double(outputTokens) / elapsed,
+                                    elapsedSeconds: elapsed
+                                )))
+                            }
                             guard let chunk = try decoder.consume(token) else { continue }
                             if var scanner = reasoning {
                                 try routeSegments(scanner.process(chunk))
@@ -77,6 +122,20 @@ extension NativeTextModel {
                                 try route(processor.processChunkOutputs(chunk))
                             }
                         case .finished(let reason):
+                            let elapsed = max(
+                                Date().timeIntervalSince(
+                                    decodeStartedAt ?? generationStartedAt
+                                ),
+                                0.001
+                            )
+                            try emit(.progress(TextProgress(
+                                phase: .generating,
+                                completedTokens: outputTokens,
+                                totalTokens: request.maxTokens,
+                                generatedTokens: outputTokens,
+                                tokensPerSecond: Double(outputTokens) / elapsed,
+                                elapsedSeconds: elapsed
+                            )))
                             if var scanner = reasoning { try routeSegments(scanner.finalize()) }
                             try route(processor.processEOSOutputs())
                             try emit(

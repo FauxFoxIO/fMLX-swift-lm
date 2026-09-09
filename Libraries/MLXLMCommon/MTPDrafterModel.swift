@@ -4,6 +4,17 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Tokens proposed by an MTP head and each proposal's raw model logits.
+public struct MTPDraft {
+    public let tokens: MLXArray
+    public let logits: MLXArray
+
+    public init(tokens: MLXArray, logits: MLXArray) {
+        self.tokens = tokens
+        self.logits = logits
+    }
+}
+
 /// Protocol for Multi-Token Prediction (MTP) speculative drafter models.
 ///
 /// Mirrors `EmbeddingModel`'s relationship to `BaseLanguageModel`: this
@@ -39,14 +50,10 @@ public protocol MTPDrafterModel: BaseLanguageModel {
     /// its first proposal. Qwen's private decoder cache requires this.
     var requiresPromptPrefill: Bool { get }
 
-    /// Whether this drafter is currently supported only for greedy decoding.
-    /// This keeps stochastic generation on the ordinary target path until a
-    /// probability-ratio acceptance sampler is available.
-    var requiresGreedySampling: Bool { get }
-
     /// K-step drafting from a constant position.
     ///
-    /// Returns the proposed tokens as a `[B, blockSize - 1]` MLXArray. The
+    /// Returns proposed tokens as `[B, blockSize - 1]` and their logits as
+    /// `[B, blockSize - 1, vocabularySize]`. The
     /// drafter holds no transient round-state on the model instance — every
     /// per-round input is threaded as a method argument.
     ///
@@ -71,7 +78,7 @@ public protocol MTPDrafterModel: BaseLanguageModel {
     ///   - blockSize: Total tokens in the round (the drafter returns
     ///     `blockSize - 1`; the bonus token is implicit).
     ///   - sampler: `LogitSampler` to apply to each step's logits.
-    /// - Returns: `[B, blockSize - 1]` token array.
+    /// - Returns: Proposed tokens and the logits used to sample them.
     func draftBlock(
         target: any LanguageModel,
         lastToken: MLXArray,
@@ -81,14 +88,13 @@ public protocol MTPDrafterModel: BaseLanguageModel {
         queryOffset: Int,
         blockSize: Int,
         sampler: any LogitSampler
-    ) -> MLXArray
+    ) -> MTPDraft
 }
 
 extension MTPDrafterModel {
     public var maximumBlockSize: Int? { nil }
     public var requiresSharedTargetKV: Bool { true }
     public var requiresPromptPrefill: Bool { false }
-    public var requiresGreedySampling: Bool { false }
 }
 
 /// Target-side capability for rewinding an in-place speculative verify pass.
@@ -111,10 +117,11 @@ public struct MTPDrafterState {
     /// Absolute next position in a drafter-owned autoregressive cache.
     public var nextPosition: Int
 
-    /// A proposal already computed while committing the previous verified
-    /// round. Qwen uses this to avoid advancing its cache twice.
+    /// A proposal and its source logits already computed while committing the
+    /// previous verified round. Qwen uses these to avoid advancing its cache twice.
     public var seedToken: MLXArray?
     public var seedHidden: MLXArray?
+    public var seedLogits: MLXArray?
 
     /// Number of tentative cache entries appended by the current proposal.
     public var proposalAppended: Int
@@ -124,12 +131,14 @@ public struct MTPDrafterState {
         nextPosition: Int = 0,
         seedToken: MLXArray? = nil,
         seedHidden: MLXArray? = nil,
+        seedLogits: MLXArray? = nil,
         proposalAppended: Int = 0
     ) {
         self.cache = cache
         self.nextPosition = nextPosition
         self.seedToken = seedToken
         self.seedHidden = seedHidden
+        self.seedLogits = seedLogits
         self.proposalAppended = proposalAppended
     }
 }
@@ -167,7 +176,7 @@ public protocol StatefulMTPDrafterModel: MTPDrafterModel {
         blockSize: Int,
         state: inout MTPDrafterState,
         sampler: any LogitSampler
-    ) -> MLXArray
+    ) -> MTPDraft
 
     /// Reconcile tentative proposal writes with the sequence accepted by the
     /// target, then seed the next proposal if the architecture supports it.

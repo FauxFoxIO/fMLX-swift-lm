@@ -8,6 +8,24 @@ import Testing
 
 @testable import MLXLMCommon
 
+@Test
+func stochasticSpeculativeAcceptanceAndCorrectionDistributions() {
+    let target = log(MLXArray([Float(0.4), 0.6], [1, 2]))
+    let draft = log(MLXArray([Float(0.8), 0.2], [1, 2]))
+
+    let acceptance = speculativeAcceptanceProbability(
+        targetLogProbabilities: target, draftLogProbabilities: draft, token: 0)
+    let correction = exp(
+        speculativeCorrectionLogProbabilities(
+            targetLogProbabilities: target, draftLogProbabilities: draft))
+    eval(acceptance, correction)
+
+    #expect(abs(acceptance.item(Float.self) - 0.5) < 0.0001)
+    let values = correction.asArray(Float.self)
+    #expect(values[0] < 0.0001)
+    #expect(abs(values[1] - 1) < 0.0001)
+}
+
 @Suite(.serialized)
 struct SpeculativeDecodingTests {
 

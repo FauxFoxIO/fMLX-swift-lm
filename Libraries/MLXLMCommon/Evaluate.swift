@@ -14,6 +14,16 @@ public protocol LogitSampler {
     func sample(logits: MLXArray) -> MLXArray
 }
 
+/// A sampler that exposes the exact distribution it samples from.
+///
+/// Speculative decoding needs this to accept a draft token with probability
+/// `min(1, p(x) / q(x))` and, after rejection, sample from `(p - q)+`.
+package protocol ProbabilityLogitSampler: LogitSampler {
+    func logProbabilities(logits: MLXArray) -> MLXArray
+    func sample(logProbabilities: MLXArray) -> MLXArray
+    func sampleUniform() -> MLXArray
+}
+
 /// A `LogitProcessor` is an optional visitor of `logits`.
 ///
 /// The ``LogitProcessor`` is called with the input (prompt) before generating tokens:
@@ -365,27 +375,35 @@ public struct TopPSampler: LogitSampler {
     }
 
     public func sample(logits: MLXArray) -> MLXArray {
+        sample(logProbabilities: logProbabilities(logits: logits))
+    }
+
+    package func logProbabilities(logits: MLXArray) -> MLXArray {
         var logits = logits
         if logits.dtype == .bfloat16 {
             logits = logits.asType(.float32)
         }
 
-        return withRandomState(randomState) {
-            var logprobs = logSoftmax(logits)
-
-            // Apply filters in Python mlx-lm order: top_p → min_p → top_k.
-            if let topP {
-                logprobs = applyTopP(logprobs, topP: topP)
-            }
-            if let minP {
-                logprobs = applyMinP(logprobs, minP: minP)
-            }
-            if let topK {
-                logprobs = applyTopK(logprobs, topK: topK)
-            }
-
-            return categorical(logprobs * (1 / temp))
+        var logprobs = logSoftmax(logits)
+        // Apply filters in Python mlx-lm order: top_p → min_p → top_k.
+        if let topP {
+            logprobs = applyTopP(logprobs, topP: topP)
         }
+        if let minP {
+            logprobs = applyMinP(logprobs, minP: minP)
+        }
+        if let topK {
+            logprobs = applyTopK(logprobs, topK: topK)
+        }
+        return logSoftmax(logprobs * (1 / temp))
+    }
+
+    package func sample(logProbabilities: MLXArray) -> MLXArray {
+        withRandomState(randomState) { categorical(logProbabilities) }
+    }
+
+    package func sampleUniform() -> MLXArray {
+        withRandomState(randomState) { MLXRandom.uniform(low: 0, high: 1, [1]) }
     }
 
     /// Keep tokens whose cumulative probability exceeds `1 - topP` (nucleus sampling).
@@ -435,11 +453,24 @@ public struct CategoricalSampler: LogitSampler {
     }
 
     public func sample(logits: MLXArray) -> MLXArray {
-        return withRandomState(randomState) {
-            categorical(logits * (1 / temp))
-        }
+        sample(logProbabilities: logProbabilities(logits: logits))
+    }
+
+    package func logProbabilities(logits: MLXArray) -> MLXArray {
+        logSoftmax(logits * (1 / temp))
+    }
+
+    package func sample(logProbabilities: MLXArray) -> MLXArray {
+        withRandomState(randomState) { categorical(logProbabilities) }
+    }
+
+    package func sampleUniform() -> MLXArray {
+        withRandomState(randomState) { MLXRandom.uniform(low: 0, high: 1, [1]) }
     }
 }
+
+extension TopPSampler: ProbabilityLogitSampler {}
+extension CategoricalSampler: ProbabilityLogitSampler {}
 
 /// GPU-resident ring buffer of recent token IDs.
 ///

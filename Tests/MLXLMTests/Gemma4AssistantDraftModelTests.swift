@@ -419,6 +419,7 @@ func testDraftBlockAcceptsGemma4UnifiedTarget() throws {
         blockSize: 3,
         sampler: ArgMaxSampler()
     )
-    eval(proposed)
-    #expect(proposed.shape == [1, 2])
+    eval(proposed.tokens, proposed.logits)
+    #expect(proposed.tokens.shape == [1, 2])
+    #expect(proposed.logits.shape == [1, 2, 32])
 }

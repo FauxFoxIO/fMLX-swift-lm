@@ -571,13 +571,13 @@ struct Qwen35MTPMetalTests {
                     lastHidden: promptHidden[0..., (-1)..., 0...], sharedKV: [:],
                     positionDeltas: nil, queryOffset: expectedPosition, blockSize: 2,
                     state: &state, sampler: sampler)
-                eval(proposal)
+                eval(proposal.tokens, proposal.logits)
                 #expect(state.cache.allSatisfy { $0.offset == expectedPosition })
 
                 let verifyHidden = MLXArray.zeros([1, 2, cfg.hiddenSize])
                 let finalToken = MLXArray([Int32(8 + accepted)])
                 drafter.commitDrafterState(
-                    target: target, targetHidden: verifyHidden, draftTokens: proposal,
+                    target: target, targetHidden: verifyHidden, draftTokens: proposal.tokens,
                     acceptedCount: accepted, finalToken: finalToken, positionDeltas: nil,
                     state: &state, sampler: sampler)
                 eval(state.seedToken!, state.seedHidden!)
@@ -699,7 +699,6 @@ struct Qwen35MTPRegistrationTests {
         #expect(standalone.maximumBlockSize == 2)
         #expect(standalone.requiresPromptPrefill)
         #expect(!standalone.requiresSharedTargetKV)
-        #expect(standalone.requiresGreedySampling)
     }
 
     @Test

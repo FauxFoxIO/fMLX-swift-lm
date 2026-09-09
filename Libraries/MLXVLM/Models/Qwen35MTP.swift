@@ -80,7 +80,6 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
     public let maximumBlockSize: Int? = 2
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
-    public let requiresGreedySampling = true
     private let preconvertedNorms: Bool
 
     @ModuleInfo(key: "mtp") var mtp: Qwen35VLMNextNPredictor
@@ -134,9 +133,11 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
             cache: state.cache, positionOffset: 0, positionDeltas: nil)
         state.nextPosition = shifted.dim(1)
         state.seedHidden = mtpHidden[0..., (-1)..., 0...]
-        state.seedToken = sampleMTPSeed(
+        let seed = makeMTPSeed(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
             lmHead: target.languageModel.lmHead, sampler: sampler)
+        state.seedToken = seed.token
+        state.seedLogits = seed.logits
         state.proposalAppended = 0
     }
 
@@ -149,7 +150,7 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
         queryOffset: Int,
         blockSize: Int,
         sampler: any LogitSampler
-    ) -> MLXArray {
+    ) -> MTPDraft {
         var state = makeState(parameters: nil)
         return draftBlock(
             target: target,
@@ -173,7 +174,7 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
         blockSize: Int,
         state: inout MTPDrafterState,
         sampler: any LogitSampler
-    ) -> MLXArray {
+    ) -> MTPDraft {
         guard let target = target as? Qwen35 else {
             fatalError(
                 "Qwen35VLMNextNDraftModel requires a Qwen35 VLM target, got \(type(of: target))")
@@ -184,10 +185,12 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
         let lmHead = target.languageModel.lmHead
 
         if let seed = state.seedToken {
+            let logits = state.seedLogits!
             state.seedToken = nil
             state.seedHidden = nil
+            state.seedLogits = nil
             state.proposalAppended = 0
-            return seed
+            return MTPDraft(tokens: seed, logits: logits)
         }
 
         state.proposalAppended = blockSize - 1
@@ -252,9 +255,11 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
             positionDeltas: positionDeltas)
         state.nextPosition += committedTokens.dim(1)
         state.seedHidden = mtpHidden[0..., (-1)..., 0...]
-        state.seedToken = sampleMTPSeed(
+        let seed = makeMTPSeed(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
             lmHead: target.languageModel.lmHead, sampler: sampler)
+        state.seedToken = seed.token
+        state.seedLogits = seed.logits
         state.proposalAppended = 0
     }
 

@@ -196,10 +196,10 @@ private func assertDraftBlockMatchesFixture(name: String) async throws {
         sampler: ArgMaxSampler()
     )
 
-    eval(drafted)
-    #expect(drafted.shape == expectedDrafted.shape)
+    eval(drafted.tokens, drafted.logits)
+    #expect(drafted.tokens.shape == expectedDrafted.shape)
 
-    let swift = drafted.asArray(Int.self)
+    let swift = drafted.tokens.asArray(Int.self)
     let python = expectedDrafted.asArray(Int.self)
     #expect(swift == python, "drafter tokens diverged from Python fixture for \(name)")
 }

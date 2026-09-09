@@ -3,6 +3,23 @@
 import Foundation
 import MLX
 
+private final class ProcessingMTPLogitSampler: LogitSampler {
+    private let sampler: any LogitSampler
+    private var processor: any LogitProcessor
+
+    init(sampler: any LogitSampler, processor: any LogitProcessor) {
+        self.sampler = sampler
+        self.processor = processor
+    }
+
+    func sample(logits: MLXArray) -> MLXArray {
+        let processed = processor.process(logits: logits)
+        let token = sampler.sample(logits: processed)
+        processor.didSample(token: token)
+        return token
+    }
+}
+
 /// Generator of tokens using MTP (Multi-Token Prediction) speculative
 /// decoding.
 ///
@@ -211,9 +228,6 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         if scheduled {
-            guard !drafter.requiresGreedySampling || parameters.temperature == 0 else {
-                throw KVCacheError(message: "Scheduled Qwen MTP requires greedy sampling")
-            }
             processor?.prompt(input.text.tokens)
             return
         }
@@ -230,12 +244,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         try prepare(input: input, prefill: mtpPrefill)
         self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - prefillStart
 
-        if drafter.requiresGreedySampling, parameters.temperature != 0 {
-            switchToPassthrough(
-                reason:
-                    "Qwen MTP currently requires temperature == 0; generating without speculation"
-            )
-        }
+    }
+
+    private func makeDraftSampler() -> any LogitSampler {
+        guard let processor else { return sampler }
+        return ProcessingMTPLogitSampler(sampler: sampler, processor: processor.copy())
     }
 
     /// Advances target and shifted-prompt drafter caches together without retaining full prompt hidden states.
@@ -273,7 +286,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         drafter.prepareDrafterChunk(
             target: mainModel, shiftedTokens: shifted,
             targetHidden: hidden, isFinal: nextPromptToken == nil,
-            state: &draftState, sampler: sampler)
+            state: &draftState, sampler: makeDraftSampler())
         drafterState = draftState
         let logitsToEvaluate =
             nextPromptToken == nil || evaluateIntermediateLogits ? [result.logits] : []
@@ -286,7 +299,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         mainCache.flatMap { $0.innerState() }
             + (drafterState?.cache.flatMap { $0.innerState() } ?? [])
             + [
-                drafterState?.seedHidden, drafterState?.seedToken,
+                drafterState?.seedHidden, drafterState?.seedToken, drafterState?.seedLogits,
                 mainState?[mtpLastHiddenStatesKey],
             ].compactMap { $0 }
     }
@@ -304,7 +317,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             !passthrough, tokenCount == 0, pendingTokens.isEmpty,
             !mainCacheStorage.roundIsOpen, mainCacheStorage.processedTokenCount > 0,
             let state = drafterState, state.nextPosition == mainCacheStorage.processedTokenCount,
-            state.seedToken == nil, state.seedHidden == nil, state.proposalAppended == 0,
+            state.seedToken == nil, state.seedHidden == nil, state.seedLogits == nil,
+            state.proposalAppended == 0,
             !mainCache.isEmpty, !state.cache.isEmpty,
             state.cache.allSatisfy({ type(of: $0) == KVCacheSimple.self }),
             mainCache.allSatisfy({
@@ -507,7 +521,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 firstBonus: y.tokens,
                 positionDeltas: mainState?[mtpPositionDeltasKey],
                 state: &currentDrafterState,
-                sampler: sampler)
+                sampler: makeDraftSampler())
             drafterState = currentDrafterState
         } else if drafter.requiresPromptPrefill {
             switchToPassthrough(
@@ -517,8 +531,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         try kvCachePlan.applyAndValidate(to: mainCacheStorage)
     }
 
-    /// Single round: draft `blockSize - 1` tokens, verify with main, accept
-    /// the longest matching prefix, emit the bonus correction.
+    /// Single round: draft `blockSize - 1` tokens, verify with main, then use
+    /// exact probability-ratio acceptance for stochastic sampling (or token
+    /// equality for greedy sampling) before emitting a correction or bonus.
     mutating func speculateRound() {
         guard !passthrough else { return }
         // A prior all-accepted round may keep one recurrent checkpoint until
@@ -612,11 +627,12 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         )
 
         let bonusToken = y.tokens
-        let draftTokens: MLXArray
+        let draft: MTPDraft
+        let draftSampler = makeDraftSampler()
         if let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
             var currentDrafterState = drafterState
         {
-            draftTokens = statefulDrafter.draftBlock(
+            draft = statefulDrafter.draftBlock(
                 target: mainModel,
                 lastToken: bonusToken,
                 lastHidden: bonusSlotHidden,
@@ -625,11 +641,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 queryOffset: queryOffset,
                 blockSize: numDraft + 1,  // total round size: bonus + numDraft
                 state: &currentDrafterState,
-                sampler: sampler
+                sampler: draftSampler
             )
             drafterState = currentDrafterState
         } else {
-            draftTokens = drafter.draftBlock(
+            draft = drafter.draftBlock(
                 target: mainModel,
                 lastToken: bonusToken,
                 lastHidden: bonusSlotHidden,
@@ -637,10 +653,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 positionDeltas: state[mtpPositionDeltasKey],
                 queryOffset: queryOffset,
                 blockSize: numDraft + 1,  // total round size: bonus + numDraft
-                sampler: sampler
+                sampler: draftSampler
             )
         }
         // draftTokens shape [B, numDraft] -> flatten to [numDraft].
+        let draftTokens = draft.tokens
         let flatDraftTokens = draftTokens.flattened()
 
         // Verify pass: main model evaluates [bonus, draft_1, ..., draft_numDraft]
@@ -674,7 +691,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             pendingTokens.append(contentsOf: targetTokensList.prefix(accepted + 1))
             finalToken = targets[accepted ..< accepted + 1]
             jointGreedyVerificationCount += 1
-        } else {
+        } else if sampler is ArgMaxSampler {
             eval(flatDraftTokens)
             let draftTokensList = flatDraftTokens.asArray(Int.self)
             for i in 0 ..< numDraft {
@@ -692,8 +709,6 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 accepted += 1
             }
 
-            // Only the all-accepted path samples the bonus row. On rejection the
-            // mismatching target sample above is already the emitted correction.
             if finalToken == nil {
                 var logits = mainLogits[0..., verifyStart + accepted, 0...]
                 logits = processor?.process(logits: logits) ?? logits
@@ -703,6 +718,62 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 pendingTokens.append(bonus.item(Int.self))
                 finalToken = bonus
             }
+        } else if let probabilitySampler = sampler as? any ProbabilityLogitSampler {
+            eval(flatDraftTokens, draft.logits)
+            let draftTokensList = flatDraftTokens.asArray(Int.self)
+            var draftProcessor = processor?.copy()
+            for i in 0 ..< numDraft {
+                let draftToken = draftTokens[0..., i]
+
+                var draftLogits = draft.logits[0..., i, 0...]
+                draftLogits = draftProcessor?.process(logits: draftLogits) ?? draftLogits
+                let draftLogProbabilities = probabilitySampler.logProbabilities(
+                    logits: draftLogits)
+                draftProcessor?.didSample(token: draftToken)
+
+                var targetLogits = mainLogits[0..., verifyStart + i, 0...]
+                targetLogits = processor?.process(logits: targetLogits) ?? targetLogits
+                let targetLogProbabilities = probabilitySampler.logProbabilities(
+                    logits: targetLogits)
+
+                let tokenValue = draftTokensList[i]
+                let acceptanceProbability = speculativeAcceptanceProbability(
+                    targetLogProbabilities: targetLogProbabilities,
+                    draftLogProbabilities: draftLogProbabilities,
+                    token: tokenValue)
+                let uniform = probabilitySampler.sampleUniform()
+                eval(acceptanceProbability, uniform)
+                if uniform.item(Float.self) < acceptanceProbability.item(Float.self) {
+                    processor?.didSample(token: draftToken)
+                    pendingTokens.append(tokenValue)
+                    accepted += 1
+                    continue
+                }
+
+                let correctionLogProbabilities = speculativeCorrectionLogProbabilities(
+                    targetLogProbabilities: targetLogProbabilities,
+                    draftLogProbabilities: draftLogProbabilities)
+                let correction = probabilitySampler.sample(
+                    logProbabilities: correctionLogProbabilities)
+                eval(correction)
+                processor?.didSample(token: correction)
+                pendingTokens.append(correction.item(Int.self))
+                finalToken = correction
+                break
+            }
+
+            if finalToken == nil {
+                var logits = mainLogits[0..., verifyStart + accepted, 0...]
+                logits = processor?.process(logits: logits) ?? logits
+                let bonus = probabilitySampler.sample(logits: logits)
+                eval(bonus)
+                processor?.didSample(token: bonus)
+                pendingTokens.append(bonus.item(Int.self))
+                finalToken = bonus
+            }
+        } else {
+            preconditionFailure(
+                "parameter-derived non-greedy samplers must expose probabilities")
         }
         let emittedFinalToken = finalToken!
         committedPendingTokenCount = accepted
@@ -728,7 +799,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 finalToken: emittedFinalToken,
                 positionDeltas: mainResult.state?[mtpPositionDeltasKey],
                 state: &currentDrafterState,
-                sampler: sampler)
+                sampler: makeDraftSampler())
             drafterState = currentDrafterState
         }
 

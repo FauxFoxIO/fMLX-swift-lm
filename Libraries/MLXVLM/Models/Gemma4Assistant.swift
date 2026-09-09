@@ -210,7 +210,7 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
         queryOffset: Int,
         blockSize: Int,
         sampler: any LogitSampler
-    ) -> MLXArray {
+    ) -> MTPDraft {
         precondition(blockSize >= 2, "blockSize must be >= 2 (K-1 drafted + 1 bonus)")
 
         // Derive target-bound constants inline per round. Mirrors mlx-vlm's
@@ -234,7 +234,9 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
             lastToken.ndim == 1 ? lastToken.reshaped([lastToken.dim(0), 1]) : lastToken
         var hPrev = lastHidden
         var tokens: [MLXArray] = []
+        var proposalLogits: [MLXArray] = []
         tokens.reserveCapacity(blockSize - 1)
+        proposalLogits.reserveCapacity(blockSize - 1)
 
         for _ in 0 ..< (blockSize - 1) {
             let tokEmbed =
@@ -251,8 +253,11 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
             let nextTok = sampler.sample(logits: lastStepLogits)
             tok = nextTok.ndim == 1 ? nextTok.reshaped([nextTok.dim(0), 1]) : nextTok
             tokens.append(tok)
+            proposalLogits.append(logits[0..., (-1)..., 0...])
         }
-        return concatenated(tokens, axis: 1)
+        return MTPDraft(
+            tokens: concatenated(tokens, axis: 1),
+            logits: concatenated(proposalLogits, axis: 1))
     }
 
     /// One drafter forward — pre-projection, layer loop with shared K/V,

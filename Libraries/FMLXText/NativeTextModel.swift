@@ -55,7 +55,8 @@ public struct NativeTextModel: Sendable {
     public func prepareRequest(
         messages: [[String: any Sendable]], tools: [[String: any Sendable]]? = nil,
         additionalContext: [String: any Sendable]? = nil,
-        maximumOutputTokens: Int = 512, temperature: Float = 0, seed: UInt64? = nil,
+        maximumOutputTokens: Int = 512, temperature: Float? = nil,
+        topP: Float? = nil, topK: Int? = nil, seed: UInt64? = nil,
         priority: ConcurrentTextRuntime.Priority = .interactive, prefixTokenCount: Int = 0
     ) throws -> ConcurrentTextRuntime.Request {
         guard text.stopStrings.isEmpty else {
@@ -75,7 +76,9 @@ public struct NativeTextModel: Sendable {
             promptTokenCount: tokens.count, maximumOutputTokens: maximumOutputTokens)
         return ConcurrentTextRuntime.Request(
             tokens: tokens, maxTokens: maximumOutputTokens,
-            temperature: temperature, seed: seed, stopTokenIDs: text.stopTokenIDs,
+            temperature: temperature ?? text.temperature,
+            topP: topP ?? text.topP, topK: topK ?? text.topK,
+            seed: seed, stopTokenIDs: text.stopTokenIDs,
             priority: priority,
             prefixTokenCount: prefixTokenCount, cacheIdentity: cacheIdentity)
     }

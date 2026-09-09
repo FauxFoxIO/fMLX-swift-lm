@@ -3,6 +3,34 @@
 import Foundation
 import MLX
 
+package func speculativeAcceptanceProbability(
+    targetLogProbabilities: MLXArray,
+    draftLogProbabilities: MLXArray,
+    token: Int
+) -> MLXArray {
+    minimum(
+        exp(targetLogProbabilities[0, token] - draftLogProbabilities[0, token]),
+        MLXArray(Float(1)))
+}
+
+package func speculativeCorrectionLogProbabilities(
+    targetLogProbabilities: MLXArray,
+    draftLogProbabilities: MLXArray
+) -> MLXArray {
+    let residual = maximum(
+        exp(targetLogProbabilities) - exp(draftLogProbabilities),
+        MLXArray(Float(0)))
+    let residualSum = residual.sum(axis: -1, keepDims: true)
+    let normalized = MLX.where(
+        residualSum .> 0,
+        residual / maximum(residualSum, MLXArray(Float.leastNonzeroMagnitude)),
+        exp(targetLogProbabilities))
+    return MLX.where(
+        normalized .> 0,
+        log(normalized),
+        MLXArray(-Float.infinity))
+}
+
 private func defaultSpeculativeDecodingMemoryLimit() -> Int? {
     guard let bytes = GPU.maxRecommendedWorkingSetBytes(), bytes > 0 else {
         return nil

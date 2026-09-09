@@ -77,7 +77,6 @@ public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel,
     public let maximumBlockSize: Int? = 2
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
-    public let requiresGreedySampling = true
     private let preconvertedNorms: Bool
     private let mixedPreservedNorms: Bool
 
@@ -118,9 +117,11 @@ public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel,
         state.nextPosition += shiftedTokens.dim(1)
         if isFinal {
             state.seedHidden = hidden[0..., (-1)..., 0...]
-            state.seedToken = sampleMTPSeed(
+            let seed = makeMTPSeed(
                 hidden: state.seedHidden!,
                 targetEmbedTokens: targetEmbedTokens, lmHead: lmHead, sampler: sampler)
+            state.seedToken = seed.token
+            state.seedLogits = seed.logits
         }
         eval([hidden] + state.cache.flatMap { $0.innerState() })
     }
@@ -150,9 +151,11 @@ public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel,
             positionOffset: 0)
         state.nextPosition = shifted.dim(1)
         state.seedHidden = mtpHidden[0..., (-1)..., 0...]
-        state.seedToken = sampleMTPSeed(
+        let seed = makeMTPSeed(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
             lmHead: lmHead, sampler: sampler)
+        state.seedToken = seed.token
+        state.seedLogits = seed.logits
         state.proposalAppended = 0
     }
 
@@ -165,7 +168,7 @@ public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel,
         queryOffset: Int,
         blockSize: Int,
         sampler: any LogitSampler
-    ) -> MLXArray {
+    ) -> MTPDraft {
         var state = makeState(parameters: nil)
         return draftBlock(
             target: target,
@@ -189,15 +192,17 @@ public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel,
         blockSize: Int,
         state: inout MTPDrafterState,
         sampler: any LogitSampler
-    ) -> MLXArray {
+    ) -> MTPDraft {
         let (targetEmbedTokens, lmHead) = targetEmbeddingAndHead(target)
         let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
 
         if let seed = state.seedToken {
+            let logits = state.seedLogits!
             state.seedToken = nil
             state.seedHidden = nil
+            state.seedLogits = nil
             state.proposalAppended = 0
-            return seed
+            return MTPDraft(tokens: seed, logits: logits)
         }
 
         state.proposalAppended = blockSize - 1
@@ -259,9 +264,11 @@ public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel,
             positionOffset: state.nextPosition)
         state.nextPosition += committedTokens.dim(1)
         state.seedHidden = mtpHidden[0..., (-1)..., 0...]
-        state.seedToken = sampleMTPSeed(
+        let seed = makeMTPSeed(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
             lmHead: lmHead, sampler: sampler)
+        state.seedToken = seed.token
+        state.seedLogits = seed.logits
         state.proposalAppended = 0
     }
 

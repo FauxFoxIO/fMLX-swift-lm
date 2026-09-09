@@ -122,6 +122,8 @@ public actor ConcurrentTextRuntime {
         public let maxTokens: Int
         public let speculative: Bool
         public let temperature: Float
+        public let topP: Float
+        public let topK: Int
         public let seed: UInt64?
         public let stopTokenIDs: Set<Int>
         public let priority: Priority
@@ -132,7 +134,8 @@ public actor ConcurrentTextRuntime {
         public let cacheIdentity: PrefixCacheIdentity?
 
         public init(
-            tokens: [Int], maxTokens: Int, temperature: Float = 0, seed: UInt64? = nil,
+            tokens: [Int], maxTokens: Int, temperature: Float = 0,
+            topP: Float = 1, topK: Int = 0, seed: UInt64? = nil,
             stopTokenIDs: Set<Int> = [], priority: Priority = .interactive,
             prefixTokenCount: Int = 0, cacheIdentity: PrefixCacheIdentity? = nil,
             speculative: Bool = true
@@ -141,6 +144,8 @@ public actor ConcurrentTextRuntime {
             self.tokens = tokens
             self.maxTokens = maxTokens
             self.temperature = temperature
+            self.topP = topP
+            self.topK = topK
             self.seed = seed
             self.stopTokenIDs = stopTokenIDs
             self.priority = priority
@@ -230,7 +235,10 @@ public actor ConcurrentTextRuntime {
             self.continuation = continuation
             self.reservation = reservation
             self.sampler = GenerateParameters(
-                temperature: request.temperature, seed: request.seed
+                temperature: request.temperature,
+                topP: request.topP,
+                topK: request.topK,
+                seed: request.seed
             ).sampler()
         }
     }
@@ -312,8 +320,8 @@ public actor ConcurrentTextRuntime {
                 : configuration.cacheQuantization != nil
                     ? "MTP with quantized target KV is not qualified"
                     : drafter is any ScheduledMTPPrefixCachingDrafter
-                        ? "Greedy sampling only; MTP disk prefix restore and batched verification are unavailable"
-                        : "Greedy sampling only; MTP prefix restore and batched verification are unavailable",
+                        ? "MTP disk prefix restore and batched verification are unavailable; prefix reuse is greedy-only"
+                        : "MTP prefix restore and batched verification are unavailable",
             fusedBatching: batching, executionMode: batching ? .batchedDecode : .interleaved,
             limitation: batching
                 ? nil : "Model has not opted into batched projection/row-native attention")
@@ -332,6 +340,8 @@ public actor ConcurrentTextRuntime {
         guard !request.tokens.isEmpty, request.tokens.count <= configuration.maxPromptTokens,
             request.maxTokens > 0, request.maxTokens <= configuration.maxOutputTokens,
             request.temperature.isFinite, request.temperature >= 0,
+            request.topP.isFinite, request.topP > 0, request.topP <= 1,
+            request.topK >= 0,
             request.prefixTokenCount >= 0, request.prefixTokenCount < request.tokens.count,
             request.tokens.allSatisfy({ $0 >= 0 && $0 < model.vocabularySize })
         else { throw ConcurrentTextRuntimeError.invalidRequest }
@@ -554,7 +564,9 @@ public actor ConcurrentTextRuntime {
                     throw ConcurrentTextRuntimeError.unsupportedCache
                 }
                 if usesMTP(slot.request), let drafter = ownedDrafter {
-                    let prefix = takePrefix(for: slot.request, speculative: true)
+                    let prefix =
+                        slot.request.temperature == 0
+                        ? takePrefix(for: slot.request, speculative: true) : nil
                     let snapshot: MTPSpeculativeTokenIterator.ScheduledPrefix?
                     if case .speculative(let state) = prefix?.state {
                         snapshot = state
@@ -566,7 +578,10 @@ public actor ConcurrentTextRuntime {
                         mainCache: slot.cache,
                         parameters: GenerateParameters(
                             maxTokens: slot.request.maxTokens,
-                            temperature: 0, seed: slot.request.seed), blockSize: 2, prefix: snapshot
+                            temperature: slot.request.temperature,
+                            topP: slot.request.topP,
+                            topK: slot.request.topK,
+                            seed: slot.request.seed), blockSize: 2, prefix: snapshot
                     )
                     slot.cache = slot.iterator!.mainCache
                     slot.position = snapshot?.processedTokenCount ?? 0
@@ -596,17 +611,17 @@ public actor ConcurrentTextRuntime {
                     to: slot)
                 if slot.request.speculative, ownedDrafter != nil, slot.iterator == nil {
                     try emit(
-                        .fallback(
-                            reason: slot.request.temperature != 0
-                                ? "MTP requires greedy sampling"
-                                : "MTP requires unquantized target KV"), to: slot)
+                        .fallback(reason: "MTP requires unquantized target KV"), to: slot)
                 }
-                if slot.iterator != nil, slot.request.prefixTokenCount > 0,
-                    !(ownedDrafter is any ScheduledMTPPrefixCachingDrafter)
-                {
-                    try emit(
-                        .fallback(reason: "This MTP drafter requires cold prompt caches"),
-                        to: slot)
+                if slot.iterator != nil, slot.request.prefixTokenCount > 0 {
+                    if slot.request.temperature != 0 {
+                        try emit(
+                            .fallback(reason: "MTP prefix reuse is greedy-only"), to: slot)
+                    } else if !(ownedDrafter is any ScheduledMTPPrefixCachingDrafter) {
+                        try emit(
+                            .fallback(reason: "This MTP drafter requires cold prompt caches"),
+                            to: slot)
+                    }
                 }
             } catch {
                 finish(slot, error: error)
@@ -615,7 +630,7 @@ public actor ConcurrentTextRuntime {
     }
 
     private func usesMTP(_ request: Request) -> Bool {
-        request.speculative && request.temperature == 0 && capabilities.speculativeDecoding
+        request.speculative && capabilities.speculativeDecoding
     }
 
     private func takePrefix(for request: Request, speculative: Bool) -> Prefix? {

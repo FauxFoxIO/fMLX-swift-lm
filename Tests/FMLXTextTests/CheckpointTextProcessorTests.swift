@@ -83,6 +83,29 @@ private struct Fixture {
     #expect(try a.decode([1, 3, 2], skipSpecialTokens: true) == "hello")
 }
 
+@Test func samplingDefaultsComeFromGenerationConfiguration() async throws {
+    let fixture = try Fixture()
+    defer { fixture.remove() }
+    try fixture.write(
+        "generation_config.json",
+        object: [
+            "eos_token_id": [11], "do_sample": true,
+            "temperature": 1.0, "top_p": 0.95, "top_k": 20,
+        ]
+    )
+    let sampled = try await CheckpointTextProcessor.load(directory: fixture.directory)
+    #expect(sampled.temperature == 1)
+    #expect(sampled.topP == 0.95)
+    #expect(sampled.topK == 20)
+
+    try fixture.write(
+        "generation_config.json",
+        object: ["eos_token_id": [11], "do_sample": false, "temperature": 1.0]
+    )
+    let greedy = try await CheckpointTextProcessor.load(directory: fixture.directory)
+    #expect(greedy.temperature == 0)
+}
+
 @Test func templateChangesInvalidateCacheAndSidecarWins() async throws {
     let fixture = try Fixture()
     defer { fixture.remove() }

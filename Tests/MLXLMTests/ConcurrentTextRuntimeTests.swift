@@ -409,6 +409,14 @@ final class ConcurrentTextRuntimeTests: XCTestCase {
             XCTAssertEqual(restored.reused, 4)
             XCTAssertEqual(restored.tokens, Array(expectedB.prefix(4)))
             if bits == 0 {
+                let sampled = try await collect(
+                    runtime.generate(
+                        .init(
+                            tokens: short, maxTokens: 8, temperature: 0.7,
+                            topP: 0.95, topK: 20, seed: 7)))
+                XCTAssertEqual(sampled.tokens.count, 8)
+                XCTAssertGreaterThan(sampled.speculativeRounds, 0)
+
                 let stopToken = expectedA[3]
                 let stopIndex = expectedA.firstIndex(of: stopToken)!
                 let stopped = try await collect(
