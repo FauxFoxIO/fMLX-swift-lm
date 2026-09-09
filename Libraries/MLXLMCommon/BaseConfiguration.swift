@@ -152,6 +152,8 @@ public struct BaseConfiguration: Codable, Sendable {
                 // additional keys that are not layer instructions, see
                 // mlx-community/bitnet-b1.58-2B-4T-4bit
                 case "quant_method", "linear_class", "quantization_mode": continue
+                // Conversion metadata in combined JANG/Osaurus Qwen checkpoints.
+                case "vision", "mtp", "quantization_backend": continue
 
                 default:
                     // If the value is a boolean 'false', we treat it as .skip

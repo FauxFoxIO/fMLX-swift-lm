@@ -131,6 +131,7 @@ public struct HuggingFaceModelHub: @unchecked Sendable {
 
     public static let supportedModelTypes: Set<String> = [
         "llama", "mistral", "qwen3", "qwen3_5", "qwen3_5_text", "qwen3_5_moe",
+        "qwen3_5_mtp",
     ]
 
     public static func isValidRepositoryID(_ id: String) -> Bool {

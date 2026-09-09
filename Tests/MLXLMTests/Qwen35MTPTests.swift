@@ -7,6 +7,87 @@ import Testing
 @testable import MLXLLM
 @testable import MLXVLM
 
+@Test func combinedQwenPreservedHeadConvertsMixedNorms() throws {
+    let config = try JSONDecoder().decode(
+        MLXLLM.Qwen35TextConfiguration.self,
+        from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+    let model = MLXLLM.Qwen35MTPDraftModel(config, mixedPreservedNorms: true)
+    let result = model.sanitize(weights: [
+        "mtp.norm.weight": MLXArray.full([16], values: MLXArray(Float(2.1))),
+        "mtp.pre_fc_norm_embedding.weight": MLXArray.full([16], values: MLXArray(Float(-0.5))),
+        "mtp.layers.0.input_layernorm.weight": MLXArray.zeros([16]),
+    ])
+    #expect(
+        try #require(result["mtp.norm.weight"]).asArray(Float.self)
+            == Array(repeating: Float(2.1), count: 16))
+    #expect(
+        try #require(result["mtp.pre_fc_norm_embedding.weight"]).asArray(Float.self)
+            == Array(repeating: Float(0.5), count: 16))
+    #expect(
+        try #require(result["mtp.layers.0.input_layernorm.weight"]).asArray(Float.self)
+            == Array(repeating: Float(1), count: 16))
+}
+
+@Test func combinedQuantizedMoECheckpointLoadsTargetAndMTP() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "combined-qwen-\(UUID())")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let data = Data(
+        """
+        {"model_type":"qwen3_5_moe","text_config":{
+        "model_type":"qwen3_5_moe_text","hidden_size":64,"num_hidden_layers":2,
+        "intermediate_size":128,"num_attention_heads":2,"num_key_value_heads":1,
+        "head_dim":32,"linear_num_value_heads":2,"linear_num_key_heads":1,
+        "linear_key_head_dim":32,"linear_value_head_dim":32,"linear_conv_kernel_dim":4,
+        "vocab_size":100,"full_attention_interval":2,"mtp_num_hidden_layers":1,
+        "tie_word_embeddings":true,"rope_theta":10000000.0,"partial_rotary_factor":0.25,
+        "num_experts":2,"num_experts_per_tok":1,"moe_intermediate_size":64,"shared_expert_intermediate_size":64},
+        "quantization":{"bits":4,"group_size":32,"mode":"affine","vision":"fp16_passthrough",
+        "mtp":"preserved","quantization_backend":"mx.quantize"}}
+        """.utf8)
+    try data.write(to: directory.appendingPathComponent("config.json"))
+    let configuration = try JSONDecoder().decode(MLXLLM.Qwen35Configuration.self, from: data)
+    do {
+        let target = MLXLLM.Qwen35MoEModel(configuration)
+        let head = MLXLLM.Qwen35MTPDraftModel(configuration, preconvertedNorms: true)
+        quantize(model: target, groupSize: 32, bits: 4)
+        quantize(model: head, groupSize: 32, bits: 4)
+        var arrays = Dictionary(uniqueKeysWithValues: target.parameters().flattened())
+        arrays.merge(Dictionary(uniqueKeysWithValues: head.parameters().flattened())) { _, new in
+            new
+        }
+        arrays["vision_tower.unused.weight"] = MLXArray.zeros([2, 2])
+        try save(arrays: arrays, url: directory.appendingPathComponent("model.safetensors"))
+    }
+    let target = try await NativeTextModelLoader.load(directory: directory)
+    let head = try #require(try await NativeTextModelLoader.loadCombinedMTP(directory: directory))
+    let runtime = try ConcurrentTextRuntime(
+        model: target,
+        identity: .init(
+            modelRevision: "fixture", tokenizerRevision: "fixture", chatTemplateRevision: "fixture",
+            adapterRevision: "none", cacheLayoutRevision: "fixture"),
+        configuration: .init(
+            memoryBudgetBytes: 32_000_000, prefixCacheBytes: 1_000_000,
+            workingMemoryBytes: 1_000_000, prefillChunkSize: 2), drafter: head)
+    func generate(speculative: Bool) async throws -> [Int] {
+        let stream = try await runtime.generate(
+            .init(tokens: [1, 2, 3, 4], maxTokens: 12, speculative: speculative))
+        var tokens: [Int] = []
+        var rounds = 0
+        for try await event in stream.events {
+            if case .token(let token) = event { tokens.append(token) }
+            if case .speculation(let telemetry) = event { rounds += telemetry.roundCount }
+        }
+        if speculative { #expect(rounds > 0) }
+        return tokens
+    }
+    let baseline = try await generate(speculative: false)
+    let speculative = try await generate(speculative: true)
+    #expect(baseline == speculative)
+    await runtime.shutdown()
+}
+
 @Test
 func testQwen35TextConfigurationDecodesMTPFields() throws {
     let cfg = try JSONDecoder().decode(

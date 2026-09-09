@@ -17,12 +17,18 @@ public struct NativeTextModel: Sendable {
     public static func load(
         directory: URL, modelRevision: String,
         configuration: ConcurrentTextRuntime.Configuration,
-        extraEOSTokens: Set<String> = []
+        extraEOSTokens: Set<String> = [],
+        mtpCompanionDirectory: URL? = nil
     ) async throws -> Self {
         let text = try await CheckpointTextProcessor.load(
             directory: directory, extraEOSTokens: extraEOSTokens)
         let model = try await NativeTextModelLoader.load(directory: directory)
-        let drafter = try await NativeTextModelLoader.loadEmbeddedMTP(directory: directory)
+        let drafter: Qwen35MTPDraftModel?
+        if let mtpCompanionDirectory {
+            drafter = try await NativeTextModelLoader.loadMTP(directory: mtpCompanionDirectory)
+        } else {
+            drafter = try await NativeTextModelLoader.loadCombinedMTP(directory: directory)
+        }
         try Task.checkCancellation()
         try text.verifyAssets(directory: directory)
         guard model.vocabularySize == text.vocabularySize else {

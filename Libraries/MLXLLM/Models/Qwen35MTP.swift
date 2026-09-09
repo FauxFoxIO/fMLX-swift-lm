@@ -79,15 +79,18 @@ public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel,
     public let requiresPromptPrefill = true
     public let requiresGreedySampling = true
     private let preconvertedNorms: Bool
+    private let mixedPreservedNorms: Bool
 
     @ModuleInfo(key: "mtp") var mtp: Qwen35MTPPredictor
 
     public init(
         _ configuration: Qwen35TextConfiguration,
-        preconvertedNorms: Bool = false
+        preconvertedNorms: Bool = false,
+        mixedPreservedNorms: Bool = false
     ) {
         self.configuration = configuration
         self.preconvertedNorms = preconvertedNorms
+        self.mixedPreservedNorms = mixedPreservedNorms
         _mtp.wrappedValue = Qwen35MTPPredictor(configuration)
         super.init()
     }
@@ -263,12 +266,28 @@ public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel,
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        qwenMTPSanitizeWeights(
+        var result = qwenMTPSanitizeWeights(
             weights: weights,
             mtpNumHiddenLayers: configuration.mtpNumHiddenLayers,
             numExperts: configuration.numExperts,
-            shiftNormWeights: !preconvertedNorms
+            shiftNormWeights: !preconvertedNorms && !mixedPreservedNorms
         )
+        if mixedPreservedNorms {
+            // JANG preserved heads mix raw and converted RMSNorm weights. Match
+            // oMLX's per-tensor conversion rather than shifting the entire head twice.
+            let suffixes = [
+                ".norm.weight", ".pre_fc_norm_embedding.weight", ".pre_fc_norm_hidden.weight",
+                ".input_layernorm.weight", ".post_attention_layernorm.weight", ".q_norm.weight",
+                ".k_norm.weight",
+            ]
+            for (key, value) in result
+            where value.ndim == 1 && suffixes.contains(where: key.hasSuffix) {
+                if value.asType(.float32).mean().item(Float.self) < 0.5 {
+                    result[key] = value + MLXArray(1, dtype: value.dtype)
+                }
+            }
+        }
+        return result
     }
 
     private func targetEmbeddingAndHead(_ target: any LanguageModel) -> (Embedding, Linear?) {
