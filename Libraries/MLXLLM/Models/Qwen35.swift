@@ -643,10 +643,9 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // Decode (S == 1) runs through a compiled trace: fusion merges the
-        // elementwise chains into fewer kernels, bit-identically. Prefill
-        // stays unfused — it is GEMM-bound and would pay a trace per shape.
-        if x.dim(1) != 1 {
+        // Decode and two-token MTP verification run through a compiled trace.
+        // Longer prefill stays unfused because it is GEMM-bound.
+        if x.dim(1) > 2 {
             return forward(x)
         }
         return compiledForward(self, x)
@@ -735,8 +734,7 @@ final class Qwen35DecoderLayer: Module {
         checkpointAfter: Int? = nil
     ) -> MLXArray {
         if compiledVerificationEnabled, x.dim(1) == 2, checkpointAfter == 1, ssmMask == nil,
-            positionOffset == nil,
-            mlp is Qwen3NextMLP
+            positionOffset == nil
         {
             if isLinear, let mambaCache = cache as? MambaCache,
                 mambaCache[0] != nil, mambaCache[1] != nil
@@ -1126,11 +1124,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public let model: Qwen35TextModelInner
     let configuration: Qwen35TextConfiguration
+    private let mixedPreservedNorms: Bool
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
-    public init(_ args: Qwen35TextConfiguration) {
+    public init(_ args: Qwen35TextConfiguration, mixedPreservedNorms: Bool = false) {
         self.configuration = args
+        self.mixedPreservedNorms = mixedPreservedNorms
         self.vocabularySize = args.vocabularySize
         self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
         self.model = Qwen35TextModelInner(args)
@@ -1208,10 +1208,9 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let hasUnsanitizedConv1d = weights.contains { key, value in
             key.contains("conv1d.weight") && value.dim(-1) != 1
         }
-        // MTP tensors are not proof of a raw checkpoint: a converted checkpoint can
-        // keep them (the framework uses them for speculative decoding), and shifting
-        // its already-shifted norms a second time produces garbage tokens. The conv1d
-        // layout is the reliable signal on its own.
+        // Ordinary converted checkpoints advertise their norm convention through
+        // convolution layout. JANG MXFP bundles are the typed exception: projections
+        // and convolutions are converted while source `(1 + weight)` norms are retained.
         let shouldShiftNormWeights = hasUnsanitizedConv1d
 
         var weights = weights.filter { !$0.key.contains("mtp.") }
@@ -1233,10 +1232,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 weights[k] = v.movedAxis(source: 2, destination: 1)
                 continue
             }
-            if shouldShiftNormWeights
-                && normKeys.contains(where: { k.hasSuffix($0) })
-                && v.ndim == 1
-            {
+            let isNorm = v.ndim == 1 && normKeys.contains(where: { k.hasSuffix($0) })
+            if isNorm && (shouldShiftNormWeights || mixedPreservedNorms) {
                 weights[k] = v + MLXArray(1, dtype: v.dtype)
             }
         }
@@ -1288,7 +1285,8 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
 
     public init(_ args: Qwen35Configuration) {
-        let textModel = Qwen35TextModel(args.textConfig)
+        let textModel = Qwen35TextModel(
+            args.textConfig, mixedPreservedNorms: args.mixedPreservedNorms)
         self.vocabularySize = textModel.vocabularySize
         self.kvHeads = textModel.kvHeads
         _languageModel.wrappedValue = textModel

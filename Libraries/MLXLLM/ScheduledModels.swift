@@ -89,8 +89,8 @@ public enum NativeTextModelLoader {
         let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         let quantization = object?["quantization"] as? [String: Any]
         let mixed =
-            quantization?["mtp"] as? String == "preserved"
-            && quantization?["quantization_backend"] as? String == "mx.quantize"
+            configuration.mixedPreservedNorms
+            && quantization?["mtp"] as? String == "preserved"
         let drafter = Qwen35MTPDraftModel(
             configuration.textConfig, preconvertedNorms: base.perLayerQuantization != nil,
             mixedPreservedNorms: mixed)
@@ -148,8 +148,10 @@ public enum NativeTextModelLoader {
                 base.modelType == "qwen3_5_moe"
                 ? Qwen35MoEModel(configuration) : Qwen35Model(configuration)
         case "qwen3_5_text":
+            let configuration = try JSONDecoder().decode(Qwen35Configuration.self, from: data)
             model = Qwen35TextModel(
-                try JSONDecoder().decode(Qwen35TextConfiguration.self, from: data))
+                configuration.textConfig,
+                mixedPreservedNorms: configuration.mixedPreservedNorms)
         default:
             throw ConcurrentTextRuntimeError.unsupportedCache
         }

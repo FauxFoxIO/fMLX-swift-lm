@@ -57,7 +57,8 @@ public struct NativeTextModel: Sendable {
         additionalContext: [String: any Sendable]? = nil,
         maximumOutputTokens: Int = 512, temperature: Float? = nil,
         topP: Float? = nil, topK: Int? = nil, seed: UInt64? = nil,
-        priority: ConcurrentTextRuntime.Priority = .interactive, prefixTokenCount: Int = 0
+        priority: ConcurrentTextRuntime.Priority = .interactive, prefixTokenCount: Int = 0,
+        cachePromptPrefix: Bool = false
     ) throws -> ConcurrentTextRuntime.Request {
         guard text.stopStrings.isEmpty else {
             throw CheckpointTextError.stringStopsRequireTextGeneration
@@ -67,8 +68,9 @@ public struct NativeTextModel: Sendable {
         }
         let tokens = try text.prepareChat(
             messages: messages, tools: tools, additionalContext: additionalContext)
-        guard tokens.count <= configuration.maxPromptTokens, prefixTokenCount >= 0,
-            prefixTokenCount < tokens.count
+        let resolvedPrefixTokenCount = cachePromptPrefix ? tokens.count - 1 : prefixTokenCount
+        guard tokens.count <= configuration.maxPromptTokens, resolvedPrefixTokenCount >= 0,
+            resolvedPrefixTokenCount < tokens.count
         else {
             throw ConcurrentTextRuntimeError.invalidRequest
         }
@@ -80,6 +82,6 @@ public struct NativeTextModel: Sendable {
             topP: topP ?? text.topP, topK: topK ?? text.topK,
             seed: seed, stopTokenIDs: text.stopTokenIDs,
             priority: priority,
-            prefixTokenCount: prefixTokenCount, cacheIdentity: cacheIdentity)
+            prefixTokenCount: resolvedPrefixTokenCount, cacheIdentity: cacheIdentity)
     }
 }

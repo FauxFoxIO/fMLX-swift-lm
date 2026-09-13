@@ -119,6 +119,51 @@ final class Qwen38CompatibilityTests: XCTestCase {
         }
     }
 
+    func testJANGMXFPCheckpointShiftsPreservedRawNormWeights() throws {
+        let json = """
+            {
+                "model_type": "qwen3_5_moe",
+                "weight_format": "mxfp4",
+                "quantization": {
+                    "bits": 4, "group_size": 32, "mode": "affine",
+                    "quantization_backend": "mx.quantize"
+                },
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text",
+                    "hidden_size": 32, "num_hidden_layers": 4, "intermediate_size": 64,
+                    "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 16,
+                    "linear_num_value_heads": 6, "linear_num_key_heads": 2,
+                    "linear_key_head_dim": 16, "linear_value_head_dim": 16,
+                    "linear_conv_kernel_dim": 4, "vocab_size": 32,
+                    "full_attention_interval": 4, "num_experts": 2,
+                    "num_experts_per_tok": 1, "moe_intermediate_size": 16,
+                    "shared_expert_intermediate_size": 16,
+                    "rms_norm_eps": 0.000001, "tie_word_embeddings": false
+                }
+            }
+            """
+        let configuration = try JSONDecoder().decode(
+            Qwen35Configuration.self, from: Data(json.utf8))
+        XCTAssertTrue(configuration.mixedPreservedNorms)
+        let model = Qwen35TextModel(
+            configuration.textConfig,
+            mixedPreservedNorms: configuration.mixedPreservedNorms)
+        let raw = MLXArray([Float(-0.25), 0.75, 1.5])
+        let normKeys = [
+            "model.norm.weight", "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+        ]
+        let sanitized = model.sanitize(
+            weights: Dictionary(uniqueKeysWithValues: normKeys.map { ($0, raw) }))
+
+        for key in normKeys {
+            XCTAssertEqual(
+                try XCTUnwrap(sanitized[key]).asArray(Float.self),
+                [0.75, 1.75, 2.5],
+                key)
+        }
+    }
+
     func testCompiledDecodeMatchesFullPrefillWithQwen38Metadata() throws {
         let config = try configuration()
         let model = withRandomState(MLXRandom.RandomState(seed: 38)) {

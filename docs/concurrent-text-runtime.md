@@ -11,7 +11,7 @@ chat policy, package product change, or deployment-floor increase is required.
 | --- | --- | --- |
 | Llama/Mistral, Qwen3 | Chunked prefill and continuous batched decode | Simple or affine 4/8-bit attention KV |
 | Qwen3.5/3.8 text and hybrid wrappers | Batched projections with independent attention and packed recurrent rows | Exact Mamba caches; multimodal inputs excluded |
-| Qwen MTP | Per-request target/drafter state, bounded shifted-prompt prefill, existing rollback machinery | Matching trained head, greedy sampling, block size two; unquantized target KV |
+| Qwen MTP | Per-request target/drafter state, stochastic ratio verification, bounded shifted-prompt prefill, existing rollback machinery | Matching trained head, block size two; unquantized target KV |
 | Prefix snapshots | Immutable hot copies and optional persistent restart restore | Simple, affine quantized, Mamba; Qwen MTP uses paired in-memory snapshots only |
 | Public Core ML/ANE | Isolated feasibility and transfer probe | No production acceleration claim; see public-accelerator-evidence.md |
 
@@ -56,8 +56,8 @@ The owned [FMLXText product](checkpoint-text.md) supplies checkpoint-specific te
 processing and a paired native loader without putting tokenizer policy inside
 the scheduler or requiring Mirage/Bright Eyes to implement it themselves.
 `Request.speculative` defaults to true when a compatible drafter is configured.
-Capabilities and execution/fallback events disclose the selected path. Nonzero
-temperature and quantized target KV use ordinary decoding. Qwen MTP reuses paired
+Capabilities and execution/fallback events disclose the selected path. Quantized
+target KV uses ordinary decoding. Qwen MTP reuses paired
 target/drafter snapshots at existing chunk boundaries. The drafter needs one
 lookahead token inside the allowed prefix, so a 128-token chunk size and 2048-token
 prefix permit 1920 tokens of reuse. Other drafters must explicitly support this

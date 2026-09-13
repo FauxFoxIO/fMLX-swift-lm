@@ -280,8 +280,8 @@ public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel,
             shiftNormWeights: !preconvertedNorms && !mixedPreservedNorms
         )
         if mixedPreservedNorms {
-            // JANG preserved heads mix raw and converted RMSNorm weights. Match
-            // oMLX's per-tensor conversion rather than shifting the entire head twice.
+            // JANG preserves Qwen's raw `(1 + weight)` RMSNorm tensors while
+            // converting the surrounding projections to MLX layout.
             let suffixes = [
                 ".norm.weight", ".pre_fc_norm_embedding.weight", ".pre_fc_norm_hidden.weight",
                 ".input_layernorm.weight", ".post_attention_layernorm.weight", ".q_norm.weight",
@@ -289,9 +289,7 @@ public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel,
             ]
             for (key, value) in result
             where value.ndim == 1 && suffixes.contains(where: key.hasSuffix) {
-                if value.asType(.float32).mean().item(Float.self) < 0.5 {
-                    result[key] = value + MLXArray(1, dtype: value.dtype)
-                }
+                result[key] = value + MLXArray(1, dtype: value.dtype)
             }
         }
         return result

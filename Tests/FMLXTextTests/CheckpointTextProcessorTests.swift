@@ -293,6 +293,11 @@ private struct Fixture {
         #expect(request.tokens == [1, 5, 3, 6])
         #expect(request.stopTokenIDs == [2, 11])
         #expect(request.cacheIdentity == loaded.cacheIdentity)
+        let automaticPrefix = try loaded.prepareRequest(
+            messages: [["role": "user", "content": "hello"]],
+            maximumOutputTokens: 4,
+            cachePromptPrefix: true)
+        #expect(automaticPrefix.prefixTokenCount == automaticPrefix.tokens.count - 1)
         let generation = try await loaded.runtime.generate(request)
         var tokens: [Int] = []
         var finished = false

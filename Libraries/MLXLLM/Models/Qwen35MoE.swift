@@ -15,15 +15,35 @@ import MLXNN
 public struct Qwen35Configuration: Codable, Sendable {
     var modelType: String
     var textConfig: Qwen35TextConfiguration
+    private var weightFormat: String?
+    private var quantizationMetadata: QuantizationMetadata?
+    var mixedPreservedNorms: Bool {
+        let format = weightFormat?.lowercased()
+        return quantizationMetadata?.backend == "mx.quantize"
+            && (format == "mxfp4" || format == "mxfp8")
+    }
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case textConfig = "text_config"
+        case weightFormat = "weight_format"
+        case quantizationMetadata = "quantization"
+    }
+
+    private struct QuantizationMetadata: Codable {
+        let backend: String?
+
+        enum CodingKeys: String, CodingKey {
+            case backend = "quantization_backend"
+        }
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.modelType = try container.decode(String.self, forKey: .modelType)
+        self.weightFormat = try container.decodeIfPresent(String.self, forKey: .weightFormat)
+        self.quantizationMetadata = try container.decodeIfPresent(
+            QuantizationMetadata.self, forKey: .quantizationMetadata)
 
         if let textConfig = try container.decodeIfPresent(
             Qwen35TextConfiguration.self, forKey: .textConfig)

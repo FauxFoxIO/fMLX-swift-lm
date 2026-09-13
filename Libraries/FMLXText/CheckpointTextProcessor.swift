@@ -92,13 +92,15 @@ public struct CheckpointTextProcessor: Sendable {
         let generation = try assets.files["generation_config.json"].map {
             try decoder.decode(GenerationConfigFile.self, from: $0)
         }
-        let temperature = generation?.doSample == false
+        let temperature =
+            generation?.doSample == false
             ? 0 : generation?.temperature ?? 0.6
         let topP = generation?.topP ?? 1
         let topK = generation?.topK ?? 0
         guard temperature.isFinite, temperature >= 0,
-              topP.isFinite, topP > 0, topP <= 1,
-              topK >= 0 else {
+            topP.isFinite, topP > 0, topP <= 1,
+            topK >= 0
+        else {
             throw CheckpointTextError.invalidConfiguration(
                 "generation_config.json contains invalid sampling parameters"
             )

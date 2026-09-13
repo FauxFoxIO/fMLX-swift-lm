@@ -145,7 +145,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     ) throws {
         if let prefix {
             guard drafter is any ScheduledMTPPrefixCachingDrafter,
-                mainModel is any ScheduledTextModel, parameters.temperature == 0,
+                mainModel is any ScheduledTextModel,
                 prefix.processedTokenCount < scheduledPrompt.count
             else { throw KVCacheError(message: "Incompatible scheduled MTP prefix") }
         }
@@ -190,7 +190,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         self.processor = components.logitProcessor(parameters: parameters)
         if scheduledPrefix != nil, processor != nil {
             throw KVCacheError(
-                message: "Scheduled MTP prefix restore requires pure greedy sampling")
+                message: "Scheduled MTP prefix restore does not support stateful logit processors")
         }
 
         self.maxTokens = parameters.maxTokens
@@ -313,7 +313,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
     package var scheduledPrefixCacheBytes: Int? {
         guard drafter is any ScheduledMTPPrefixCachingDrafter,
-            mainModel is any ScheduledTextModel, sampler is ArgMaxSampler, processor == nil,
+            mainModel is any ScheduledTextModel, processor == nil,
             !passthrough, tokenCount == 0, pendingTokens.isEmpty,
             !mainCacheStorage.roundIsOpen, mainCacheStorage.processedTokenCount > 0,
             let state = drafterState, state.nextPosition == mainCacheStorage.processedTokenCount,

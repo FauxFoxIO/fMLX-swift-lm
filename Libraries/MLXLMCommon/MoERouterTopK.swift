@@ -86,15 +86,17 @@ package enum FusedRouterTopKOrder {
     case descending
 }
 
-/// Whether a router tensor can use the fused single-row Metal path.
+/// Whether a router tensor can use the fused small-row Metal path.
 package func supportsFusedRouterTopK(_ selection: MLXArray, k: Int) -> Bool {
     let e = selection.dim(-1)
-    return selection.size == e && e <= maxFusedRouterExperts && k > 0 && k <= e
+    guard e > 0 else { return false }
+    let rows = selection.size / e
+    return (1 ... 2).contains(rows) && e <= maxFusedRouterExperts && k > 0 && k <= e
         && selection.dtype.isFloatingPoint
 }
 
 /// Fused top-k selection, selected-value gather, and optional normalization.
-/// Callers are responsible for restricting production use to the single-row
+/// Callers are responsible for restricting production use to the small-row
 /// decode shape with ``supportsFusedRouterTopK(_:k:)``.
 package func fusedRouterTopK(
     selection: MLXArray,
@@ -155,8 +157,8 @@ func chainRouterTopK(
     return (inds, scores)
 }
 
-/// Selects experts using the fused kernel for a single decode row and the
-/// reference chain for prefill, batched decode, or unsupported expert counts.
+/// Selects experts using the fused kernel for one- and two-row decode shapes and
+/// the reference chain for larger inputs or unsupported expert counts.
 package func moeRouterTopK(
     _ gates: MLXArray, k: Int, normalize: Bool
 ) -> (indices: MLXArray, scores: MLXArray) {

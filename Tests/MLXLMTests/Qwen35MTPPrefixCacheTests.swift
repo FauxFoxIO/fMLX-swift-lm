@@ -79,12 +79,31 @@ final class Qwen35MTPPrefixCacheTests: XCTestCase {
 
     private func request(
         _ tokens: [Int], prefix: Int = 13, speculative: Bool = true, maxTokens: Int = 16,
-        stop: Set<Int> = [], identity: PrefixCacheIdentity? = nil
+        stop: Set<Int> = [], identity: PrefixCacheIdentity? = nil,
+        temperature: Float = 0, seed: UInt64? = nil
     ) -> PrefixRuntime.Request {
         .init(
-            tokens: tokens, maxTokens: maxTokens, stopTokenIDs: stop,
+            tokens: tokens, maxTokens: maxTokens, temperature: temperature,
+            topP: 0.95, topK: 20, seed: seed, stopTokenIDs: stop,
             prefixTokenCount: prefix, cacheIdentity: identity ?? self.identity(),
             speculative: speculative)
+    }
+
+    func testStochasticMTPReusesPairedPrefixWithoutChangingSeededOutput() async throws {
+        let runtime = try runtime()
+        let tokens = Array(1 ... 17)
+        let cold = try await collectPrefix(
+            runtime.generate(
+                request(tokens, prefix: 13, temperature: 0.6, seed: 7)))
+        let warm = try await collectPrefix(
+            runtime.generate(
+                request(tokens, prefix: 13, temperature: 0.6, seed: 7)))
+
+        XCTAssertEqual(cold.reused, 0)
+        XCTAssertEqual(warm.reused, 12)
+        XCTAssertEqual(warm.tokens, cold.tokens)
+        XCTAssertTrue(warm.fallbacks.isEmpty)
+        await runtime.shutdown()
     }
 
     func testPairedPrefixesPreserveBranchesStopsAndExecutionKinds() async throws {

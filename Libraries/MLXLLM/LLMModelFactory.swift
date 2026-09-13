@@ -69,7 +69,7 @@ public enum LLMTypeRegistry {
         "qwen3_next": create(Qwen3NextConfiguration.self, Qwen3NextModel.init),
         "qwen3_5": create(Qwen35Configuration.self, Qwen35Model.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
-        "qwen3_5_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
+        "qwen3_5_text": create(Qwen35TextConfiguration.self) { Qwen35TextModel($0) },
         "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
         "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
         "starcoder2": create(Starcoder2Configuration.self, Starcoder2Model.init),

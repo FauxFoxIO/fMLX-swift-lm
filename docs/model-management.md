@@ -46,3 +46,7 @@ The combined `OsaurusAI/Qwen3.6-35B-A3B-MXFP4-MTP` checkpoint declares
 `qwen3_5_moe`, `text_config.mtp_num_hidden_layers = 1`, and embedded `mtp.*` weights. Its normal
 target load filters MTP tensors, while `loadEmbeddedMTP` loads those same tensors into the matching
 drafter and gives both models to `ConcurrentTextRuntime` for verified speculative decoding.
+Its JANG metadata marks a mixed conversion: projections use MLX layout while Qwen RMSNorm tensors
+retain the source `(1 + weight)` convention. The native loader shifts those preserved target and
+MTP norms exactly once; treating convolution layout as proof that every tensor was converted
+produces corrupt multilingual output.

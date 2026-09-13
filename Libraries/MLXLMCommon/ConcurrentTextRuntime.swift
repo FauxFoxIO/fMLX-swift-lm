@@ -320,7 +320,7 @@ public actor ConcurrentTextRuntime {
                 : configuration.cacheQuantization != nil
                     ? "MTP with quantized target KV is not qualified"
                     : drafter is any ScheduledMTPPrefixCachingDrafter
-                        ? "MTP disk prefix restore and batched verification are unavailable; prefix reuse is greedy-only"
+                        ? "MTP disk prefix restore and batched verification are unavailable"
                         : "MTP prefix restore and batched verification are unavailable",
             fusedBatching: batching, executionMode: batching ? .batchedDecode : .interleaved,
             limitation: batching
@@ -564,9 +564,7 @@ public actor ConcurrentTextRuntime {
                     throw ConcurrentTextRuntimeError.unsupportedCache
                 }
                 if usesMTP(slot.request), let drafter = ownedDrafter {
-                    let prefix =
-                        slot.request.temperature == 0
-                        ? takePrefix(for: slot.request, speculative: true) : nil
+                    let prefix = takePrefix(for: slot.request, speculative: true)
                     let snapshot: MTPSpeculativeTokenIterator.ScheduledPrefix?
                     if case .speculative(let state) = prefix?.state {
                         snapshot = state
@@ -614,10 +612,7 @@ public actor ConcurrentTextRuntime {
                         .fallback(reason: "MTP requires unquantized target KV"), to: slot)
                 }
                 if slot.iterator != nil, slot.request.prefixTokenCount > 0 {
-                    if slot.request.temperature != 0 {
-                        try emit(
-                            .fallback(reason: "MTP prefix reuse is greedy-only"), to: slot)
-                    } else if !(ownedDrafter is any ScheduledMTPPrefixCachingDrafter) {
+                    if !(ownedDrafter is any ScheduledMTPPrefixCachingDrafter) {
                         try emit(
                             .fallback(reason: "This MTP drafter requires cold prompt caches"),
                             to: slot)

@@ -19,7 +19,7 @@ import Testing
     ])
     #expect(
         try #require(result["mtp.norm.weight"]).asArray(Float.self)
-            == Array(repeating: Float(2.1), count: 16))
+            == Array(repeating: Float(3.1), count: 16))
     #expect(
         try #require(result["mtp.pre_fc_norm_embedding.weight"]).asArray(Float.self)
             == Array(repeating: Float(0.5), count: 16))
@@ -217,11 +217,13 @@ func testQwen35MTPDraftInstantiatesDedicatedEmbeddingWhenConfigured() throws {
 
 @Suite(.serialized)
 struct Qwen35MTPMetalTests {
-    @Test(arguments: [false, true])
-    func testCompiledVerificationPreservesRecurrentCheckpoint(fusedCheckpoint: Bool) throws {
+    @Test(arguments: [false, true], [0, 2])
+    func testCompiledVerificationPreservesRecurrentCheckpoint(
+        fusedCheckpoint: Bool, numExperts: Int
+    ) throws {
         var cfg = try JSONDecoder().decode(
             MLXLLM.Qwen35TextConfiguration.self,
-            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1, numExperts: numExperts).utf8))
         cfg.fullAttentionInterval = 4
         cfg.linearKeyHeadDim = 128
         cfg.linearValueHeadDim = 128
