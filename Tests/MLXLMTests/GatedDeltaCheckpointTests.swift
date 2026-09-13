@@ -5,18 +5,20 @@ import XCTest
 @testable import MLXLMCommon
 
 final class GatedDeltaCheckpointTests: XCTestCase {
-    private func inputs(dtype: DType, dimension: Int, fullWidth: Bool) -> [MLXArray] {
+    private func inputs(
+        dtype: DType, dimension: Int, fullWidth: Bool, length: Int = 2
+    ) -> [MLXArray] {
         withRandomState(MLXRandom.RandomState(seed: 184)) {
             let batch = fullWidth ? 1 : 2
             let keyHeads = fullWidth ? 16 : 2
             let valueHeads = fullWidth ? 48 : 4
             let valueDimension = fullWidth ? 128 : 8
             return [
-                (MLXRandom.normal([batch, 2, keyHeads, dimension]) * 0.05).asType(dtype),
-                (MLXRandom.normal([batch, 2, keyHeads, dimension]) * 0.05).asType(dtype),
-                MLXRandom.normal([batch, 2, valueHeads, valueDimension]).asType(dtype),
-                sigmoid(MLXRandom.normal([batch, 2, valueHeads])),
-                sigmoid(MLXRandom.normal([batch, 2, valueHeads])),
+                (MLXRandom.normal([batch, length, keyHeads, dimension]) * 0.05).asType(dtype),
+                (MLXRandom.normal([batch, length, keyHeads, dimension]) * 0.05).asType(dtype),
+                MLXRandom.normal([batch, length, valueHeads, valueDimension]).asType(dtype),
+                sigmoid(MLXRandom.normal([batch, length, valueHeads])),
+                sigmoid(MLXRandom.normal([batch, length, valueHeads])),
                 MLXRandom.normal([batch, valueHeads, valueDimension, dimension]),
             ]
         }
@@ -52,6 +54,66 @@ final class GatedDeltaCheckpointTests: XCTestCase {
                 }
             }
         }
+    }
+
+    func testFourCheckpointsMatchOnePassAndEveryPrefixBitwise() {
+        for dtype in [DType.float32, .float16, .bfloat16] {
+            for dimension in [32, 128, 192] {
+                let input = inputs(
+                    dtype: dtype, dimension: dimension, fullWidth: dimension == 128, length: 4)
+                let candidate = gatedDeltaFourCheckpointKernel(
+                    q: input[0], k: input[1], v: input[2], g: input[3], beta: input[4],
+                    state: input[5])
+                let reference = gatedDeltaKernel(
+                    q: input[0], k: input[1], v: input[2], g: input[3], beta: input[4],
+                    state: input[5])
+
+                var chainedState = input[5]
+                var chainedOutputs = [MLXArray]()
+                var prefixStates = [MLXArray]()
+                for index in 0 ..< 4 {
+                    let step = gatedDeltaKernel(
+                        q: input[0][0..., index ..< (index + 1), 0..., 0...],
+                        k: input[1][0..., index ..< (index + 1), 0..., 0...],
+                        v: input[2][0..., index ..< (index + 1), 0..., 0...],
+                        g: input[3][0..., index ..< (index + 1), 0...],
+                        beta: input[4][0..., index ..< (index + 1), 0...], state: chainedState)
+                    chainedOutputs.append(step.0)
+                    chainedState = step.1
+                    if index < 3 { prefixStates.append(chainedState) }
+                }
+
+                for (actual, expected) in zip(
+                    [candidate.0, candidate.1] + candidate.2,
+                    [reference.0, reference.1] + prefixStates
+                ) {
+                    eval(actual, expected)
+                    XCTAssertEqual(
+                        actual.asType(.float32).asArray(Float.self).map(\.bitPattern),
+                        expected.asType(.float32).asArray(Float.self).map(\.bitPattern),
+                        "dtype=\(dtype) Dk=\(dimension) shape=\(actual.shape)")
+                }
+                let chained = concatenated(chainedOutputs, axis: 1)
+                eval(candidate.0, chained, candidate.1, chainedState)
+                XCTAssertEqual(
+                    candidate.0.asType(.float32).asArray(Float.self).map(\.bitPattern),
+                    chained.asType(.float32).asArray(Float.self).map(\.bitPattern))
+                XCTAssertEqual(
+                    candidate.1.asArray(Float.self).map(\.bitPattern),
+                    chainedState.asArray(Float.self).map(\.bitPattern))
+            }
+        }
+    }
+
+    func testFourCheckpointFallbackHandlesNonKernelDimensions() {
+        let input = inputs(dtype: .bfloat16, dimension: 48, fullWidth: false, length: 4)
+        let candidate = gatedDeltaUpdateFourCheckpoints(
+            q: input[0], k: input[1], v: input[2], a: input[3], b: input[4],
+            aLog: MLXArray.zeros([input[2].dim(2)]), dtBias: MLXArray.zeros([input[2].dim(2)]),
+            state: input[5])
+        eval(candidate.0, candidate.1, candidate.2)
+        XCTAssertEqual(candidate.0.shape[1], 4)
+        XCTAssertEqual(candidate.2.count, 3)
     }
 
     func testLocalCheckpointPerformance() throws {

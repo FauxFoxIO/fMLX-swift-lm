@@ -136,14 +136,93 @@ final class Qwen3NextMLP: Module, UnaryLayer {
     @ModuleInfo(key: "down_proj") var downProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
 
+    // The registered projections remain checkpoint-shaped views after
+    // preparation; only the inference path uses the physical fused projection.
+    private let fusedGateUpProjection = FusedQuantizedLinearProjectionCache()
+    var fusedGateUpProjectionEnabled = qwen35MLPGateUpEnabled
+    private var recoverLoRATargets = [String: Edge0Qwen35RecoverLoRATarget]()
+
     init(dimensions: Int, hiddenDimensions: Int) {
         _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
         _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
         _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
     }
 
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        let replacesGateOrUp = parameters.flattened().contains { key, _ in
+            key.hasPrefix("gate_proj.") || key.hasPrefix("up_proj.")
+        }
+        defer {
+            // Updates can throw after changing an earlier parameter. Never keep
+            // a physical projection derived from the old parameter storage.
+            if replacesGateOrUp {
+                fusedGateUpProjection.invalidate()
+            }
+        }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        let replacesGateOrUp = key == "gate_proj" || key == "up_proj"
+        defer {
+            if replacesGateOrUp {
+                fusedGateUpProjection.invalidate()
+            }
+        }
+        try super.updateModule(key: key, value)
+    }
+
+    var hasFusedGateUpProjection: Bool { fusedGateUpProjection.isPrepared }
+
+    /// Prepares the inference-only projection during model publication.
+    /// Forward passes only read the result of this transaction.
+    @discardableResult
+    func prepareFusedGateUpProjection() throws -> Bool {
+        try fusedGateUpProjection.prepare(
+            enabled: fusedGateUpProjectionEnabled,
+            linears: [gateProj, upProj]
+        ) { sourceViews in
+            try update(
+                modules: ModuleChildren(values: [
+                    "gate_proj": .value(sourceViews[0]),
+                    "up_proj": .value(sourceViews[1]),
+                ]), verify: [])
+        }
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(silu(gateProj(x)) * upProj(x))
+        guard recoverLoRATargets.isEmpty,
+            fusedGateUpProjectionEnabled, let fused = fusedGateUpProjection.fused
+        else {
+            let gate = recoverProjection(gateProj, input: x, target: "gate_proj")
+            let up = recoverProjection(upProj, input: x, target: "up_proj")
+            let activated = silu(gate) * up
+            return recoverProjection(downProj, input: activated, target: "down_proj")
+        }
+
+        let projected = fused(x)
+        let gateEnd = gateProj.shape.0
+        let gate = projected[.ellipsis, ..<gateEnd]
+        let up = projected[.ellipsis, gateEnd...]
+        return downProj(silu(gate) * up)
+    }
+
+    func attachRecoverLoRA(_ targets: [String: Edge0Qwen35RecoverLoRATarget]) {
+        recoverLoRATargets = targets
+        fusedGateUpProjection.invalidate()
+    }
+
+    private func recoverProjection(_ projection: Linear, input: MLXArray, target: String)
+        -> MLXArray
+    {
+        let output = projection(input)
+        guard let adapter = recoverLoRATargets[target] else { return output }
+        return adapter.applying(to: output, input: input)
     }
 }
 
@@ -404,7 +483,7 @@ final class Qwen3NextSparseMoeBlock: Module {
         let inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, (kth)...]
         var scores = MLX.takeAlong(gates, inds, axis: -1)
         if normTopkProb {
-            scores = scores / scores.sum(axis: -1, keepDims: true)
+            scores = normalizeRouterTopKScores(scores, k: k)
         }
 
         let y = switchMLP(x, inds)

@@ -132,4 +132,13 @@ final class Qwen35RouterTopKBitwiseTests: XCTestCase {
                 "\(testCase.label): scores")
         }
     }
+
+    func testChainRouterNormalizesSingleExpertWithoutReduction() {
+        let gates = MLXArray([Float(0.25), 0.75, 0.625, 0.375, 0.1, 0.9]).reshaped(3, 2)
+        let (indices, scores) = chainRouterTopK(gates, k: 1, normalize: true)
+        eval(indices, scores)
+
+        XCTAssertEqual(indices.reshaped(-1).asArray(UInt32.self), [1, 0, 1])
+        XCTAssertEqual(scores.reshaped(-1).asArray(Float.self), [1, 1, 1])
+    }
 }

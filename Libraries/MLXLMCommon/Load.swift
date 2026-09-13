@@ -104,6 +104,43 @@ func weightLoadConcurrency(processorCount: Int = ProcessInfo.processInfo.activeP
 /// Below this size a file is loaded whole: splitting cannot beat a single sequential read.
 private let minimumBytesPerLoadGroup: Int64 = 256 * 1024 * 1024
 
+/// Selects checkpoint tensors before their lazy safetensors arrays are evaluated.
+///
+/// Most callers use ``all``.  Checkpoint components that share files can select their own
+/// namespace, avoiding materializing the rest of a combined checkpoint only to discard it in
+/// `sanitize(weights:)`.
+package struct WeightTensorNameSelection: Sendable {
+    private let matches: @Sendable (String) -> Bool
+    fileprivate let filtersNames: Bool
+
+    package static let all = Self(matches: { _ in true }, filtersNames: false)
+
+    private init(
+        matches: @escaping @Sendable (String) -> Bool, filtersNames: Bool
+    ) {
+        self.matches = matches
+        self.filtersNames = filtersNames
+    }
+
+    package static func prefixed(_ prefix: String) -> Self {
+        Self(matches: { $0.hasPrefix(prefix) }, filtersNames: true)
+    }
+
+    /// Select every tensor except names accepted by `predicate`.
+    ///
+    /// This is used by streamed checkpoint components to keep their lazy
+    /// safetensor arrays out of the normal materialization path.
+    package static func excluding(
+        _ predicate: @escaping @Sendable (String) -> Bool
+    ) -> Self {
+        Self(matches: { !predicate($0) }, filtersNames: true)
+    }
+
+    package func contains(_ name: String) -> Bool {
+        matches(name)
+    }
+}
+
 /// Lock-guarded shared state for the concurrent load.
 private final class ConcurrentLoadState: @unchecked Sendable {
     private let lock = NSLock()
@@ -151,7 +188,9 @@ private final class ConcurrentLoadState: @unchecked Sendable {
 /// range's I/O inside the work item), and the results are merged in file order. A file whose
 /// header cannot be parsed is loaded whole by one work item, which is exactly the serial
 /// loader's behavior for that file.
-func loadWeightArrays(urls: [URL]) throws -> (
+func loadWeightArrays(
+    urls: [URL], tensorNameSelection: WeightTensorNameSelection = .all
+) throws -> (
     weights: [String: MLXArray], metadata: [String: String]
 ) {
     struct WorkItem {
@@ -165,7 +204,10 @@ func loadWeightArrays(urls: [URL]) throws -> (
         var spansPerFile = [[SafetensorSpan]?]()
         var totalBytes: Int64 = 0
         for url in urls {
-            let spans = try? safetensorSpansInFileOrder(url: url)
+            let spans = (try? safetensorSpansInFileOrder(url: url)).map { spans in
+                tensorNameSelection.filtersNames
+                    ? spans.filter { tensorNameSelection.contains($0.name) } : spans
+            }
             spansPerFile.append(spans)
             totalBytes += spans?.reduce(0) { $0 + $1.byteCount } ?? 0
         }
@@ -174,7 +216,16 @@ func loadWeightArrays(urls: [URL]) throws -> (
         let groupBytes = max(minimumBytesPerLoadGroup, totalBytes / Int64(concurrency))
         var items = [WorkItem]()
         for (file, url) in urls.enumerated() {
-            if let spans = spansPerFile[file], !spans.isEmpty {
+            if let spans = spansPerFile[file] {
+                // A parsed header proves this file has no selected tensors, so avoid opening it
+                // through MLX at all.  A header we cannot parse still falls back to loading the
+                // whole file; silently skipping it could hide a malformed selected checkpoint.
+                if spans.isEmpty {
+                    if tensorNameSelection.filtersNames { continue }
+                    items.append(WorkItem(file: file, url: url, names: nil))
+                    continue
+                }
+
                 let bytes = spans.reduce(0) { $0 + $1.byteCount }
                 let groupCount = max(1, Int(bytes / groupBytes))
                 for range in contiguousLoadGroups(
@@ -224,6 +275,11 @@ private struct SafetensorsIndex: Decodable {
     enum CodingKeys: String, CodingKey {
         case weightMap = "weight_map"
     }
+}
+
+private struct IndexedWeightFiles {
+    let urls: [URL]
+    let weightMap: [String: String]
 }
 
 /// How the safetensors files holding a model's weights are chosen.
@@ -278,16 +334,20 @@ public enum WeightFileSelection: Sendable, Equatable {
 package func safetensorWeightURLs(
     in modelDirectory: URL,
     selection: WeightFileSelection = .automatic,
-    additionalFiles: [String] = []
+    additionalFiles: [String] = [],
+    tensorNameSelection: WeightTensorNameSelection = .all
 ) throws -> [URL] {
     let present = topLevelSafetensorURLs(in: modelDirectory)
 
     let selected: [URL]
+    let indexed: IndexedWeightFiles?
     switch selection {
     case .allFilesPresent:
         selected = present
+        indexed = nil
     case .automatic:
-        selected = try indexedWeightURLs(in: modelDirectory) ?? conventionalWeightURLs(in: present)
+        indexed = try indexedWeightFiles(in: modelDirectory)
+        selected = indexed?.urls ?? conventionalWeightURLs(in: present)
     }
 
     var seen = Set(selected.map(\.standardizedFileURL.path))
@@ -301,6 +361,22 @@ package func safetensorWeightURLs(
         }
         urls.append(url)
     }
+
+    // A valid index identifies which shards can contain a selected tensor, so avoid even
+    // opening unrelated shards.  Additional files remain eligible because an index does not
+    // describe them.  Headers still perform the authoritative per-tensor filtering below.
+    if tensorNameSelection.filtersNames, let indexed {
+        let indexedPaths = Set(indexed.urls.map(\.standardizedFileURL.path))
+        let selectedPaths = Set(
+            indexed.weightMap.compactMap { name, file in
+                tensorNameSelection.contains(name)
+                    ? modelDirectory.appendingPathComponent(file).standardizedFileURL.path : nil
+            })
+        urls.removeAll { url in
+            let path = url.standardizedFileURL.path
+            return indexedPaths.contains(path) && !selectedPaths.contains(path)
+        }
+    }
     return urls
 }
 
@@ -310,7 +386,7 @@ package func safetensorWeightURLs(
 /// Existence is checked against the file system rather than the top-level listing: an index may
 /// legitimately map weights into a subdirectory, and that is a deliberate statement about where
 /// this model's weights live rather than an unrelated file that happens to be nearby.
-private func indexedWeightURLs(in modelDirectory: URL) throws -> [URL]? {
+private func indexedWeightFiles(in modelDirectory: URL) throws -> IndexedWeightFiles? {
     let indexURL = modelDirectory.appendingPathComponent("model.safetensors.index.json")
     guard FileManager.default.fileExists(atPath: indexURL.path) else {
         return nil
@@ -327,7 +403,7 @@ private func indexedWeightURLs(in modelDirectory: URL) throws -> [URL]? {
     else {
         return nil
     }
-    return urls
+    return IndexedWeightFiles(urls: urls, weightMap: index.weightMap)
 }
 
 /// The conventionally named weight files among `present`, matching `mlx_lm.utils.load_model`'s
@@ -352,6 +428,28 @@ private func topLevelSafetensorURLs(in modelDirectory: URL) -> [URL] {
         .sorted { $0.lastPathComponent < $1.lastPathComponent }
 }
 
+/// Reports whether selected checkpoint files contain a tensor accepted by `tensorNameSelection`.
+///
+/// This reads safetensor headers only.  It is useful for optional checkpoint components, whose
+/// presence must be established without materializing any of the target model's tensors.
+package func containsWeightTensor(
+    in modelDirectory: URL,
+    selection: WeightFileSelection = .automatic,
+    additionalFiles: [String] = [],
+    tensorNameSelection: WeightTensorNameSelection
+) throws -> Bool {
+    let urls = try safetensorWeightURLs(
+        in: modelDirectory,
+        selection: selection,
+        additionalFiles: additionalFiles,
+        tensorNameSelection: tensorNameSelection)
+    return try urls.contains { url in
+        try safetensorSpansInFileOrder(url: url).contains {
+            tensorNameSelection.contains($0.name)
+        }
+    }
+}
+
 /// Load model weights.
 ///
 /// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
@@ -371,6 +469,23 @@ public func loadWeights(
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
     weightFileSelection: WeightFileSelection = .automatic
 ) throws {
+    try loadWeights(
+        modelDirectory: modelDirectory, model: model, tensorNameSelection: .all,
+        quantization: quantization, perLayerQuantization: perLayerQuantization,
+        weightFileSelection: weightFileSelection)
+}
+
+/// Package-internal variant for a checkpoint component embedded beside another model.
+///
+/// The name selection happens before lazy safetensor arrays are evaluated.  The normal public
+/// entry point always selects every weight.
+package func loadWeights(
+    modelDirectory: URL, model: BaseLanguageModel,
+    tensorNameSelection: WeightTensorNameSelection,
+    quantization: BaseConfiguration.Quantization? = nil,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    weightFileSelection: WeightFileSelection = .automatic
+) throws {
     // load the weights and collect metadata from the first safetensor file
     var weights = [String: MLXArray]()
     var metadata = [String: String]()
@@ -378,8 +493,10 @@ public func loadWeights(
     let weightURLs = try safetensorWeightURLs(
         in: modelDirectory,
         selection: weightFileSelection,
-        additionalFiles: additionalFiles ?? [])
-    (weights, metadata) = try loadWeightArrays(urls: weightURLs)
+        additionalFiles: additionalFiles ?? [],
+        tensorNameSelection: tensorNameSelection)
+    (weights, metadata) = try loadWeightArrays(
+        urls: weightURLs, tensorNameSelection: tensorNameSelection)
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
@@ -400,12 +517,20 @@ public func loadWeights(
     }
 
     // apply the loaded weights
-    let parameters = ModuleParameters.unflattened(weights)
-    try model.update(parameters: parameters, verify: [.all])
+    do {
+        let parameters = ModuleParameters.unflattened(weights)
+        try model.update(parameters: parameters, verify: [.all])
+    }
+    // Derived fused projections replace their source modules. Drop loader-owned
+    // references first so each replaced source can be reclaimed immediately.
+    weights.removeAll(keepingCapacity: false)
 
     // Build derived inference-only state and realize the model while the loader
     // still has exclusive access. Forward passes must remain read-only.
     materializeModelForInference(model)
+    // Fused projections replace materialized checkpoint buffers with larger
+    // concatenations. Return the retired buffers instead of retaining them in MLX's cache.
+    MLX.Memory.clearCache()
 }
 
 /// Async variant of
@@ -421,6 +546,20 @@ public func loadWeights(
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
     weightFileSelection: WeightFileSelection = .automatic
 ) async throws {
+    try await loadWeights(
+        modelDirectory: modelDirectory, model: model, tensorNameSelection: .all,
+        quantization: quantization, perLayerQuantization: perLayerQuantization,
+        weightFileSelection: weightFileSelection)
+}
+
+/// Async package-internal variant of the selective weight loader.
+package func loadWeights(
+    modelDirectory: URL, model: BaseLanguageModel,
+    tensorNameSelection: WeightTensorNameSelection,
+    quantization: BaseConfiguration.Quantization? = nil,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    weightFileSelection: WeightFileSelection = .automatic
+) async throws {
     let model = SendableBox(model)
     try await withCheckedThrowingContinuation {
         (continuation: CheckedContinuation<Void, any Error>) in
@@ -429,6 +568,7 @@ public func loadWeights(
                 with: Result {
                     try loadWeights(
                         modelDirectory: modelDirectory, model: model.consume(),
+                        tensorNameSelection: tensorNameSelection,
                         quantization: quantization,
                         perLayerQuantization: perLayerQuantization,
                         weightFileSelection: weightFileSelection)

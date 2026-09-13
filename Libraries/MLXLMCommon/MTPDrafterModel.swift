@@ -319,11 +319,23 @@ public let mtpPositionDeltasKey =
 /// reads as `false` (no emit), so non-MTP callers are unaffected.
 public let mtpEmitFlagKey = LMOutput.Key<Bool>("mtp.emitDrafterState")
 
+/// Requests logits only for the final row of an incremental MTP prompt
+/// prefill. Targets must still emit full hidden and shared-K/V state for the
+/// drafter. The iterator removes this one-shot intent before verification.
+public let mtpFinalPrefillLogitsOnlyKey =
+    LMOutput.Key<Bool>("mtp.finalPrefillLogitsOnly")
+
 /// Requests a recurrent-cache checkpoint after this many verification input
 /// tokens. Hybrid Qwen models use `1` for MTP-1 so a rejected draft restores
 /// state after the always-committed bonus token without replaying the model.
 public let mtpCacheCheckpointIndexKey =
     LMOutput.Key<Int>("mtp.cacheCheckpointIndex")
+
+/// Requests recurrent-cache checkpoints after each listed verification input
+/// position. The positions are used only by hybrid targets that can restore
+/// a rejected multi-token tail without replaying the target model.
+public let mtpCacheCheckpointIndicesKey =
+    LMOutput.Key<[Int]>("mtp.cacheCheckpointIndices")
 
 /// Which cache entry each ``mtpSharedKVStatesKey`` tuple was read from, keyed the same way.
 ///

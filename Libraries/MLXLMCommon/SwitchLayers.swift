@@ -10,10 +10,24 @@ public let compiledSiluProduct: @Sendable (MLXArray, MLXArray) -> MLXArray = com
     MLXNN.silu(gate) * up
 }
 
-public let weightedExpertSum: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+private let weightedMultipleExpertSum: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
     shapeless: true
 ) { outputs, weights in
     (outputs * MLX.expandedDimensions(weights, axis: -1)).sum(axis: -2)
+}
+
+private let weightedSingleExpertSum: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { outputs, weights in
+    MLX.squeezed(outputs * MLX.expandedDimensions(weights, axis: -1), axis: -2)
+}
+
+public let weightedExpertSum: @Sendable (MLXArray, MLXArray) -> MLXArray = { outputs, weights in
+    if outputs.dim(-2) == 1 {
+        weightedSingleExpertSum(outputs, weights)
+    } else {
+        weightedMultipleExpertSum(outputs, weights)
+    }
 }
 
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
@@ -487,5 +501,212 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
         }
 
         return result
+    }
+}
+
+// MARK: - Streamed SwitchGLU
+
+/// One quantized routed expert materialized from its independent weight ranges.
+///
+/// Each array excludes the expert axis. ``StreamedSwitchGLU`` stacks only the
+/// slots selected for one small decode call, then remaps the router IDs to that
+/// compact axis before using the same quantized gather kernels as ``SwitchGLU``.
+/// Scales and affine biases may be FP16 or BF16; biases are optional.
+public struct StreamedQuantizedExpertWeights: @unchecked Sendable {
+    public let gateWeight: MLXArray
+    public let gateScales: MLXArray
+    public let gateBiases: MLXArray?
+    public let upWeight: MLXArray
+    public let upScales: MLXArray
+    public let upBiases: MLXArray?
+    public let downWeight: MLXArray
+    public let downScales: MLXArray
+    public let downBiases: MLXArray?
+    public let byteCount: Int
+
+    public init(
+        gateWeight: MLXArray,
+        gateScales: MLXArray,
+        gateBiases: MLXArray? = nil,
+        upWeight: MLXArray,
+        upScales: MLXArray,
+        upBiases: MLXArray? = nil,
+        downWeight: MLXArray,
+        downScales: MLXArray,
+        downBiases: MLXArray? = nil,
+        byteCount: Int
+    ) throws {
+        guard byteCount > 0 else { throw StreamedSwitchGLUError.invalidExpertByteCount(byteCount) }
+        self.gateWeight = gateWeight
+        self.gateScales = gateScales
+        self.gateBiases = gateBiases
+        self.upWeight = upWeight
+        self.upScales = upScales
+        self.upBiases = upBiases
+        self.downWeight = downWeight
+        self.downScales = downScales
+        self.downBiases = downBiases
+        self.byteCount = byteCount
+    }
+}
+
+/// Validation failures for a streamed compact SwitchGLU invocation.
+public enum StreamedSwitchGLUError: Error, Equatable, Sendable {
+    case invalidExpertByteCount(Int)
+    case unsupportedSequenceLength(Int)
+    case invalidInputShape
+    case invalidTopK(Int)
+    case invalidRouterAssignmentCount(expected: Int, actual: Int)
+    case invalidCompactRouterID(UInt32)
+    case invalidCompactRouterMapping
+    case invalidScoreShape
+    case invalidExpertShape
+}
+
+/// Exact affine-quantized SwitchGLU execution over a compact expert axis.
+///
+/// This is intentionally not compiled. Its expert arrays are created after
+/// range reads and must remain explicit inputs to the MLX graph; a compiled
+/// body would otherwise capture the first materialized expert set as constants.
+/// It accepts only one- and two-row decode calls. Prefill must retain the
+/// resident expert layer rather than changing the width of its GEMM kernels.
+public struct StreamedSwitchGLU: @unchecked Sendable {
+    public let inputDims: Int
+    public let hiddenDims: Int
+    public let groupSize: Int
+    public let bits: Int
+
+    public init(inputDims: Int, hiddenDims: Int, groupSize: Int = 32, bits: Int = 4) {
+        self.inputDims = inputDims
+        self.hiddenDims = hiddenDims
+        self.groupSize = groupSize
+        self.bits = bits
+    }
+
+    /// Runs the existing quantized gather path with a first-occurrence compact
+    /// expert list and row-major remapped router IDs.
+    public func callAndWeightedReduce(
+        _ x: MLXArray,
+        compactRouterIDs: [UInt32],
+        topK: Int,
+        weights: MLXArray,
+        experts: [StreamedQuantizedExpertWeights]
+    ) throws -> MLXArray {
+        guard x.ndim == 2 else { throw StreamedSwitchGLUError.invalidInputShape }
+        let tokenCount = x.dim(0)
+        guard (1 ... 2).contains(tokenCount) else {
+            throw StreamedSwitchGLUError.unsupportedSequenceLength(tokenCount)
+        }
+        guard x.dim(1) == inputDims else {
+            throw StreamedSwitchGLUError.invalidInputShape
+        }
+        guard topK > 0 else { throw StreamedSwitchGLUError.invalidTopK(topK) }
+        let (expectedAssignmentCount, overflow) = tokenCount.multipliedReportingOverflow(by: topK)
+        guard !overflow, compactRouterIDs.count == expectedAssignmentCount else {
+            throw StreamedSwitchGLUError.invalidRouterAssignmentCount(
+                expected: overflow ? .max : expectedAssignmentCount,
+                actual: compactRouterIDs.count)
+        }
+        guard !experts.isEmpty else {
+            throw StreamedSwitchGLUError.invalidRouterAssignmentCount(
+                expected: expectedAssignmentCount, actual: 0)
+        }
+        guard compactRouterIDs.allSatisfy({ Int($0) < experts.count }) else {
+            throw StreamedSwitchGLUError.invalidCompactRouterID(
+                compactRouterIDs.first { Int($0) >= experts.count }!)
+        }
+        var seenSlots = Set<UInt32>()
+        for slot in compactRouterIDs where seenSlots.insert(slot).inserted {
+            guard slot == UInt32(seenSlots.count - 1) else {
+                throw StreamedSwitchGLUError.invalidCompactRouterMapping
+            }
+        }
+        guard seenSlots.count == experts.count else {
+            throw StreamedSwitchGLUError.invalidCompactRouterMapping
+        }
+        guard weights.ndim == 2, weights.dim(0) == tokenCount, weights.dim(1) == topK else {
+            throw StreamedSwitchGLUError.invalidScoreShape
+        }
+        guard experts.allSatisfy(isValid) else {
+            throw StreamedSwitchGLUError.invalidExpertShape
+        }
+
+        let indices = MLXArray(compactRouterIDs).reshaped(tokenCount, topK)
+        var expanded = MLX.expandedDimensions(x, axes: [-2, -3])
+        let gateWeight = MLX.stacked(experts.map(\.gateWeight))
+        let gateScales = MLX.stacked(experts.map(\.gateScales))
+        let gateBiases = try stackOptional(experts.map(\.gateBiases))
+        let upWeight = MLX.stacked(experts.map(\.upWeight))
+        let upScales = MLX.stacked(experts.map(\.upScales))
+        let upBiases = try stackOptional(experts.map(\.upBiases))
+        let downWeight = MLX.stacked(experts.map(\.downWeight))
+        let downScales = MLX.stacked(experts.map(\.downScales))
+        let downBiases = try stackOptional(experts.map(\.downBiases))
+
+        let up = MLX.gatherQuantizedMM(
+            expanded, upWeight, scales: upScales, biases: upBiases, rhsIndices: indices,
+            transpose: true, groupSize: groupSize, bits: bits, mode: .affine, sortedIndices: false)
+        let gate = MLX.gatherQuantizedMM(
+            expanded, gateWeight, scales: gateScales, biases: gateBiases, rhsIndices: indices,
+            transpose: true, groupSize: groupSize, bits: bits, mode: .affine, sortedIndices: false)
+        expanded = MLX.gatherQuantizedMM(
+            compiledSiluProduct(gate, up), downWeight, scales: downScales, biases: downBiases,
+            rhsIndices: indices, transpose: true, groupSize: groupSize, bits: bits, mode: .affine,
+            sortedIndices: false)
+
+        return weightedExpertSum(MLX.squeezed(expanded, axis: -2), weights)
+    }
+
+    private func isValid(_ expert: StreamedQuantizedExpertWeights) -> Bool {
+        guard inputDims > 0, hiddenDims > 0, groupSize > 0 else { return false }
+        let packedInputDims = inputDims / 8
+        let packedHiddenDims = hiddenDims / 8
+        let inputGroups = inputDims / groupSize
+        let hiddenGroups = hiddenDims / groupSize
+        return inputDims.isMultiple(of: 8)
+            && hiddenDims.isMultiple(of: 8)
+            && inputDims.isMultiple(of: groupSize)
+            && hiddenDims.isMultiple(of: groupSize)
+            && bits == 4
+            && expert.gateWeight.dtype == .uint32
+            && expert.gateWeight.shape == [hiddenDims, packedInputDims]
+            && validQuantizationParameter(
+                expert.gateScales, expectedShape: [hiddenDims, inputGroups])
+            && validOptionalBias(
+                expert.gateBiases, scales: expert.gateScales,
+                expectedShape: [hiddenDims, inputGroups])
+            && expert.upWeight.dtype == .uint32
+            && expert.upWeight.shape == [hiddenDims, packedInputDims]
+            && validQuantizationParameter(
+                expert.upScales, expectedShape: [hiddenDims, inputGroups])
+            && validOptionalBias(
+                expert.upBiases, scales: expert.upScales,
+                expectedShape: [hiddenDims, inputGroups])
+            && expert.downWeight.dtype == .uint32
+            && expert.downWeight.shape == [inputDims, packedHiddenDims]
+            && validQuantizationParameter(
+                expert.downScales, expectedShape: [inputDims, hiddenGroups])
+            && validOptionalBias(
+                expert.downBiases, scales: expert.downScales,
+                expectedShape: [inputDims, hiddenGroups])
+    }
+
+    private func validQuantizationParameter(_ value: MLXArray, expectedShape: [Int]) -> Bool {
+        (value.dtype == .float16 || value.dtype == .bfloat16) && value.shape == expectedShape
+    }
+
+    private func validOptionalBias(
+        _ bias: MLXArray?, scales: MLXArray, expectedShape: [Int]
+    ) -> Bool {
+        guard let bias else { return true }
+        return bias.dtype == scales.dtype && bias.shape == expectedShape
+    }
+
+    private func stackOptional(_ arrays: [MLXArray?]) throws -> MLXArray? {
+        let present = arrays.compactMap { $0 }
+        guard present.isEmpty || present.count == arrays.count else {
+            throw StreamedSwitchGLUError.invalidExpertShape
+        }
+        return present.isEmpty ? nil : MLX.stacked(present)
     }
 }

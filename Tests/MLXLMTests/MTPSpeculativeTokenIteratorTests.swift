@@ -14,9 +14,17 @@ private let preservedStateKey = LMOutput.Key<Int>("tests.mtp.preservedState")
 /// Records `draftBlock(...)` invocations and returns a fixed token pattern
 /// so the iterator's draft/verify/accept flow can be exercised without a
 /// real drafter.
-private final class MockDrafter: Module, StatefulMTPDrafterModel {
+private final class MockDrafter: Module, IncrementalMTPDrafterModel {
     private(set) var draftBlockCallCount = 0
+    private(set) var preparedShiftedTokens = [[Int]]()
+    private(set) var preparedHiddenLengths = [Int]()
+    private(set) var preparedFinalChunkCount = 0
+    private(set) var seededDraftBlockCallCount = 0
+    private(set) var computedDraftBlockCallCount = 0
+    private(set) var commitDrafterStateCallCount = 0
     var draftedTokenValue: Int32
+    let requiresPromptPrefill: Bool
+    let precomputesFinalSeed: Bool
     /// Per-call record of what the iterator handed `draftBlock`: the
     /// sequence-axis span of each sharedKV entry, and the query offset.
     /// Lets tests assert the state the drafter conditions on, not just the
@@ -26,13 +34,42 @@ private final class MockDrafter: Module, StatefulMTPDrafterModel {
     private(set) var receivedPositionDeltaValues: [Int?] = []
     private(set) var receivedCacheOffsets: [Int?] = []
 
-    init(draftedTokenValue: Int32 = 7) {
+    init(
+        draftedTokenValue: Int32 = 7, requiresPromptPrefill: Bool = false,
+        precomputesFinalSeed: Bool = false
+    ) {
         self.draftedTokenValue = draftedTokenValue
+        self.requiresPromptPrefill = requiresPromptPrefill
+        self.precomputesFinalSeed = precomputesFinalSeed
         super.init()
     }
 
+    var targetArchitectureID: String { "tests.mock-mtp" }
+    var cacheBytesPerToken: Int { 0 }
+
     func makeState(parameters: GenerateParameters?) -> MTPDrafterState {
         MTPDrafterState(cache: [CountingKVCache()])
+    }
+
+    func prepareDrafterChunk(
+        target _: any LanguageModel, shiftedTokens: MLXArray, targetHidden: MLXArray,
+        isFinal: Bool, state: inout MTPDrafterState, sampler _: any LogitSampler
+    ) {
+        preparedShiftedTokens.append(shiftedTokens.flattened().asArray(Int.self))
+        preparedHiddenLengths.append(targetHidden.dim(1))
+        let length = shiftedTokens.dim(1)
+        state.nextPosition += length
+        (state.cache.first as? MutableOffsetKVCache)?.offset += length
+        guard isFinal else { return }
+
+        preparedFinalChunkCount += 1
+        guard precomputesFinalSeed else { return }
+        let vocab = 20
+        var logits = [Float](repeating: -100, count: vocab)
+        logits[Int(draftedTokenValue)] = 100
+        state.seedHidden = MLXArray.zeros([1, 1, 4])
+        state.seedToken = MLXArray([draftedTokenValue], [1, 1])
+        state.seedLogits = MLXArray(logits, [1, 1, vocab])
     }
 
     func draftBlock(
@@ -70,6 +107,14 @@ private final class MockDrafter: Module, StatefulMTPDrafterModel {
         sampler: any LogitSampler
     ) -> MTPDraft {
         draftBlockCallCount += 1
+        if let seed = state.seedToken, let logits = state.seedLogits {
+            seededDraftBlockCallCount += 1
+            state.seedToken = nil
+            state.seedHidden = nil
+            state.seedLogits = nil
+            return MTPDraft(tokens: seed, logits: logits)
+        }
+        computedDraftBlockCallCount += 1
         receivedSharedKVSpans.append(sharedKV.mapValues { $0.0.dim(-2) })
         receivedQueryOffsets.append(queryOffset)
         receivedPositionDeltaValues.append(positionDeltas?.item(Int.self))
@@ -89,11 +134,23 @@ private final class MockDrafter: Module, StatefulMTPDrafterModel {
             tokens: tokens,
             logits: MLXArray(logitValues, [batch, blockSize - 1, vocabularySize]))
     }
+
+    func commitDrafterState(
+        target _: any LanguageModel, targetHidden _: MLXArray, draftTokens: MLXArray,
+        acceptedCount: Int, finalToken _: MLXArray, positionDeltas _: MLXArray?,
+        state: inout MTPDrafterState, sampler _: any LogitSampler
+    ) {
+        commitDrafterStateCallCount += 1
+        let rejected = draftTokens.dim(-1) - acceptedCount
+        if rejected > 0 {
+            trimPromptCache(state.cache, numTokens: rejected)
+        }
+    }
 }
 
 /// Minimal `LanguageModel` mock that emits MTP state on every call when
 /// `mtpEmitFlagKey` is true. Returns shaped logits and a trimmable KV cache.
-private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvider {
+private class MockMainModel: Module, LanguageModel, KVCacheDimensionProvider {
     var kvHeads: [Int] { [1] }
     /// Sequence of token values returned in increasing position order. Length
     /// must cover all positions the iterator will sample across the run.
@@ -110,7 +167,10 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
     var logitPeak: Float = 100
 
     private(set) var callCount: Int = 0
+    private(set) var prepareCallCount: Int = 0
+    private(set) var forwardInputLengths: [Int] = []
     private(set) var lastIncomingEmitFlag: Bool? = nil
+    private(set) var incomingFinalPrefillLogitsOnlyFlags: [Bool?] = []
     private(set) var incomingPreservedStateValues: [Int?] = []
     /// Sequence-axis span of each emitted sharedKV snapshot, in emit order.
     /// Tests assert this against the mock cache offset to pin the mock's
@@ -127,6 +187,7 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
     )
         throws -> PrepareResult
     {
+        prepareCallCount += 1
         if let prepareLogitsStateValue {
             var state = LMOutput.State()
             state[preservedStateKey] = prepareLogitsStateValue
@@ -153,9 +214,11 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
     ) -> LMOutput {
         callCount += 1
         lastIncomingEmitFlag = state?[mtpEmitFlagKey]
+        incomingFinalPrefillLogitsOnlyFlags.append(state?[mtpFinalPrefillLogitsOnlyKey])
         incomingPreservedStateValues.append(state?[preservedStateKey])
 
         let positions = input.tokens.dim(-1)
+        forwardInputLengths.append(positions)
         let logits = makeLogits(positions: positions)
 
         // Update the mock cache to reflect that `positions` tokens were seen.
@@ -181,6 +244,7 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
             emittedSharedKVSpans.append(kvSpan)
             var out = LMOutput.State()
             out[preservedStateKey] = state?[preservedStateKey]
+            out[mtpFinalPrefillLogitsOnlyKey] = state?[mtpFinalPrefillLogitsOnlyKey]
             out[mtpLastHiddenStatesKey] = MLXArray.zeros([1, positions, 4])
             if emitEmptySharedKVState {
                 out[mtpSharedKVStatesKey] = [:]
@@ -231,6 +295,55 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
         }
         perPositionIndex += positions
         return MLXArray(data, [1, positions, vocab])
+    }
+}
+
+/// Model-free stand-in for Qwen's one-token native hybrid rewind path.
+private final class NativeRewindMockMainModel: MockMainModel, SpeculativeCacheRewindModel {
+    var maximumNativeTargetCacheRewind: Int { 1 }
+
+    override func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        let output = super.callAsFunction(input, cache: cache, state: state)
+        if state?[mtpCacheCheckpointIndexKey] == 1,
+            let recurrent = cache?.first(where: { $0 is MambaCache }) as? MambaCache
+        {
+            recurrent.saveSpeculativeCheckpoint(
+                convState: MLXArray.ones([1, 1, 1]),
+                recurrentState: MLXArray.ones([1, 1, 1, 1]), advancedBy: 1)
+        }
+        return output
+    }
+
+    override func newCache(parameters _: GenerateParameters?) -> [KVCache] {
+        [CountingKVCache(), MambaCache()]
+    }
+}
+
+private final class NativeD3RewindMockMainModel: MockMainModel, SpeculativeCacheRewindModel {
+    var maximumNativeTargetCacheRewind: Int { 3 }
+
+    override func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        let output = super.callAsFunction(input, cache: cache, state: state)
+        if let indices = state?[mtpCacheCheckpointIndicesKey],
+            let recurrent = cache?.first(where: { $0 is MambaCache }) as? MambaCache
+        {
+            for index in indices {
+                recurrent.saveSpeculativeCheckpoint(
+                    convState: MLXArray.full([1, 1, 1], values: MLXArray(Float(index))),
+                    recurrentState: MLXArray.full(
+                        [1, 1, 1, 1], values: MLXArray(Float(index))),
+                    advancedBy: index, rewinding: input.tokens.dim(-1) - index)
+            }
+        }
+        return output
+    }
+
+    override func newCache(parameters _: GenerateParameters?) -> [KVCache] {
+        [CountingKVCache(), MambaCache()]
     }
 }
 
@@ -388,8 +501,121 @@ func testMTPSpeculateRoundSmokeWithSynthetics() throws {
     #expect(telemetry.draftModelCallCount == 1)
     #expect(telemetry.targetVerifiedTokenCount == 4)
     #expect(telemetry.emittedTokenCount == iter.tokenCount)
+    #expect(iter.roundDiagnostics.isEmpty)
     // Verify the main model received emit=true on every call after prefill.
     #expect(main.lastIncomingEmitFlag == true)
+}
+
+@Test
+func testIncrementalMTPPrefillUsesBoundedAlignedChunks() throws {
+    let prompt = (1 ... 11).map(Int32.init)
+    let main = MockMainModel(nextLogitTokens: Array(repeating: 7, count: 64))
+    let drafter = MockDrafter(draftedTokenValue: 7, requiresPromptPrefill: true)
+
+    _ = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray(prompt)), mainModel: main, drafter: drafter,
+        parameters: GenerateParameters(
+            maxTokens: 6, temperature: 0,
+            prefill: .init(stepSize: 3, chunking: .remainder)),
+        blockSize: 2)
+
+    // The ordinary iterator bypasses the target's opaque `prepare` path and
+    // advances target and shifted drafter chunks together. The final two
+    // prompt tokens are the legacy remainder reserved for the bonus forward.
+    #expect(main.prepareCallCount == 0)
+    #expect(main.forwardInputLengths == [3, 3, 3, 2])
+    #expect(drafter.preparedHiddenLengths == [3, 3, 3, 2])
+    #expect(
+        drafter.preparedShiftedTokens == [
+            [2, 3, 4], [5, 6, 7], [8, 9, 10], [11, 7],
+        ])
+    #expect(drafter.preparedFinalChunkCount == 1)
+    #expect(main.forwardInputLengths.max()! <= 3)
+    #expect(drafter.preparedHiddenLengths.max()! <= 3)
+}
+
+@Test
+func testIncrementalMTPPrefillKeepsShortPromptInOneForward() throws {
+    let main = MockMainModel(nextLogitTokens: Array(repeating: 7, count: 64))
+    let drafter = MockDrafter(draftedTokenValue: 7, requiresPromptPrefill: true)
+
+    _ = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3, 4])),
+        mainModel: main, drafter: drafter,
+        parameters: GenerateParameters(
+            maxTokens: 6, temperature: 0,
+            prefill: .init(stepSize: 512, chunking: .balanced)),
+        blockSize: 2)
+
+    #expect(main.forwardInputLengths == [4])
+    #expect(drafter.preparedHiddenLengths == [4])
+    #expect(drafter.preparedShiftedTokens == [[2, 3, 4, 7]])
+}
+
+@Test
+func testIncrementalMTPPrefillChunkSizePreservesTokenParity() throws {
+    let prompt = (1 ... 11).map(Int32.init)
+    let parameters = GenerateParameters(maxTokens: 6, temperature: 0)
+
+    func tokens(prefill: PrefillParameters) throws -> [Int] {
+        let main = MockMainModel(nextLogitTokens: Array(repeating: 7, count: 64))
+        let drafter = MockDrafter(draftedTokenValue: 7, requiresPromptPrefill: true)
+        var iterator = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray(prompt)), mainModel: main, drafter: drafter,
+            parameters: GenerateParameters(
+                maxTokens: parameters.maxTokens, temperature: parameters.temperature,
+                prefill: prefill),
+            blockSize: 2)
+        return Array(iterator)
+    }
+
+    let reference = try tokens(prefill: .init(chunking: .unchunked))
+    let chunked = try tokens(prefill: .init(stepSize: 3, chunking: .remainder))
+
+    #expect(chunked == reference)
+}
+
+@Test
+func testIncrementalMTPPrefillMaterializesFinalSeedBeforeSecondToken() throws {
+    let main = MockMainModel(nextLogitTokens: Array(repeating: 7, count: 64))
+    let drafter = MockDrafter(
+        draftedTokenValue: 7, requiresPromptPrefill: true, precomputesFinalSeed: true)
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3, 4])),
+        mainModel: main, drafter: drafter,
+        parameters: GenerateParameters(
+            maxTokens: 3, temperature: 0,
+            prefill: .init(stepSize: 2, chunking: .remainder)),
+        blockSize: 2)
+
+    // The final shifted-prompt call produces and evaluates this seed during
+    // iterator construction. Draining the bonus cannot defer it to decoding.
+    #expect(drafter.preparedFinalChunkCount == 1)
+    #expect(drafter.seededDraftBlockCallCount == 0)
+    #expect(drafter.computedDraftBlockCallCount == 0)
+    #expect(iterator.next() == 7)
+    #expect(drafter.computedDraftBlockCallCount == 0)
+
+    // Token two consumes the prefilled seed instead of issuing a new drafter
+    // forward over prompt-derived state.
+    #expect(iterator.next() == 7)
+    #expect(drafter.seededDraftBlockCallCount == 1)
+    #expect(drafter.computedDraftBlockCallCount == 0)
+}
+
+@Test
+func testMTPFinalPrefillLogitsOnlyIntentDoesNotReachVerification() throws {
+    let main = MockMainModel(nextLogitTokens: Array(repeating: 7, count: 64))
+    let drafter = MockDrafter(draftedTokenValue: 7, requiresPromptPrefill: true)
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3, 4])),
+        mainModel: main, drafter: drafter,
+        parameters: GenerateParameters(maxTokens: 3, temperature: 0), blockSize: 2)
+
+    #expect(main.incomingFinalPrefillLogitsOnlyFlags == [true])
+    #expect(iterator.next() == 7)
+    #expect(iterator.next() == 7)
+    #expect(main.incomingFinalPrefillLogitsOnlyFlags == [true, nil])
 }
 
 @Test
@@ -496,10 +722,12 @@ struct MTPJointGreedyVerificationTests {
             Array(repeating: Int32(5), count: accepted) + [9]
             + Array(repeating: Int32(1), count: 3 - accepted)
         let model = MockMainModel(nextLogitTokens: [0, 0, 5] + verify)
+        let drafter = MockDrafter(draftedTokenValue: 5)
         var iterator = try MTPSpeculativeTokenIterator(
             input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
-            mainModel: model, drafter: MockDrafter(draftedTokenValue: 5),
-            parameters: GenerateParameters(maxTokens: 8, temperature: 0), blockSize: 4)
+            mainModel: model, drafter: drafter,
+            parameters: GenerateParameters(maxTokens: 8, temperature: 0), blockSize: 4,
+            roundDiagnosticCapacity: 1)
         iterator.jointGreedyVerificationEnabled = enabled
 
         let tokens = (0 ..< accepted + 2).compactMap { _ in iterator.next() }
@@ -507,6 +735,13 @@ struct MTPJointGreedyVerificationTests {
         #expect(iterator.acceptedCount == accepted)
         #expect(iterator.proposedCount == 3)
         #expect(iterator.jointGreedyVerificationCount == (enabled ? 1 : 0))
+        let diagnostic = try #require(iterator.roundDiagnostics.first)
+        #expect(diagnostic.acceptedDraftTokenCount == accepted)
+        #expect(diagnostic.firstMismatchIndex == (accepted < 3 ? accepted : nil))
+        #expect(
+            diagnostic.cacheDisposition
+                == .staged(
+                    retainedTokenCount: accepted + 1, discardedTokenCount: 3 - accepted))
         iterator.finalizeGeneration()
         #expect(iterator.mainCacheStorage.processedTokenCount == 3 + tokens.count - 1)
     }
@@ -522,6 +757,147 @@ struct MTPJointGreedyVerificationTests {
         #expect([iterator.next(), iterator.next(), iterator.next()] == [5, 11, nil])
         #expect(iterator.jointGreedyVerificationCount == 0)
         #expect(iterator.proposedCount == 0)
+    }
+
+    @Test
+    func lowAcceptanceSwitchesToTargetOnlyDecode() throws {
+        let model = MockMainModel(nextLogitTokens: [0, 0, 5, 9, 1, 2, 3, 1])
+        let drafter = MockDrafter(draftedTokenValue: 5)
+        var iterator = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+            mainModel: model, drafter: drafter,
+            parameters: GenerateParameters(maxTokens: 5, temperature: 0), blockSize: 4,
+            adaptation: .init(minimumDraftTokens: 3, minimumAcceptanceRate: 0.25))
+
+        #expect(iterator.next() == 5)
+        #expect(iterator.next() == 9)
+        #expect(iterator.acceptedCount == 0)
+        #expect(iterator.proposedCount == 3)
+        #expect(
+            iterator.passthroughReason
+                == "MTP acceptance stayed below the configured performance floor")
+        #expect(iterator.next() == 1)
+        #expect(iterator.proposedCount == 3)
+        #expect(drafter.commitDrafterStateCallCount == 0)
+    }
+
+    @Test
+    func zeroAcceptanceDiagnosticPinsVerifierAlignmentAndStagedCacheCommit() throws {
+        let model = MockMainModel(nextLogitTokens: [0, 0, 5, 9, 1, 2, 3])
+        var iterator = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+            mainModel: model, drafter: MockDrafter(draftedTokenValue: 5),
+            parameters: GenerateParameters(maxTokens: 5, temperature: 0), blockSize: 4,
+            roundDiagnosticCapacity: 1)
+
+        #expect(iterator.next() == 5)
+        #expect(iterator.next() == 9)
+        let diagnostic = try #require(iterator.roundDiagnostics.first)
+        #expect(diagnostic.inputToken == 5)
+        #expect(diagnostic.firstDraftToken == 5)
+        #expect(diagnostic.firstTargetToken == 9)
+        #expect(diagnostic.firstMismatchIndex == 0)
+        #expect(diagnostic.targetLogitStartIndex == 0)
+        #expect(diagnostic.hiddenSourceIndex == nil)
+        #expect(diagnostic.draftedTokenCount == 3)
+        #expect(diagnostic.acceptedDraftTokenCount == 0)
+        #expect(diagnostic.emittedFinalToken == 9)
+        #expect(
+            diagnostic.cacheDisposition
+                == .staged(retainedTokenCount: 1, discardedTokenCount: 3))
+        #expect(iterator.acceptedCount == 0)
+        #expect(iterator.proposedCount == 3)
+    }
+
+    @Test
+    func nativeRewindDiagnosticAccountsForRejectedQwenStyleDraft() throws {
+        let model = NativeRewindMockMainModel(nextLogitTokens: [0, 0, 5, 9])
+        var iterator = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+            mainModel: model, drafter: MockDrafter(draftedTokenValue: 5),
+            parameters: GenerateParameters(maxTokens: 3, temperature: 0), blockSize: 2,
+            roundDiagnosticCapacity: 1)
+
+        #expect(iterator.next() == 5)
+        #expect(iterator.next() == 9)
+        let diagnostic = try #require(iterator.roundDiagnostics.first)
+        #expect(diagnostic.firstDraftToken == 5)
+        #expect(diagnostic.firstTargetToken == 9)
+        #expect(diagnostic.firstMismatchIndex == 0)
+        #expect(diagnostic.acceptedDraftTokenCount == 0)
+        #expect(
+            diagnostic.cacheDisposition
+                == .nativeRewind(retainedTokenCount: 1, rewoundTokenCount: 1))
+        #expect(iterator.mainCache.first?.offset == 4)
+        let recurrent = try #require(
+            iterator.mainCache.first(where: { $0 is MambaCache }) as? MambaCache)
+        #expect(!recurrent.hasSpeculativeCheckpoint)
+    }
+
+    @Test
+    func nativeD3EarlyFinalizationRebasesReachableRecurrentCheckpoint() throws {
+        // Verify [bonus, d1, d2, d3] predicts [d1, d2, correction, ...], so
+        // D3 accepts two drafts and restores the one-token-rewind boundary.
+        let model = NativeD3RewindMockMainModel(nextLogitTokens: [0, 0, 5, 5, 5, 9, 1])
+        var iterator = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+            mainModel: model, drafter: MockDrafter(draftedTokenValue: 5),
+            parameters: GenerateParameters(maxTokens: 8, temperature: 0), blockSize: 4)
+
+        #expect(iterator.next() == 5)  // prepare-time bonus
+        #expect(iterator.next() == 5)  // d1; d2 remains committed lookahead
+
+        let recurrent = try #require(
+            iterator.mainCache.first(where: { $0 is MambaCache }) as? MambaCache)
+        #expect(recurrent.hasSpeculativeCheckpoint(rewinding: 1))
+        #expect(!recurrent.hasSpeculativeCheckpoint(rewinding: 2))
+
+        iterator.finalizeGeneration()
+
+        #expect(recurrent.state[0].asArray(Float.self) == [2])
+        #expect(recurrent.state[1].asArray(Float.self) == [2])
+        #expect(iterator.mainCache.first?.offset == 5)
+        #expect(iterator.mainCacheStorage.processedTokenCount == 5)
+        #expect(!recurrent.hasSpeculativeCheckpoint)
+    }
+
+    @Test(arguments: 0 ... 3)
+    func nativeD3RetainsOnlyCheckpointsReachableFromPendingOutput(accepted: Int) throws {
+        let verify =
+            Array(repeating: Int32(5), count: accepted) + [9]
+            + Array(repeating: Int32(1), count: 3 - accepted)
+        let model = NativeD3RewindMockMainModel(nextLogitTokens: [0, 0, 5] + verify)
+        var iterator = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+            mainModel: model, drafter: MockDrafter(draftedTokenValue: 5),
+            parameters: GenerateParameters(maxTokens: 8, temperature: 0), blockSize: 4)
+
+        #expect(iterator.next() == 5)
+        #expect(iterator.next() != nil)
+
+        let recurrent = try #require(
+            iterator.mainCache.first(where: { $0 is MambaCache }) as? MambaCache)
+        #expect(recurrent.hasSpeculativeCheckpoint(rewinding: 1) == (accepted >= 2))
+        #expect(recurrent.hasSpeculativeCheckpoint(rewinding: 2) == (accepted == 3))
+        #expect(!recurrent.hasSpeculativeCheckpoint(rewinding: 3))
+
+        iterator.finalizeGeneration()
+        #expect(!recurrent.hasSpeculativeCheckpoint)
+        #expect(iterator.mainCacheStorage.processedTokenCount == (accepted == 0 ? 4 : 5))
+    }
+
+    @Test
+    func roundDiagnosticsRetainOnlyTheirConfiguredWindow() throws {
+        let model = MockMainModel(nextLogitTokens: [0, 0, 5, 9, 0, 8, 0])
+        var iterator = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+            mainModel: model, drafter: MockDrafter(draftedTokenValue: 5),
+            parameters: GenerateParameters(maxTokens: 4, temperature: 0), blockSize: 2,
+            roundDiagnosticCapacity: 1)
+
+        #expect([iterator.next(), iterator.next(), iterator.next()] == [5, 9, 8])
+        #expect(iterator.roundDiagnostics.count == 1)
+        #expect(iterator.roundDiagnostics.first?.inputToken == 9)
     }
 
     @Test

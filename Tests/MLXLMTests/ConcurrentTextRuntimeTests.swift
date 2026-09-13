@@ -1,5 +1,6 @@
 // Copyright © 2026 Faux Fox.
 
+import Foundation
 import MLX
 import MLXLLM
 import MLXNN
@@ -9,13 +10,126 @@ import XCTest
 
 private typealias Runtime = ConcurrentTextRuntime
 
+private final class ScheduledForwardProbe: @unchecked Sendable {
+    var finalPrefillCallCount = 0
+    var promptTokenCounts = [Int]()
+}
+
+private actor ScheduledForwardGate {
+    private var started = false
+    private var released = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func recordStart() {
+        started = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func waitUntilStarted() async {
+        guard !started else { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func waitForRelease() async {
+        guard !released else { return }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+}
+
+private final class ScheduledForwardLifecycleProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var forwardReturned = false
+    private var endCount = 0
+    private var endBeforeForwardReturn = false
+
+    func recordForwardReturn() {
+        lock.withLock { forwardReturned = true }
+    }
+
+    func recordEnd() {
+        lock.withLock {
+            endCount += 1
+            endBeforeForwardReturn = endBeforeForwardReturn || !forwardReturned
+        }
+    }
+
+    func snapshot() -> (endCount: Int, endBeforeForwardReturn: Bool) {
+        lock.withLock { (endCount, endBeforeForwardReturn) }
+    }
+}
+
+private final class LatchedScheduledModel: Module, ScheduledTextModel {
+    let vocabularySize = 100
+    let scheduledCacheBytesPerToken = 8
+    let gate: ScheduledForwardGate
+    let probe: ScheduledForwardLifecycleProbe
+
+    init(gate: ScheduledForwardGate, probe: ScheduledForwardLifecycleProbe) {
+        self.gate = gate
+        self.probe = probe
+    }
+
+    func newCache(parameters: GenerateParameters?) throws -> [KVCache] { [KVCacheSimple()] }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult { .tokens(input.text) }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let token = inputs.asArray(Int32.self).reduce(0, +) % Int32(vocabularySize)
+        return (MLXArray(0 ..< vocabularySize) .== token).asType(.float32).reshaped(1, 1, -1)
+    }
+
+    func scheduledBeginRequest() throws {}
+
+    func scheduledEndRequest() {
+        probe.recordEnd()
+    }
+
+    func scheduledForward(_ tokens: MLXArray, cache: [KVCache]) async throws -> MLXArray {
+        await gate.recordStart()
+        await gate.waitForRelease()
+        probe.recordForwardReturn()
+        return callAsFunction(tokens, cache: cache)
+    }
+}
+
 /// Uses real MLX cache writes and context-dependent logits without downloaded weights.
 private final class ScheduledChecksumModel: Module, ScheduledTextModel {
     let vocabularySize = 100
     let scheduledCacheBytesPerToken = 8
     let failOnToken: Int?
+    let streamed: Bool
+    let streamFailure: Error?
+    let probe: ScheduledForwardProbe?
 
-    init(failOnToken: Int? = nil) { self.failOnToken = failOnToken }
+    init(
+        failOnToken: Int? = nil, streamed: Bool = false, streamFailure: Error? = nil,
+        probe: ScheduledForwardProbe? = nil
+    ) {
+        self.failOnToken = failOnToken
+        self.streamed = streamed
+        self.streamFailure = streamFailure
+        self.probe = probe
+    }
+
+    var scheduledSupportsBatchDecode: Bool { false }
+    var scheduledRequiresExclusiveExecution: Bool { streamed }
+    var scheduledMaximumForwardTokens: Int? { streamed ? 2 : nil }
+
+    func scheduledBeginRequest(promptTokenCount: Int) throws {
+        probe?.promptTokenCounts.append(promptTokenCount)
+    }
 
     func newCache(parameters: GenerateParameters?) throws -> [KVCache] { [KVCacheSimple()] }
 
@@ -30,13 +144,71 @@ private final class ScheduledChecksumModel: Module, ScheduledTextModel {
         return (MLXArray(0 ..< vocabularySize) .== token).asType(.float32).reshaped(1, 1, -1)
     }
 
-    func scheduledForward(_ tokens: MLXArray, cache: [KVCache]) throws -> MLXArray {
+    func scheduledForward(_ tokens: MLXArray, cache: [KVCache]) async throws -> MLXArray {
         let logits = callAsFunction(tokens, cache: cache)
         if let failOnToken, tokens.asArray(Int32.self).contains(Int32(failOnToken)) {
+            if let streamFailure { throw streamFailure }
             throw ConcurrentTextRuntimeError.invalidRequest
         }
         return logits
     }
+
+    func scheduledFinalPrefillForward(
+        _ tokens: MLXArray, cache: [KVCache]
+    ) async throws -> MLXArray {
+        probe?.finalPrefillCallCount += 1
+        return try await scheduledForward(tokens, cache: cache)
+    }
+}
+
+private final class ScheduledSamplingModel: Module, ScheduledTextModel {
+    let vocabularySize = 4
+    let scheduledCacheBytesPerToken = 8
+    let greedyFirstToken: Bool
+
+    init(greedyFirstToken: Bool) {
+        self.greedyFirstToken = greedyFirstToken
+    }
+
+    var scheduledSupportsBatchDecode: Bool { false }
+    var scheduledFirstTokenGreedy: Bool { greedyFirstToken }
+
+    func newCache(parameters: GenerateParameters?) throws -> [KVCache] { [KVCacheSimple()] }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult { .tokens(input.text) }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let values = inputs.asType(.float32).reshaped(1, 1, -1, 1)
+        _ = cache![0].update(keys: values, values: values)
+        return MLXArray.zeros([1, 1, vocabularySize])
+    }
+
+    func scheduledForward(_ tokens: MLXArray, cache: [KVCache]) async throws -> MLXArray {
+        callAsFunction(tokens, cache: cache)
+    }
+}
+
+private final class ScheduledBlockLimitDrafter: Module, MTPDrafterModel {
+    let maximumBlockSize: Int?
+
+    init(maximumBlockSize: Int?) {
+        self.maximumBlockSize = maximumBlockSize
+        super.init()
+    }
+
+    func draftBlock(
+        target _: any LanguageModel, lastToken _: MLXArray, lastHidden _: MLXArray,
+        sharedKV _: [String: (MLXArray, MLXArray)], positionDeltas _: MLXArray?,
+        queryOffset _: Int, blockSize _: Int, sampler _: any LogitSampler
+    ) -> MTPDraft {
+        fatalError("Block-limit probe never drafts")
+    }
+}
+
+private enum SyntheticStreamFailure: Error, Equatable {
+    case unreadableExpertRange
 }
 
 private func collect(_ generation: Runtime.Generation) async throws -> (
@@ -74,6 +246,164 @@ final class ConcurrentTextRuntimeTests: XCTestCase {
                 memoryBudgetBytes: memory, prefixCacheBytes: prefixBytes, workingMemoryBytes: 4096,
                 maxActiveRequests: active, maxPromptTokens: 4096, maxOutputTokens: 128,
                 prefillChunkSize: 1, streamBufferSize: buffer))
+    }
+
+    func testScheduledMTPAdmissionUsesIteratorBlockLimits() {
+        XCTAssertEqual(
+            scheduledMTPVerificationBlockSize(
+                requestedBlockSize: 4,
+                drafter: ScheduledBlockLimitDrafter(maximumBlockSize: 2),
+                cache: [KVCacheSimple()]), 2)
+        XCTAssertEqual(
+            scheduledMTPVerificationBlockSize(
+                requestedBlockSize: 4,
+                drafter: ScheduledBlockLimitDrafter(maximumBlockSize: 4),
+                cache: [RotatingKVCache(maxSize: 2)]), 3)
+    }
+
+    func testStreamedScheduledForwardCapsPrefillAndDisablesBatchDecode() async throws {
+        let model = ScheduledChecksumModel(streamed: true)
+        let runtime = try Runtime(
+            model: model, identity: identity(),
+            configuration: .init(
+                memoryBudgetBytes: 1_000_000, prefixCacheBytes: 100_000,
+                workingMemoryBytes: 4096, maxActiveRequests: 2, maxPromptTokens: 4096,
+                maxOutputTokens: 128, prefillChunkSize: 8, streamBufferSize: 2048,
+                batchDecode: true))
+        let first = try await runtime.generate(.init(tokens: [1, 2, 3], maxTokens: 2))
+        let second = try await runtime.generate(.init(tokens: [4, 5, 6], maxTokens: 2))
+        async let firstTokens = collect(first)
+        async let secondTokens = collect(second)
+        let results = try await (firstTokens, secondTokens)
+        XCTAssertEqual(results.0.tokens, [6, 12])
+        XCTAssertEqual(results.1.tokens, [15, 30])
+        let status = await runtime.status()
+        XCTAssertEqual(status.batchedForwardCount, 0)
+        XCTAssertEqual(status.maximumBatchSize, 1)
+        XCTAssertFalse(runtime.capabilities.fusedBatching)
+    }
+
+    func testStreamedScheduledForwardPropagatesReadFailure() async throws {
+        let runtime = try Runtime(
+            model: ScheduledChecksumModel(
+                failOnToken: 3, streamed: true,
+                streamFailure: SyntheticStreamFailure.unreadableExpertRange),
+            identity: identity(),
+            configuration: .init(
+                memoryBudgetBytes: 1_000_000, prefixCacheBytes: 100_000,
+                workingMemoryBytes: 4096, maxPromptTokens: 4096, maxOutputTokens: 128,
+                prefillChunkSize: 8, streamBufferSize: 2048))
+        let generation = try await runtime.generate(.init(tokens: [1, 2, 3], maxTokens: 2))
+        do {
+            _ = try await collect(generation)
+            XCTFail("Expected streamed read failure")
+        } catch let error as SyntheticStreamFailure {
+            XCTAssertEqual(error, .unreadableExpertRange)
+        }
+    }
+
+    func testEveryOrdinaryPrefillChunkUsesFinalLogitForward() async throws {
+        let probe = ScheduledForwardProbe()
+        let runtime = try Runtime(
+            model: ScheduledChecksumModel(probe: probe), identity: identity(),
+            configuration: .init(
+                memoryBudgetBytes: 1_000_000, prefixCacheBytes: 100_000,
+                workingMemoryBytes: 4096, maxPromptTokens: 4096, maxOutputTokens: 128,
+                prefillChunkSize: 2, streamBufferSize: 2048))
+        let generation = try await runtime.generate(.init(tokens: [1, 2, 3], maxTokens: 2))
+        let result = try await collect(generation)
+        XCTAssertEqual(result.tokens, [6, 12])
+        XCTAssertEqual(probe.finalPrefillCallCount, 2)
+        XCTAssertEqual(probe.promptTokenCounts, [3])
+    }
+
+    func testScheduledGreedyFirstTokenLeavesTheSamplerAtItsInitialSeededState() async throws {
+        func generatedTokens(greedyFirstToken: Bool, seed: UInt64) async throws -> [Int] {
+            let runtime = try Runtime(
+                model: ScheduledSamplingModel(greedyFirstToken: greedyFirstToken),
+                identity: identity(),
+                configuration: .init(
+                    memoryBudgetBytes: 1_000_000, prefixCacheBytes: 100_000,
+                    workingMemoryBytes: 4096, maxPromptTokens: 64, maxOutputTokens: 2,
+                    prefillChunkSize: 1, streamBufferSize: 32))
+            let generation = try await runtime.generate(
+                .init(
+                    tokens: [1], maxTokens: 2, temperature: 1, seed: seed,
+                    speculative: false))
+            return try await collect(generation).tokens
+        }
+
+        let seeds: [UInt64] = [1, 2, 3, 4, 5]
+        var greedy = [[Int]]()
+        var sampled = [[Int]]()
+        for seed in seeds {
+            greedy.append(try await generatedTokens(greedyFirstToken: true, seed: seed))
+            sampled.append(try await generatedTokens(greedyFirstToken: false, seed: seed))
+        }
+
+        XCTAssertTrue(greedy.allSatisfy { $0.first == 0 })
+        XCTAssertEqual(greedy.map { $0[1] }, sampled.map { $0[0] })
+        XCTAssertGreaterThan(Set(sampled.map { $0[0] }).count, 1)
+    }
+
+    func testCancellationSettlesForwardBeforeEndingTheModelRequest() async throws {
+        let gate = ScheduledForwardGate()
+        let probe = ScheduledForwardLifecycleProbe()
+        let runtime = try Runtime(
+            model: LatchedScheduledModel(gate: gate, probe: probe), identity: identity(),
+            configuration: .init(
+                memoryBudgetBytes: 1_000_000, prefixCacheBytes: 100_000,
+                workingMemoryBytes: 4096, maxPromptTokens: 64, maxOutputTokens: 2,
+                prefillChunkSize: 1, streamBufferSize: 32))
+        let generation = try await runtime.generate(.init(tokens: [1], maxTokens: 2))
+        await gate.waitUntilStarted()
+
+        let cancellation = Task { await runtime.cancel(generation.id) }
+        for _ in 0 ..< 3 { await Task.yield() }
+        XCTAssertEqual(probe.snapshot().endCount, 0)
+
+        await gate.release()
+        await cancellation.value
+
+        let lifecycle = probe.snapshot()
+        XCTAssertEqual(lifecycle.endCount, 1)
+        XCTAssertFalse(lifecycle.endBeforeForwardReturn)
+        let result = try await collect(generation)
+        XCTAssertTrue(result.tokens.isEmpty)
+        let status = await runtime.status()
+        XCTAssertEqual(status.activeRequests, 0)
+    }
+
+    func testShutdownWaitsForForwardBeforeReleasingModelOwnership() async throws {
+        let gate = ScheduledForwardGate()
+        let probe = ScheduledForwardLifecycleProbe()
+        let runtime = try Runtime(
+            model: LatchedScheduledModel(gate: gate, probe: probe), identity: identity(),
+            configuration: .init(
+                memoryBudgetBytes: 1_000_000, prefixCacheBytes: 100_000,
+                workingMemoryBytes: 4096, maxPromptTokens: 64, maxOutputTokens: 2,
+                prefillChunkSize: 1, streamBufferSize: 32))
+        let generation = try await runtime.generate(.init(tokens: [1], maxTokens: 2))
+        await gate.waitUntilStarted()
+
+        let shutdown = Task { await runtime.shutdown() }
+        for _ in 0 ..< 3 { await Task.yield() }
+        XCTAssertEqual(probe.snapshot().endCount, 0)
+
+        await gate.release()
+        await shutdown.value
+
+        let lifecycle = probe.snapshot()
+        XCTAssertEqual(lifecycle.endCount, 1)
+        XCTAssertFalse(lifecycle.endBeforeForwardReturn)
+        let result = try await collect(generation)
+        XCTAssertTrue(result.tokens.isEmpty)
+        let status = await runtime.status()
+        XCTAssertEqual(status.activeRequests, 0)
+        do {
+            _ = try await runtime.generate(.init(tokens: [1], maxTokens: 1))
+            XCTFail("Expected shutdown rejection")
+        } catch { XCTAssertEqual(error as? ConcurrentTextRuntimeError, .shutDown) }
     }
 
     func testDistinctSimultaneousPromptsAndSlotReuse() async throws {
@@ -435,6 +765,97 @@ final class ConcurrentTextRuntimeTests: XCTestCase {
             }
             await runtime.shutdown()
         }
+    }
+
+    func testScheduledMTPClipsPrefillAtExactPrefixFrontier() async throws {
+        let config = try JSONDecoder().decode(
+            Qwen35TextConfiguration.self,
+            from: Data(
+                """
+                {"model_type":"qwen3_5_text","hidden_size":64,"num_hidden_layers":2,
+                "intermediate_size":128,"num_attention_heads":2,"num_key_value_heads":1,
+                "head_dim":32,"linear_num_value_heads":2,"linear_num_key_heads":1,
+                "linear_key_head_dim":32,"linear_value_head_dim":32,"linear_conv_kernel_dim":4,
+                "vocab_size":100,"full_attention_interval":2,"mtp_num_hidden_layers":1,
+                "tie_word_embeddings":true,"rope_theta":10000000.0,"partial_rotary_factor":0.25}
+                """.utf8))
+        let model = withRandomState(MLXRandom.RandomState(seed: 114)) {
+            Qwen35TextModel(config)
+        }
+        let drafter = withRandomState(MLXRandom.RandomState(seed: 115)) {
+            Qwen35MTPDraftModel(config)
+        }
+        let runtime = try Runtime(
+            model: model, identity: identity(),
+            configuration: .init(
+                memoryBudgetBytes: 32_000_000, prefixCacheBytes: 1_000_000,
+                workingMemoryBytes: 1_000_000, prefillChunkSize: 256),
+            drafter: drafter)
+        let shared = (0 ..< 129).map { $0 % 99 + 1 }
+        let seed = shared + [1]
+        let branch = shared + [2]
+
+        func collectDetails(_ request: Runtime.Request) async throws -> (
+            tokens: [Int], reused: Int, prefill: [Int], rounds: Int
+        ) {
+            let generation = try await runtime.generate(request)
+            var tokens = [Int]()
+            var reused = 0
+            var prefill = [Int]()
+            var rounds = 0
+            for try await event in generation.events {
+                switch event {
+                case .token(let token): tokens.append(token)
+                case .admitted(let count): reused = count
+                case .prefill(let processed, _): prefill.append(processed)
+                case .speculation(let telemetry): rounds += telemetry.roundCount
+                default: break
+                }
+            }
+            return (tokens, reused, prefill, rounds)
+        }
+
+        do {
+            let cold = try await collectDetails(.init(tokens: branch, maxTokens: 4))
+            XCTAssertEqual(cold.prefill, [130])
+            let published = try await collectDetails(
+                .init(
+                    tokens: seed, maxTokens: 4, prefixTokenCount: 129,
+                    cacheIdentity: identity()))
+            XCTAssertEqual(published.prefill, [128, 130])
+
+            let warm = try await collectDetails(
+                .init(
+                    tokens: branch, maxTokens: 4, prefixTokenCount: 129,
+                    cacheIdentity: identity()))
+            XCTAssertEqual(warm.reused, 128)
+            XCTAssertEqual(warm.prefill, [130])
+            XCTAssertEqual(warm.tokens, cold.tokens)
+            XCTAssertGreaterThan(warm.rounds, 0)
+
+            await runtime.clearPrefixCache()
+            let alignedShared = (0 ..< 257).map { $0 % 99 + 1 }
+            let alignedSeed = alignedShared + [1]
+            let alignedBranch = alignedShared + [2]
+            let alignedCold = try await collectDetails(
+                .init(tokens: alignedBranch, maxTokens: 4))
+            let alignedPublished = try await collectDetails(
+                .init(
+                    tokens: alignedSeed, maxTokens: 4, prefixTokenCount: 257,
+                    cacheIdentity: identity()))
+            XCTAssertEqual(alignedPublished.prefill, [256, 258])
+            let alignedWarm = try await collectDetails(
+                .init(
+                    tokens: alignedBranch, maxTokens: 4, prefixTokenCount: 257,
+                    cacheIdentity: identity()))
+            XCTAssertEqual(alignedWarm.reused, 256)
+            XCTAssertEqual(alignedWarm.prefill, [258])
+            XCTAssertEqual(alignedWarm.tokens, alignedCold.tokens)
+        } catch {
+            await runtime.shutdown()
+            throw error
+        }
+        await runtime.shutdown()
     }
 
     func testSharedBudgetReservesInteractiveHeadroomAndReleasesCancelledDemand() async throws {

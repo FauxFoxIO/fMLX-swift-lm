@@ -74,7 +74,8 @@ final class Qwen35MTPPrefixCacheTests: XCTestCase {
             configuration: .init(
                 memoryBudgetBytes: 64_000_000, prefixCacheBytes: prefixBytes,
                 workingMemoryBytes: 2_000_000, maxPromptTokens: 512, maxOutputTokens: 256,
-                prefillChunkSize: 4, streamBufferSize: 2048), drafter: head)
+                prefillChunkSize: 4, streamBufferSize: 2048, speculativeAdaptation: nil),
+            drafter: head)
     }
 
     private func request(

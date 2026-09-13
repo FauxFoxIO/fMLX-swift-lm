@@ -87,33 +87,31 @@ final class NativeInferencePerformanceTests: XCTestCase {
                         let cache = try model.newCache(parameters: nil)
                         var position = 0
                         while tokens.count < fixture.outputTokens {
-                            try autoreleasepool {
-                                let prefill = position < prompt.tokens.count
-                                let input =
-                                    prefill
-                                    ? Array(
-                                        prompt.tokens[
-                                            position ..< min(position + 128, prompt.tokens.count)])
-                                    : [tokens.last!]
-                                let a = ProcessInfo.processInfo.systemUptime
-                                let logits = try model.scheduledForward(
-                                    MLXArray(input).expandedDimensions(axis: 0), cache: cache)
-                                let b = ProcessInfo.processInfo.systemUptime
-                                eval([logits] + cache.flatMap { $0.innerState() })
-                                let c = ProcessInfo.processInfo.systemUptime
-                                if prefill { position += input.count }
-                                if position == prompt.tokens.count {
-                                    tokens.append(
-                                        argMax(logits[0..., -1, 0...], axis: -1).item(Int.self))
-                                    times.append(ProcessInfo.processInfo.systemUptime - start)
-                                }
-                                let d = ProcessInfo.processInfo.systemUptime
-                                phases.append([
-                                    "prefill": prefill ? 1 : 0, "inputTokens": Double(input.count),
-                                    "graphSeconds": b - a, "evalSeconds": c - b,
-                                    "sampleSeconds": d - c,
-                                ])
+                            let prefill = position < prompt.tokens.count
+                            let input =
+                                prefill
+                                ? Array(
+                                    prompt.tokens[
+                                        position ..< min(position + 128, prompt.tokens.count)])
+                                : [tokens.last!]
+                            let a = ProcessInfo.processInfo.systemUptime
+                            let logits = try await model.scheduledForward(
+                                MLXArray(input).expandedDimensions(axis: 0), cache: cache)
+                            let b = ProcessInfo.processInfo.systemUptime
+                            eval([logits] + cache.flatMap { $0.innerState() })
+                            let c = ProcessInfo.processInfo.systemUptime
+                            if prefill { position += input.count }
+                            if position == prompt.tokens.count {
+                                tokens.append(
+                                    argMax(logits[0..., -1, 0...], axis: -1).item(Int.self))
+                                times.append(ProcessInfo.processInfo.systemUptime - start)
                             }
+                            let d = ProcessInfo.processInfo.systemUptime
+                            phases.append([
+                                "prefill": prefill ? 1 : 0, "inputTokens": Double(input.count),
+                                "graphSeconds": b - a, "evalSeconds": c - b,
+                                "sampleSeconds": d - c,
+                            ])
                         }
                         Stream().synchronize()
                     }

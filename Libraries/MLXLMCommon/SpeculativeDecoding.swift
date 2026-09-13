@@ -125,6 +125,24 @@ public struct SpeculativeDecodingTelemetry: Sendable, Equatable {
     }
 }
 
+/// Stops speculative decoding when a drafter consistently costs more work than it saves.
+public struct SpeculativeDecodingAdaptation: Sendable, Hashable {
+    /// Evaluate the acceptance floor after this many draft tokens.
+    public let minimumDraftTokens: Int
+
+    /// Continue speculating only while at least this fraction of drafts is accepted.
+    public let minimumAcceptanceRate: Double
+
+    public init(minimumDraftTokens: Int = 8, minimumAcceptanceRate: Double = 0.25) {
+        precondition(minimumDraftTokens > 0, "minimumDraftTokens must be positive")
+        precondition(
+            minimumAcceptanceRate.isFinite && (0 ... 1).contains(minimumAcceptanceRate),
+            "minimumAcceptanceRate must be finite and between zero and one")
+        self.minimumDraftTokens = minimumDraftTokens
+        self.minimumAcceptanceRate = minimumAcceptanceRate
+    }
+}
+
 /// Action to take when speculative decoding exceeds a memory budget.
 public enum SpeculativeDecodingMemoryAction: Sendable, Hashable {
     /// Use speculative decoding even if the estimate exceeds the budget.

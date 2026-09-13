@@ -12,6 +12,22 @@ package let qwen35FourGDNEnabled: Bool = {
     return raw != "0" && raw != "false" && raw != "off"
 }()
 
+/// Default-on rollback switch for Qwen 3.5/3.6/3.8 gate-and-up MLP fusion.
+package let qwen35MLPGateUpEnabled: Bool = {
+    let raw = ProcessInfo.processInfo.environment["MLX_QWEN_MLP_GATE_UP"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    return raw != "0" && raw != "false" && raw != "off"
+}()
+
+/// Default-on rollback switch for projecting only the last row of Qwen prefill logits.
+package let qwen35FinalPrefillLogitEnabled: Bool = {
+    let raw = ProcessInfo.processInfo.environment["MLX_QWEN_FINAL_PREFILL_LOGIT"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    return raw != "0" && raw != "false" && raw != "off"
+}()
+
 /// A fused quantized projection and checkpoint-shaped views into its storage.
 ///
 /// The views let a model keep its public/checkpoint module topology without
@@ -148,7 +164,8 @@ package func fuseQuantizedLinearProjections(
         first.weight.dim(0) == first.shape.0,
         first.scales.ndim == 2,
         first.scales.dim(0) == first.shape.0,
-        first.biases == nil || first.biases?.shape == first.scales.shape
+        first.biases == nil || first.biases?.shape == first.scales.shape,
+        first.globalScale == nil
     else {
         return nil
     }
@@ -172,6 +189,7 @@ package func fuseQuantizedLinearProjections(
                 && (projection.biases != nil) == hasQuantizationBiases
                 && (projection.biases == nil || projection.biases?.shape == projection.scales.shape)
                 && projection.biases?.dtype == first.biases?.dtype
+                && projection.globalScale == nil
         })
     else {
         return nil

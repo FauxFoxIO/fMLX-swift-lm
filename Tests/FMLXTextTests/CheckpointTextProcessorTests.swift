@@ -285,8 +285,10 @@ private struct Fixture {
         directory: fixture.directory, modelRevision: "test-weights",
         configuration: .init(
             memoryBudgetBytes: 16_000_000, prefixCacheBytes: 1_000_000, workingMemoryBytes: 100_000,
-            maxPromptTokens: 128, maxOutputTokens: 8))
+            maxPromptTokens: 128, maxOutputTokens: 8, prefillChunkSize: 96),
+        prefillChunkPolicy: .throughput)
     do {
+        #expect(loaded.prefillChunkSize == 96)
         let request = try loaded.prepareRequest(
             messages: [["role": "user", "content": "hello"]], maximumOutputTokens: 4,
             prefixTokenCount: 3)

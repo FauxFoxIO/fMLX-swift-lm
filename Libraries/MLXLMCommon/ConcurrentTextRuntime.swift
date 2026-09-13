@@ -4,6 +4,14 @@ import Foundation
 import MLX
 import MLXNN
 
+func scheduledMTPVerificationBlockSize(
+    requestedBlockSize: Int, drafter: any MTPDrafterModel, cache: [KVCache]
+) -> Int {
+    let drafterLimit = Swift.min(
+        requestedBlockSize, drafter.maximumBlockSize ?? requestedBlockSize)
+    return Swift.min(drafterLimit, MTPSpeculativeTokenIterator.maximumBlockSize(for: cache))
+}
+
 /// Opt-in contract for bounded, causal text forwards with all mutable state in the cache.
 /// Conformers must support arbitrary chunk boundaries, return no out-of-cache state,
 /// and keep weights read-only. Supported leaves are simple attention and Mamba caches.
@@ -11,16 +19,64 @@ public protocol ScheduledTextModel: LanguageModel {
     var vocabularySize: Int { get }
     /// Conservative bytes per token across all cache layers, including both K and V.
     var scheduledCacheBytesPerToken: Int { get }
+    /// Recurrent-state bytes for one live boundary plus the requested verification boundaries.
+    /// `verificationBlockSize` is one for ordinary decoding and includes the bonus token for MTP.
+    func scheduledRecurrentStateBytes(forVerificationBlockSize verificationBlockSize: Int) -> Int
+    /// Conservative recurrent-state reservation retained for source compatibility.
     var scheduledRecurrentStateBytes: Int { get }
     var scheduledSupportsBatchDecode: Bool { get }
+    /// Bounded weight residency held outside registered model parameters.
+    var scheduledAdditionalResidentWeightBytes: Int { get }
+    /// A streamed model may need a host-side routing and I/O phase before MLX work.
+    /// The runtime then keeps one request active so the model owns its expert slots.
+    var scheduledRequiresExclusiveExecution: Bool { get }
+    /// Upper bound for one scheduled forward. `nil` leaves prefill chunking unchanged.
+    var scheduledMaximumForwardTokens: Int? { get }
+    /// Whether this model's complete request state can be snapshotted with its KV cache.
+    var scheduledSupportsPrefixCache: Bool { get }
     var scheduledMTPArchitectureID: String? { get }
-    func scheduledForward(_ tokens: MLXArray, cache: [KVCache]) throws -> MLXArray
+    /// Request lifecycle hooks for models with transient state outside their KV cache.
+    func scheduledBeginRequest() throws
+    /// A prompt-aware lifecycle hook. Existing conformers may keep implementing
+    /// `scheduledBeginRequest()`; the default bridge preserves that behavior.
+    func scheduledBeginRequest(promptTokenCount: Int) throws
+    func scheduledEndRequest()
+    /// Whether the first generated token uses greedy selection without advancing the sampler.
+    var scheduledFirstTokenGreedy: Bool { get }
+    nonisolated(nonsending) func scheduledForward(
+        _ tokens: MLXArray,
+        cache: [KVCache]
+    ) async throws -> MLXArray
+    /// Returns only the final prefill token's logits when earlier rows are not needed.
+    nonisolated(nonsending) func scheduledFinalPrefillForward(
+        _ tokens: MLXArray,
+        cache: [KVCache]
+    ) async throws -> MLXArray
 }
 
 extension ScheduledTextModel {
+    public func scheduledRecurrentStateBytes(forVerificationBlockSize _: Int) -> Int {
+        scheduledRecurrentStateBytes
+    }
     public var scheduledRecurrentStateBytes: Int { 0 }
     public var scheduledSupportsBatchDecode: Bool { false }
+    public var scheduledAdditionalResidentWeightBytes: Int { 0 }
+    public var scheduledRequiresExclusiveExecution: Bool { false }
+    public var scheduledMaximumForwardTokens: Int? { nil }
+    public var scheduledSupportsPrefixCache: Bool { true }
     public var scheduledMTPArchitectureID: String? { nil }
+    public func scheduledBeginRequest() throws {}
+    public func scheduledBeginRequest(promptTokenCount: Int) throws {
+        try scheduledBeginRequest()
+    }
+    public func scheduledEndRequest() {}
+    public var scheduledFirstTokenGreedy: Bool { false }
+    public nonisolated(nonsending) func scheduledFinalPrefillForward(
+        _ tokens: MLXArray,
+        cache: [KVCache]
+    ) async throws -> MLXArray {
+        try await scheduledForward(tokens, cache: cache)
+    }
 }
 
 /// Caller-supplied content identities, not mutable repository names or branch names.
@@ -87,6 +143,9 @@ public actor ConcurrentTextRuntime {
         public let interactiveReservedSlots: Int
         public let cacheQuantization: CacheQuantization?
         public let persistentCache: RuntimePersistentCacheConfiguration?
+        public let speculativeAdaptation: SpeculativeDecodingAdaptation?
+        /// Total target verification positions: one committed bonus plus draft tokens.
+        public let speculativeBlockSize: Int
 
         public init(
             memoryBudgetBytes: Int, prefixCacheBytes: Int, workingMemoryBytes: Int,
@@ -95,7 +154,9 @@ public actor ConcurrentTextRuntime {
             prefillChunkSize: Int = 128, streamBufferSize: Int = 256,
             batchDecode: Bool = true, interactiveReservedSlots: Int = 0,
             cacheQuantization: CacheQuantization? = nil,
-            persistentCache: RuntimePersistentCacheConfiguration? = nil
+            persistentCache: RuntimePersistentCacheConfiguration? = nil,
+            speculativeAdaptation: SpeculativeDecodingAdaptation? = .init(),
+            speculativeBlockSize: Int = 4
         ) {
             self.memoryBudgetBytes = memoryBudgetBytes
             self.prefixCacheBytes = prefixCacheBytes
@@ -110,6 +171,8 @@ public actor ConcurrentTextRuntime {
             self.interactiveReservedSlots = interactiveReservedSlots
             self.cacheQuantization = cacheQuantization
             self.persistentCache = persistentCache
+            self.speculativeAdaptation = speculativeAdaptation
+            self.speculativeBlockSize = speculativeBlockSize
         }
     }
 
@@ -181,9 +244,9 @@ public actor ConcurrentTextRuntime {
     }
 
     public struct Capabilities: Sendable {
-        public let immutablePrefixSnapshots = true
-        public let independentPrefixForks = true
-        public let prefixRestore = true
+        public let immutablePrefixSnapshots: Bool
+        public let independentPrefixForks: Bool
+        public let prefixRestore: Bool
         public let recurrentState: Bool
         public let speculativeDecoding: Bool
         public let speculativeLimitation: String?
@@ -200,6 +263,7 @@ public actor ConcurrentTextRuntime {
     private var model: any ScheduledTextModel { ownedModel! }
     private let configuration: Configuration
     private let weightBytes: Int
+    private let scheduledSpeculativeBlockSize: Int
     private var active: [Slot] = []
     private var pending: [Slot] = []
     private var prefixes: [Prefix] = []
@@ -228,6 +292,14 @@ public actor ConcurrentTextRuntime {
         var service: Double = 0
         var iterator: MTPSpeculativeTokenIterator?
         var reportedMTPFallback: String?
+        var modelRequestBegan = false
+        var cancellationRequested = false
+        var finishing = false
+        var finished = false
+        var inFlightForwardCount = 0
+        var finishReason: GenerateStopReason?
+        var finishError: Error?
+        var settlementWaiters: [CheckedContinuation<Void, Never>] = []
 
         init(id: UUID, request: Request, continuation: Continuation, reservation: Int) {
             self.id = id
@@ -268,11 +340,17 @@ public actor ConcurrentTextRuntime {
             configuration.workingMemoryBytes > 0, configuration.maxActiveRequests > 0,
             configuration.maxQueuedRequests > 0, configuration.maxPromptTokens > 0,
             configuration.maxOutputTokens > 0, configuration.prefillChunkSize > 0,
-            configuration.streamBufferSize > 0, model.scheduledCacheBytesPerToken > 0,
+            configuration.streamBufferSize > 0, configuration.speculativeBlockSize >= 2,
+            model.scheduledCacheBytesPerToken > 0,
+            model.scheduledAdditionalResidentWeightBytes >= 0,
+            model.scheduledMaximumForwardTokens.map({ $0 > 0 }) ?? true,
             configuration.interactiveReservedSlots >= 0,
             configuration.interactiveReservedSlots < configuration.maxActiveRequests,
             model.vocabularySize > 0
         else { throw ConcurrentTextRuntimeError.invalidConfiguration }
+        guard !(model.scheduledRequiresExclusiveExecution && drafter != nil) else {
+            throw ConcurrentTextRuntimeError.invalidConfiguration
+        }
         model.train(false)
         try model.prepare()
         eval(model)
@@ -283,10 +361,12 @@ public actor ConcurrentTextRuntime {
             drafter.train(false)
             eval(drafter)
         }
-        let weights =
+        let registeredWeights =
             model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
             + (drafter?.parameters().flattened().reduce(0) { $0 + $1.1.nbytes } ?? 0)
-        guard weights < configuration.memoryBudgetBytes,
+        let (weights, overflow) = registeredWeights.addingReportingOverflow(
+            model.scheduledAdditionalResidentWeightBytes)
+        guard !overflow, weights < configuration.memoryBudgetBytes,
             configuration.prefixCacheBytes < configuration.memoryBudgetBytes - weights,
             configuration.workingMemoryBytes
                 < configuration.memoryBudgetBytes - weights - configuration.prefixCacheBytes
@@ -306,25 +386,49 @@ public actor ConcurrentTextRuntime {
                 throw ConcurrentTextRuntimeError.invalidConfiguration
             }
         }
+        if let adaptation = configuration.speculativeAdaptation {
+            guard adaptation.minimumDraftTokens > 0,
+                adaptation.minimumAcceptanceRate.isFinite,
+                (0 ... 1).contains(adaptation.minimumAcceptanceRate)
+            else { throw ConcurrentTextRuntimeError.invalidConfiguration }
+        }
+        let scheduledSpeculativeBlockSize: Int
+        if let drafter {
+            scheduledSpeculativeBlockSize = scheduledMTPVerificationBlockSize(
+                requestedBlockSize: configuration.speculativeBlockSize,
+                drafter: drafter, cache: cache)
+        } else {
+            scheduledSpeculativeBlockSize = 1
+        }
         self.ownedModel = model
         self.ownedDrafter = drafter
         self.identity = identity
         self.configuration = configuration
         self.weightBytes = weights
-        let batching = configuration.batchDecode && model.scheduledSupportsBatchDecode
+        self.scheduledSpeculativeBlockSize = scheduledSpeculativeBlockSize
+        let streamed = model.scheduledRequiresExclusiveExecution
+        let batching = configuration.batchDecode && model.scheduledSupportsBatchDecode && !streamed
         self.capabilities = Capabilities(
+            immutablePrefixSnapshots: model.scheduledSupportsPrefixCache,
+            independentPrefixForks: model.scheduledSupportsPrefixCache,
+            prefixRestore: model.scheduledSupportsPrefixCache,
             recurrentState: cache.contains { $0 is MambaCache },
-            speculativeDecoding: drafter != nil && configuration.cacheQuantization == nil,
-            speculativeLimitation: drafter == nil
-                ? "No matching trained MTP head supplied"
-                : configuration.cacheQuantization != nil
-                    ? "MTP with quantized target KV is not qualified"
-                    : drafter is any ScheduledMTPPrefixCachingDrafter
-                        ? "MTP disk prefix restore and batched verification are unavailable"
-                        : "MTP prefix restore and batched verification are unavailable",
+            speculativeDecoding: drafter != nil && configuration.cacheQuantization == nil
+                && !streamed,
+            speculativeLimitation: streamed
+                ? "Streamed experts only support direct scheduled execution"
+                : drafter == nil
+                    ? "No matching trained MTP head supplied"
+                    : configuration.cacheQuantization != nil
+                        ? "MTP with quantized target KV is not qualified"
+                        : drafter is any ScheduledMTPPrefixCachingDrafter
+                            ? "MTP disk prefix restore and batched verification are unavailable"
+                            : "MTP prefix restore and batched verification are unavailable",
             fusedBatching: batching, executionMode: batching ? .batchedDecode : .interleaved,
-            limitation: batching
-                ? nil : "Model has not opted into batched projection/row-native attention")
+            limitation: streamed
+                ? "Streamed experts serialize ownership and disable batch decode"
+                : batching
+                    ? nil : "Model has not opted into batched projection/row-native attention")
         if let persistent = configuration.persistentCache {
             let layout =
                 cache.map { String(describing: type(of: $0)) }.joined(separator: ",")
@@ -353,8 +457,10 @@ public actor ConcurrentTextRuntime {
         let (kvBytes, overflow3) = padded.multipliedReportingOverflow(
             by: model.scheduledCacheBytesPerToken
                 + (usesMTP(request) ? ownedDrafter!.cacheBytesPerToken : 0))
+        let verificationBlockSize = usesMTP(request) ? scheduledSpeculativeBlockSize : 1
         let (stateBytes, stateOverflow) = kvBytes.addingReportingOverflow(
-            model.scheduledRecurrentStateBytes)
+            model.scheduledRecurrentStateBytes(
+                forVerificationBlockSize: verificationBlockSize))
         let (reservation, overflow4) = stateBytes.addingReportingOverflow(
             configuration.workingMemoryBytes)
         guard !overflow1, !overflow2, !overflow3, !stateOverflow, !overflow4,
@@ -396,6 +502,7 @@ public actor ConcurrentTextRuntime {
         if let slot = pending.first(where: { $0.id == id }) ?? active.first(where: { $0.id == id })
         {
             finish(slot, reason: .cancelled)
+            await waitForSettlement(of: slot)
         }
         await flushReleases()
         await resources?.signal()
@@ -412,12 +519,17 @@ public actor ConcurrentTextRuntime {
 
     public func shutdown() async {
         closed = true
-        for slot in pending + active { finish(slot, reason: .cancelled) }
+        let slots = pending + active
+        for slot in slots { finish(slot, reason: .cancelled) }
+        for slot in slots { await waitForSettlement(of: slot) }
         clearPrefixCache()
+        await flushReleases()
+        if let residentReservation {
+            self.residentReservation = nil
+            await resources?.unregister(residentReservation)
+        }
         ownedModel = nil
         ownedDrafter = nil
-        await flushReleases()
-        if let residentReservation { await resources?.unregister(residentReservation) }
     }
 
     public func status() -> Status {
@@ -450,6 +562,21 @@ public actor ConcurrentTextRuntime {
         for id in released { await resources?.release(id) }
     }
 
+    private func waitForSettlement(of slot: Slot) async {
+        guard !slot.finished else { return }
+        await withCheckedContinuation { slot.settlementWaiters.append($0) }
+    }
+
+    private func beginForward(for slots: [Slot]) {
+        for slot in slots { slot.inFlightForwardCount += 1 }
+    }
+
+    private func completedForward(for slot: Slot) -> Bool {
+        precondition(slot.inFlightForwardCount > 0)
+        slot.inFlightForwardCount -= 1
+        return slot.finishing && slot.inFlightForwardCount == 0
+    }
+
     private var requestBudget: Int {
         configuration.memoryBudgetBytes - weightBytes - configuration.prefixCacheBytes
     }
@@ -459,6 +586,7 @@ public actor ConcurrentTextRuntime {
     private func run() async {
         while !pending.isEmpty || !active.isEmpty {
             let version = await resources?.version()
+            guard !closed else { break }
             await admit()
             if let slot = active.min(by: { $0.service < $1.service }) {
                 if let resources {
@@ -486,11 +614,11 @@ public actor ConcurrentTextRuntime {
                         }
                     }
                     if selected.count > 1 {
-                        try autoreleasepool { try batchStep(selected) }
+                        try await batchStep(selected)
                     } else {
-                        try autoreleasepool { try step(slot) }
+                        try await step(slot)
                     }
-                    for item in selected {
+                    for item in selected where !item.finishing {
                         item.service += item.request.priority == .interactive ? 1 : 3
                     }
                 } catch {
@@ -511,7 +639,9 @@ public actor ConcurrentTextRuntime {
 
     private func admit() async {
         // FIFO admission reserves room for large requests instead of continually bypassing them.
-        while let slot = pending.first, active.count < configuration.maxActiveRequests {
+        let maximumActive =
+            model.scheduledRequiresExclusiveExecution ? 1 : configuration.maxActiveRequests
+        while let slot = pending.first, active.count < maximumActive {
             let backgroundSlotsFull =
                 active.filter { $0.request.priority == .background }.count
                 >= configuration.maxActiveRequests - configuration.interactiveReservedSlots
@@ -579,7 +709,9 @@ public actor ConcurrentTextRuntime {
                             temperature: slot.request.temperature,
                             topP: slot.request.topP,
                             topK: slot.request.topK,
-                            seed: slot.request.seed), blockSize: 2, prefix: snapshot
+                            seed: slot.request.seed),
+                        blockSize: configuration.speculativeBlockSize, prefix: snapshot,
+                        adaptation: configuration.speculativeAdaptation
                     )
                     slot.cache = slot.iterator!.mainCache
                     slot.position = snapshot?.processedTokenCount ?? 0
@@ -589,7 +721,9 @@ public actor ConcurrentTextRuntime {
                     slot.cache = cache.map { $0.copy() }
                     eval(slot.cache.flatMap { $0.innerState() })
                     slot.position = prefix.tokens.count
-                } else if slot.request.cacheIdentity == identity, let persistentStore {
+                } else if model.scheduledSupportsPrefixCache,
+                    slot.request.cacheIdentity == identity, let persistentStore
+                {
                     do {
                         if let restored = try persistentStore.restore(
                             prompt: slot.request.tokens,
@@ -601,6 +735,8 @@ public actor ConcurrentTextRuntime {
                         }
                     } catch { persistentCacheFailures += 1 }
                 }
+                try model.scheduledBeginRequest(promptTokenCount: slot.request.tokens.count)
+                slot.modelRequestBegan = true
                 slot.service = active.map(\.service).min() ?? 0
                 active.append(slot)
                 try emit(.admitted(reusedPrefixTokens: slot.position), to: slot)
@@ -629,7 +765,7 @@ public actor ConcurrentTextRuntime {
     }
 
     private func takePrefix(for request: Request, speculative: Bool) -> Prefix? {
-        guard request.cacheIdentity == identity,
+        guard model.scheduledSupportsPrefixCache, request.cacheIdentity == identity,
             let index = prefixes.indices.filter({
                 prefixes[$0].speculative == speculative
                     && prefixes[$0].tokens.count <= request.prefixTokenCount
@@ -641,7 +777,7 @@ public actor ConcurrentTextRuntime {
         return prefix
     }
 
-    private func step(_ slot: Slot) throws {
+    private func step(_ slot: Slot) async throws {
         if slot.iterator != nil {
             try speculativeStep(slot)
             return
@@ -652,6 +788,9 @@ public actor ConcurrentTextRuntime {
         if isPrefill {
             let remaining = request.tokens.count - slot.position
             var count = min(configuration.prefillChunkSize, remaining)
+            if let maximum = model.scheduledMaximumForwardTokens {
+                count = min(count, maximum)
+            }
             if request.prefixTokenCount > slot.position {
                 count = min(count, request.prefixTokenCount - slot.position)
             }
@@ -662,9 +801,28 @@ public actor ConcurrentTextRuntime {
             }
             tokens = [token]
         }
-        let logits = try model.scheduledForward(
-            MLXArray(tokens).expandedDimensions(axis: 0), cache: slot.cache)
         let needsLogits = !isPrefill || slot.position + tokens.count == request.tokens.count
+        let input = MLXArray(tokens).expandedDimensions(axis: 0)
+        let logits: MLXArray
+        beginForward(for: [slot])
+        do {
+            if isPrefill {
+                logits = try await model.scheduledFinalPrefillForward(input, cache: slot.cache)
+            } else {
+                logits = try await model.scheduledForward(input, cache: slot.cache)
+            }
+        } catch {
+            if completedForward(for: slot) {
+                Stream().synchronize()
+                settle(slot)
+            }
+            throw error
+        }
+        if completedForward(for: slot) {
+            Stream().synchronize()
+            settle(slot)
+            return
+        }
         // Intermediate chunks only contribute cache state; their vocabulary scores are unused.
         eval((needsLogits ? [logits] : []) + slot.cache.flatMap { $0.innerState() })
         try compress(slot)
@@ -687,7 +845,11 @@ public actor ConcurrentTextRuntime {
 
     private func speculativeStep(_ slot: Slot) throws {
         if slot.position < slot.request.tokens.count {
-            let end = min(slot.position + configuration.prefillChunkSize, slot.request.tokens.count)
+            let prefixFrontier = slot.request.prefixTokenCount - 1
+            var end = min(slot.position + configuration.prefillChunkSize, slot.request.tokens.count)
+            if slot.position < prefixFrontier, end > prefixFrontier {
+                end = prefixFrontier
+            }
             try slot.iterator!.prepareScheduledChunk(
                 Array(slot.request.tokens[slot.position ..< end]),
                 nextPromptToken: end < slot.request.tokens.count ? slot.request.tokens[end] : nil)
@@ -698,9 +860,8 @@ public actor ConcurrentTextRuntime {
             slot.position = end
             try emit(
                 .prefill(processedTokens: end, totalTokens: slot.request.tokens.count), to: slot)
-            if slot.request.prefixTokenCount > 0,
-                end == ((slot.request.prefixTokenCount - 1) / configuration.prefillChunkSize)
-                    * configuration.prefillChunkSize,
+            if slot.request.prefixTokenCount > 1,
+                end == prefixFrontier,
                 slot.request.cacheIdentity == identity
             {
                 checkpointSpeculative(slot)
@@ -725,7 +886,11 @@ public actor ConcurrentTextRuntime {
     }
 
     private func sample(_ logits: MLXArray, slot: Slot) throws {
-        let token = slot.sampler.sample(logits: logits[0..., -1, 0...]).item(Int.self)
+        let finalLogits = logits[0..., -1, 0...]
+        let token =
+            slot.generated == 0 && model.scheduledFirstTokenGreedy
+            ? argMax(finalLogits, axis: -1).item(Int.self)
+            : slot.sampler.sample(logits: finalLogits).item(Int.self)
         try accept(token, slot: slot)
     }
 
@@ -757,17 +922,35 @@ public actor ConcurrentTextRuntime {
         }
     }
 
-    private func batchStep(_ slots: [Slot]) throws {
+    private func batchStep(_ slots: [Slot]) async throws {
         let batch = try RuntimeBatchCache(rows: slots.map(\.cache))
-        let logits = try model.scheduledForward(
-            MLXArray(slots.map { $0.lastToken! }).expandedDimensions(axis: 1), cache: batch.cache)
+        beginForward(for: slots)
+        let logits: MLXArray
+        do {
+            logits = try await model.scheduledForward(
+                MLXArray(slots.map { $0.lastToken! }).expandedDimensions(axis: 1),
+                cache: batch.cache)
+        } catch {
+            let finishing = slots.filter { completedForward(for: $0) }
+            if !finishing.isEmpty {
+                Stream().synchronize()
+                for slot in finishing { settle(slot) }
+            }
+            throw error
+        }
         eval(
             [logits] + batch.cache.flatMap { $0.innerState() }
                 + slots.flatMap { $0.cache.flatMap { $0.innerState() } })
         batch.commit()
+        let finishing = slots.filter { completedForward(for: $0) }
+        if !finishing.isEmpty {
+            Stream().synchronize()
+            for slot in finishing { settle(slot) }
+        }
         batchedForwardCount += 1
         maximumBatchSize = max(maximumBatchSize, slots.count)
         for (row, slot) in slots.enumerated() {
+            guard !slot.finishing else { continue }
             do {
                 try compress(slot)
                 let bytes = slot.cache.flatMap { $0.innerState() }.reduce(0) { $0 + $1.nbytes }
@@ -780,6 +963,7 @@ public actor ConcurrentTextRuntime {
     }
 
     private func checkpoint(_ slot: Slot, bytes: Int) {
+        guard model.scheduledSupportsPrefixCache else { return }
         let tokens = Array(slot.request.tokens.prefix(slot.position))
         let bytes = bytes + tokens.count * MemoryLayout<Int>.stride
         do { try persistentStore?.store(tokens: tokens, cache: slot.cache) } catch {
@@ -795,6 +979,7 @@ public actor ConcurrentTextRuntime {
     }
 
     private func checkpointSpeculative(_ slot: Slot) {
+        guard model.scheduledSupportsPrefixCache else { return }
         guard let iterator = slot.iterator, let cacheBytes = iterator.scheduledPrefixCacheBytes
         else {
             return
@@ -822,12 +1007,31 @@ public actor ConcurrentTextRuntime {
     }
 
     private func finish(_ slot: Slot, reason: GenerateStopReason? = nil, error: Error? = nil) {
+        guard !slot.finished else { return }
+        if !slot.finishing {
+            slot.finishing = true
+            slot.finishReason = reason
+            slot.finishError = error
+            if case .cancelled? = reason { slot.cancellationRequested = true }
+        }
+        guard slot.inFlightForwardCount == 0 else { return }
+        settle(slot)
+    }
+
+    private func settle(_ slot: Slot) {
+        guard slot.finishing, !slot.finished, slot.inFlightForwardCount == 0 else { return }
+        slot.finished = true
         releasedReservations.append(slot.id)
+        if slot.modelRequestBegan {
+            model.scheduledEndRequest()
+            slot.modelRequestBegan = false
+        }
         active.removeAll { $0.id == slot.id }
         pending.removeAll { $0.id == slot.id }
+        var error = slot.finishError
         if error == nil, let telemetry = slot.iterator?.speculativeDecodingTelemetry {
             if case .dropped = slot.continuation.yield(.speculation(telemetry)) {
-                slot.continuation.finish(throwing: ConcurrentTextRuntimeError.consumerTooSlow)
+                error = ConcurrentTextRuntimeError.consumerTooSlow
             }
         }
         slot.iterator?.finalizeGeneration()
@@ -837,11 +1041,16 @@ public actor ConcurrentTextRuntime {
         if let error {
             slot.continuation.finish(throwing: error)
         } else {
-            if let reason, case .dropped = slot.continuation.yield(.finished(reason)) {
+            if let reason = slot.finishReason,
+                case .dropped = slot.continuation.yield(.finished(reason))
+            {
                 slot.continuation.finish(throwing: ConcurrentTextRuntimeError.consumerTooSlow)
-                return
+            } else {
+                slot.continuation.finish()
             }
-            slot.continuation.finish()
         }
+        let waiters = slot.settlementWaiters
+        slot.settlementWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
     }
 }

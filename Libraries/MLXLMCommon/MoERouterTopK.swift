@@ -152,9 +152,14 @@ func chainRouterTopK(
     let inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, (kth)...]
     var scores = MLX.takeAlong(gates, inds, axis: -1)
     if normalize {
-        scores = scores / scores.sum(axis: -1, keepDims: true)
+        scores = normalizeRouterTopKScores(scores, k: k)
     }
     return (inds, scores)
+}
+
+/// Normalizes selected router scores without reducing a singleton expert axis.
+package func normalizeRouterTopKScores(_ scores: MLXArray, k: Int) -> MLXArray {
+    k == 1 ? scores / scores : scores / scores.sum(axis: -1, keepDims: true)
 }
 
 /// Selects experts using the fused kernel for one- and two-row decode shapes and

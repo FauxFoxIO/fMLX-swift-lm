@@ -169,6 +169,9 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 // MARK: - GatedDeltaNet
 
 final class Qwen35GatedDeltaNet: Module {
+    typealias SpeculativeCheckpoint = (
+        index: Int, conv: MLXArray, recurrent: MLXArray
+    )
     let hiddenSize: Int
     let numVHeads: Int
     let numKHeads: Int
@@ -189,6 +192,7 @@ final class Qwen35GatedDeltaNet: Module {
     // as views so checkpoint, adapter, and parameter paths do not change.
     private let fusedInputProjection = FusedQuantizedLinearProjectionCache()
     var fusedInputProjectionEnabled = qwen35FourGDNEnabled
+    private var recoverLoRATargets = [String: Edge0Qwen35RecoverLoRATarget]()
 
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
@@ -303,12 +307,15 @@ final class Qwen35GatedDeltaNet: Module {
     func projectInputs(_ inputs: MLXArray, batch: Int, sequence: Int) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
-        guard fusedInputProjectionEnabled, let fusedInProj = fusedInputProjection.fused else {
+        guard recoverLoRATargets.isEmpty,
+            fusedInputProjectionEnabled, let fusedInProj = fusedInputProjection.fused
+        else {
             return (
-                inProjQKV(inputs),
-                inProjZ(inputs).reshaped(batch, sequence, numVHeads, headVDim),
-                inProjB(inputs),
-                inProjA(inputs)
+                recoverProjection(inProjQKV, input: inputs, target: "in_proj_qkv"),
+                recoverProjection(inProjZ, input: inputs, target: "in_proj_z").reshaped(
+                    batch, sequence, numVHeads, headVDim),
+                recoverProjection(inProjB, input: inputs, target: "in_proj_b"),
+                recoverProjection(inProjA, input: inputs, target: "in_proj_a")
             )
         }
 
@@ -330,21 +337,22 @@ final class Qwen35GatedDeltaNet: Module {
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
         cache: MambaCache? = nil,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        checkpointIndices: [Int] = []
     ) -> MLXArray {
         let convState =
             cache?[0] ?? zeroStates(batch: inputs.dim(0), dtype: inputs.dtype).conv
         let (out, newConvState, newRecState, checkpoint) = forward(
             inputs, convState: convState, recState: cache?[1], mask: mask,
-            checkpointAfter: checkpointAfter)
+            checkpointAfter: checkpointAfter, checkpointIndices: checkpointIndices)
         if let cache {
             cache[0] = newConvState
             cache[1] = newRecState
-            if let checkpoint, let checkpointAfter {
+            for checkpoint in checkpoint {
                 cache.saveSpeculativeCheckpoint(
-                    convState: checkpoint.conv,
-                    recurrentState: checkpoint.recurrent,
-                    advancedBy: checkpointAfter)
+                    convState: checkpoint.conv, recurrentState: checkpoint.recurrent,
+                    advancedBy: checkpoint.index,
+                    rewinding: inputs.dim(1) - checkpoint.index)
             }
             cache.advance(inputs.dim(1))
         }
@@ -369,12 +377,13 @@ final class Qwen35GatedDeltaNet: Module {
         recState: MLXArray?,
         mask: MLXArray?,
         checkpointAfter: Int? = nil,
+        checkpointIndices: [Int] = [],
         fusedCheckpoint: Bool = false
     ) -> (
         output: MLXArray,
         convState: MLXArray,
         recurrentState: MLXArray,
-        checkpoint: (conv: MLXArray, recurrent: MLXArray)?
+        checkpoints: [SpeculativeCheckpoint]
     ) {
         let B = x.dim(0)
         let S = x.dim(1)
@@ -407,10 +416,31 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
+        let checkpointIndices = Array(
+            Set(checkpointIndices + (checkpointAfter.map { [$0] } ?? []))
+        ).filter { $0 > 0 && $0 < S }.sorted()
+
+        func checkpointConv(at split: Int) -> MLXArray {
+            guard convKernelSize > 1 else {
+                return MLXArray.zeros([B, 0, convDim], dtype: qkv.dtype)
+            }
+            let convInput = concatenated([convState, qkv], axis: 1)
+            return contiguous(convInput[0..., split ..< (split + convKernelSize - 1), 0...])
+        }
+
         let out: MLXArray
         let newRecState: MLXArray
-        let checkpoint: (conv: MLXArray, recurrent: MLXArray)?
-        if let split = checkpointAfter, split > 0, split < S {
+        let checkpoints: [SpeculativeCheckpoint]
+        if S == 4, checkpointIndices == [1, 2, 3], mask == nil {
+            let prefixStates: [MLXArray]
+            (out, newRecState, prefixStates) = gatedDeltaUpdateFourCheckpoints(
+                q: qNormed, k: kNormed, v: v, a: a, b: b,
+                aLog: aLog, dtBias: dtBias, state: recState)
+            checkpoints = zip(checkpointIndices, prefixStates).map { split, recurrent in
+                (split, checkpointConv(at: split), recurrent)
+            }
+        } else if checkpointIndices.count == 1 {
+            let split = checkpointIndices[0]
             let prefixState: MLXArray
             if fusedCheckpoint, S == 2, split == 1, mask == nil, headKDim % 32 == 0 {
                 (out, newRecState, prefixState) = gatedDeltaUpdateCheckpoint(
@@ -444,16 +474,7 @@ final class Qwen35GatedDeltaNet: Module {
                 prefixState = intermediateState
             }
 
-            let checkpointConv: MLXArray
-            if convKernelSize > 1 {
-                let convInput = concatenated([convState, qkv], axis: 1)
-                checkpointConv = contiguous(
-                    convInput[
-                        0..., split ..< (split + convKernelSize - 1), 0...])
-            } else {
-                checkpointConv = MLXArray.zeros([B, 0, convDim], dtype: qkv.dtype)
-            }
-            checkpoint = (checkpointConv, prefixState)
+            checkpoints = [(split, checkpointConv(at: split), prefixState)]
         } else {
             (out, newRecState) = gatedDeltaUpdate(
                 q: qNormed,
@@ -465,11 +486,40 @@ final class Qwen35GatedDeltaNet: Module {
                 dtBias: dtBias,
                 state: recState,
                 mask: mask)
-            checkpoint = nil
+            checkpoints = checkpointIndices.map { split in
+                let (_, recurrent) = gatedDeltaUpdate(
+                    q: qNormed[0..., ..<split, 0..., 0...],
+                    k: kNormed[0..., ..<split, 0..., 0...],
+                    v: v[0..., ..<split, 0..., 0...],
+                    a: a[0..., ..<split, 0...],
+                    b: b[0..., ..<split, 0...],
+                    aLog: aLog,
+                    dtBias: dtBias,
+                    state: recState,
+                    mask: mask.map { $0[0..., ..<split] })
+                return (split, checkpointConv(at: split), recurrent)
+            }
         }
 
         let gated = norm(out, gate: z)
-        return (outProj(gated.reshaped(B, S, -1)), newConvState, newRecState, checkpoint)
+        let outputInput = gated.reshaped(B, S, -1)
+        return (
+            recoverProjection(outProj, input: outputInput, target: "out_proj"),
+            newConvState, newRecState, checkpoints
+        )
+    }
+
+    func attachRecoverLoRA(_ targets: [String: Edge0Qwen35RecoverLoRATarget]) {
+        recoverLoRATargets = targets
+        fusedInputProjection.invalidate()
+    }
+
+    private func recoverProjection(_ projection: Linear, input: MLXArray, target: String)
+        -> MLXArray
+    {
+        let output = projection(input)
+        guard let adapter = recoverLoRATargets[target] else { return output }
+        return adapter.applying(to: output, input: input)
     }
 
     /// The S == 1 depthwise conv as elementwise multiply-adds, so `compile`
@@ -525,6 +575,7 @@ final class Qwen35Attention: Module {
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
     let rope: RoPELayer
+    private var recoverLoRATargets = [String: Edge0Qwen35RecoverLoRATarget]()
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -585,13 +636,13 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let qProjOutput = qProj(x)
+        let qProjOutput = recoverProjection(qProj, input: x, target: "q_proj")
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
         let gate = qSplit[1].reshaped(B, L, -1)
 
-        var keys = kProj(x)
-        var values = vProj(x)
+        var keys = recoverProjection(kProj, input: x, target: "k_proj")
+        var values = recoverProjection(vProj, input: x, target: "v_proj")
 
         queries = qNorm(queries).transposed(0, 2, 1, 3)
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
@@ -606,7 +657,20 @@ final class Qwen35Attention: Module {
             attention
             .transposed(0, 2, 1, 3)
             .reshaped(attention.dim(0), attention.dim(2), -1)
-        return oProj(sigmoidMultiply(merged, gate))
+        let projectionInput = sigmoidMultiply(merged, gate)
+        return recoverProjection(oProj, input: projectionInput, target: "o_proj")
+    }
+
+    func attachRecoverLoRA(_ targets: [String: Edge0Qwen35RecoverLoRATarget]) {
+        recoverLoRATargets = targets
+    }
+
+    private func recoverProjection(_ projection: Linear, input: MLXArray, target: String)
+        -> MLXArray
+    {
+        let output = projection(input)
+        guard let adapter = recoverLoRATargets[target] else { return output }
+        return adapter.applying(to: output, input: input)
     }
 }
 
@@ -618,22 +682,41 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     let topK: Int
 
     @ModuleInfo(key: "gate") var gate: Linear
-    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    @ModuleInfo(key: "switch_mlp") private var residentSwitchMLP: SwitchGLU?
+
+    /// The registered resident expert layer. Streamed models deliberately have
+    /// no parameters under `switch_mlp`; their weights live in the expert store.
+    var switchMLP: SwitchGLU { residentSwitchMLP! }
 
     @ModuleInfo(key: "shared_expert") var sharedExpert: Qwen3NextMLP
     @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
 
-    init(_ args: Qwen35TextConfiguration) {
+    private var streamedSwitchGLU: StreamedSwitchGLU?
+    private var streamedExpertExecution:
+        Qwen35StreamedExpertExecution<StreamedQuantizedExpertWeights>?
+    private let streamedPlaceholder: Bool
+    private let streamedInputDims: Int
+    private let streamedHiddenDims: Int
+    private var streamedResidentBytes = 0
+    private var recoverLoRAEnabled = false
+
+    init(_ args: Qwen35TextConfiguration, streamedExperts: Bool = false) {
         self.normTopkProb = args.normTopkProb
         self.numExperts = args.numExperts
         self.topK = args.numExpertsPerTok
+        self.streamedPlaceholder = streamedExperts
+        self.streamedInputDims = args.hiddenSize
+        self.streamedHiddenDims = args.moeIntermediateSize
 
         _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
-        _switchMLP.wrappedValue = SwitchGLU(
-            inputDims: args.hiddenSize,
-            hiddenDims: args.moeIntermediateSize,
-            numExperts: args.numExperts
-        )
+        if !streamedExperts {
+            _residentSwitchMLP.wrappedValue = SwitchGLU(
+                inputDims: args.hiddenSize,
+                hiddenDims: args.moeIntermediateSize,
+                numExperts: args.numExperts
+            )
+        }
+        self.streamedSwitchGLU = nil
 
         _sharedExpert.wrappedValue = Qwen3NextMLP(
             dimensions: args.hiddenSize,
@@ -642,10 +725,34 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         _sharedExpertGate.wrappedValue = Linear(args.hiddenSize, 1, bias: false)
     }
 
+    var usesStreamedExperts: Bool { streamedExpertExecution != nil }
+    var streamedAdditionalResidentWeightBytes: Int { streamedResidentBytes }
+
+    func configureStreamedExperts(
+        store: ExpertWeightStore<Int, StreamedQuantizedExpertWeights>, groupSize: Int,
+        maximumResidentBytes: Int
+    ) throws {
+        guard streamedPlaceholder, streamedSwitchGLU == nil,
+            streamedExpertExecution == nil, [32, 64].contains(groupSize),
+            maximumResidentBytes >= 0
+        else {
+            throw NativeTextModelLoadingError.invalidStreamedExpertConfiguration
+        }
+        streamedSwitchGLU = StreamedSwitchGLU(
+            inputDims: streamedInputDims, hiddenDims: streamedHiddenDims, groupSize: groupSize)
+        streamedExpertExecution = Qwen35StreamedExpertExecution(store: store)
+        streamedResidentBytes = maximumResidentBytes
+    }
+
+    @discardableResult
+    func prepareFusedSharedExpertProjection() throws -> Bool {
+        try sharedExpert.prepareFusedGateUpProjection()
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         // Decode and two-token MTP verification run through a compiled trace.
         // Longer prefill stays unfused because it is GEMM-bound.
-        if x.dim(1) > 2 {
+        if recoverLoRAEnabled || x.dim(1) > 2 {
             return forward(x)
         }
         return compiledForward(self, x)
@@ -675,9 +782,74 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         ).reshaped(x.shape)
 
         var sharedY = sharedExpert(x)
-        sharedY = sigmoid(sharedExpertGate(x)) * sharedY
+        let gateOutput = sharedExpertGate(x)
+        sharedY = sigmoid(gateOutput) * sharedY
 
         return combined + sharedY
+    }
+
+    func attachRecoverLoRA(_ targets: [String: Edge0Qwen35RecoverLoRATarget]) {
+        sharedExpert.attachRecoverLoRA(targets)
+        recoverLoRAEnabled = !targets.isEmpty
+    }
+
+    /// Route, materialize and remap outside every compiled Qwen trace. The
+    /// ordinary `SwitchGLU` owns no routed weight arrays in this configuration.
+    nonisolated(nonsending) func streamedForward(_ x: MLXArray) async throws -> MLXArray {
+        try await streamedForward(x, prediction: nil).output
+    }
+
+    nonisolated(nonsending) func streamedForward(
+        _ x: MLXArray, prediction: Edge0Qwen35PrerouterPrediction?
+    ) async throws -> (output: MLXArray, executedExpertIDs: MLXArray) {
+        guard let execution = streamedExpertExecution, let streamedSwitchGLU else {
+            throw NativeTextModelLoadingError.invalidStreamedExpertConfiguration
+        }
+        guard x.dim(0) == 1 else {
+            throw NativeTextModelLoadingError.streamedExpertsUnsupported(
+                "Streaming requires a batch of one")
+        }
+        let sequenceLength = x.dim(1)
+        guard (1 ... 2).contains(sequenceLength) else {
+            throw Qwen35StreamedExpertExecutionError.requiresResidentExperts(
+                sequenceLength: sequenceLength)
+        }
+
+        let indices: MLXArray
+        let scores: MLXArray
+        if let prediction {
+            guard prediction.expertIDs.shape == [1, sequenceLength, topK],
+                prediction.scores.shape == prediction.expertIDs.shape
+            else {
+                throw NativeTextModelLoadingError.invalidStreamedExpertConfiguration
+            }
+            indices = prediction.expertIDs
+            scores = prediction.scores
+        } else {
+            var gates = gate(x)
+            gates = MLX.softmax(gates, axis: -1, precise: true)
+            (indices, scores) = moeRouterTopK(
+                gates, k: topK, normalize: normTopkProb)
+        }
+        // The IDs cross the MLX/I/O boundary; scores remain MLX values for the
+        // exact weighted reduction after the selected slots are materialized.
+        eval([indices, scores])
+        let routerExpertIDs = indices.asArray(UInt32.self).map(Int.init)
+        let plan = try await execution.prepareDecode(
+            sequenceLength: sequenceLength, topK: topK, expertCount: numExperts,
+            routerExpertIDs: routerExpertIDs)
+
+        let flatX = x.reshaped(sequenceLength, x.dim(-1))
+        let flatScores = scores.reshaped(sequenceLength, topK)
+        let combined = try plan.withExpertWeights { weights in
+            try streamedSwitchGLU.callAndWeightedReduce(
+                flatX, compactRouterIDs: plan.compactRouterIDs, topK: topK,
+                weights: flatScores, experts: weights.map { $0.withValue { $0 } })
+        }.reshaped(x.shape)
+
+        var sharedY = sharedExpert(x)
+        sharedY = sigmoid(sharedExpertGate(x)) * sharedY
+        return (combined + sharedY, indices)
     }
 }
 
@@ -693,8 +865,12 @@ final class Qwen35DecoderLayer: Module {
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
     @ModuleInfo(key: "mlp") var mlp: Module
+    private var recoverLoRAEnabled = false
 
-    init(_ args: Qwen35TextConfiguration, layerIdx: Int, forceFullAttention: Bool = false) {
+    init(
+        _ args: Qwen35TextConfiguration, layerIdx: Int, forceFullAttention: Bool = false,
+        streamedExperts: Bool = false
+    ) {
         self.isLinear =
             forceFullAttention ? false : (layerIdx + 1) % args.fullAttentionInterval != 0
 
@@ -705,7 +881,7 @@ final class Qwen35DecoderLayer: Module {
         }
 
         if args.numExperts > 0 {
-            _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
+            _mlp.wrappedValue = Qwen35SparseMoeBlock(args, streamedExperts: streamedExperts)
         } else {
             _mlp.wrappedValue = Qwen3NextMLP(
                 dimensions: args.hiddenSize,
@@ -725,15 +901,51 @@ final class Qwen35DecoderLayer: Module {
         super.init()
     }
 
+    var usesStreamedExperts: Bool {
+        (mlp as? Qwen35SparseMoeBlock)?.usesStreamedExperts ?? false
+    }
+    var streamedAdditionalResidentWeightBytes: Int {
+        (mlp as? Qwen35SparseMoeBlock)?.streamedAdditionalResidentWeightBytes ?? 0
+    }
+
+    func configureStreamedExperts(
+        store: ExpertWeightStore<Int, StreamedQuantizedExpertWeights>, groupSize: Int,
+        maximumResidentBytes: Int
+    ) throws {
+        guard let moe = mlp as? Qwen35SparseMoeBlock else {
+            throw NativeTextModelLoadingError.streamedExpertsUnsupported(
+                "The selected Qwen layer is not routed")
+        }
+        try moe.configureStreamedExperts(
+            store: store, groupSize: groupSize, maximumResidentBytes: maximumResidentBytes)
+    }
+
+    func attachRecoverLoRA(
+        linearTargets: [String: Edge0Qwen35RecoverLoRATarget],
+        attentionTargets: [String: Edge0Qwen35RecoverLoRATarget],
+        sharedExpertTargets: [String: Edge0Qwen35RecoverLoRATarget]
+    ) {
+        linearAttn?.attachRecoverLoRA(linearTargets)
+        selfAttn?.attachRecoverLoRA(attentionTargets)
+        if let moe = mlp as? Qwen35SparseMoeBlock {
+            moe.attachRecoverLoRA(sharedExpertTargets)
+        }
+        recoverLoRAEnabled =
+            !linearTargets.isEmpty || !attentionTargets.isEmpty
+            || !sharedExpertTargets.isEmpty
+    }
+
     func callAsFunction(
         _ x: MLXArray,
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
         cache: KVCache?,
         positionOffset: Int? = nil,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        checkpointIndices: [Int] = []
     ) -> MLXArray {
-        if compiledVerificationEnabled, x.dim(1) == 2, checkpointAfter == 1, ssmMask == nil,
+        if !recoverLoRAEnabled,
+            compiledVerificationEnabled, x.dim(1) == 2, checkpointAfter == 1, ssmMask == nil,
             positionOffset == nil
         {
             if isLinear, let mambaCache = cache as? MambaCache,
@@ -748,7 +960,7 @@ final class Qwen35DecoderLayer: Module {
         // Single-token unmasked decode runs the layer as one traced function
         // (two for full attention, split at the KV write). Everything else
         // takes the general body below.
-        if x.dim(1) == 1, ssmMask == nil {
+        if !recoverLoRAEnabled, x.dim(1) == 1, ssmMask == nil {
             if isLinear, let mambaCache = cache as? MambaCache {
                 return decodeLinearLayer(x, cache: mambaCache)
             }
@@ -761,7 +973,7 @@ final class Qwen35DecoderLayer: Module {
         if isLinear {
             r = linearAttn!(
                 inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
-                checkpointAfter: checkpointAfter)
+                checkpointAfter: checkpointAfter, checkpointIndices: checkpointIndices)
         } else {
             r = selfAttn!(
                 inputLayerNorm(x), mask: attentionMask, cache: cache,
@@ -770,6 +982,59 @@ final class Qwen35DecoderLayer: Module {
 
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+    }
+
+    /// The stream boundary sits after each attention/GDN result and before
+    /// routed experts. No compiled layer or decode-segment trace is entered.
+    nonisolated(nonsending) func streamedForward(
+        _ x: MLXArray,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?, cache: KVCache?
+    ) async throws -> MLXArray {
+        let r: MLXArray
+        if isLinear {
+            r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache)
+        } else {
+            r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
+        }
+        let h = x + r
+        let mlpInput = postAttentionLayerNorm(h)
+        if let moe = mlp as? Qwen35SparseMoeBlock {
+            return h + (try await moe.streamedForward(mlpInput))
+        }
+        return h + (mlp as! UnaryLayer)(mlpInput)
+    }
+
+    nonisolated(nonsending) func edge0StreamedForward(
+        _ x: MLXArray,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?, cache: KVCache?,
+        prediction: Edge0Qwen35PrerouterPrediction?
+    ) async throws -> (hidden: MLXArray, mlpInput: MLXArray, executedExpertIDs: MLXArray) {
+        let r: MLXArray
+        if isLinear {
+            r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache)
+        } else {
+            r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
+        }
+        let h = x + r
+        let mlpInput = postAttentionLayerNorm(h)
+        guard let moe = mlp as? Qwen35SparseMoeBlock else {
+            throw NativeTextModelLoadingError.invalidStreamedExpertConfiguration
+        }
+        let routed = try await moe.streamedForward(mlpInput, prediction: prediction)
+        return (h + routed.output, mlpInput, routed.executedExpertIDs)
+    }
+
+    @discardableResult
+    func prepareFusedMLPProjection() throws -> Bool {
+        if let denseMLP = mlp as? Qwen3NextMLP {
+            return try denseMLP.prepareFusedGateUpProjection()
+        }
+        if let sparseMLP = mlp as? Qwen35SparseMoeBlock {
+            return try sparseMLP.prepareFusedSharedExpertProjection()
+        }
+        return false
     }
 
     // MARK: - Compiled decode blocks
@@ -790,13 +1055,14 @@ final class Qwen35DecoderLayer: Module {
     }
 
     private func verificationLayerBody(_ args: [MLXArray], fusedCheckpoint: Bool) -> [MLXArray] {
-        let (r, conv, recurrent, checkpoint) = linearAttn!.forward(
+        let (r, conv, recurrent, checkpoints) = linearAttn!.forward(
             inputLayerNorm(args[0]), convState: args[1], recState: args[2],
             mask: nil, checkpointAfter: 1, fusedCheckpoint: fusedCheckpoint)
+        let checkpoint = checkpoints[0]
         let h = args[0] + r
         return [
             h + mlpForward(postAttentionLayerNorm(h)), conv, recurrent,
-            checkpoint!.conv, checkpoint!.recurrent,
+            checkpoint.conv, checkpoint.recurrent,
         ]
     }
 
@@ -909,6 +1175,26 @@ final class Qwen35DecoderLayer: Module {
     }
 }
 
+private final class Edge0Qwen35Runtime {
+    let profile: Edge0Qwen35InferenceProfile
+    let prerouter: Edge0Qwen35Prerouter
+    let state: Edge0Qwen35InferenceRequestState
+    let phaseController = Edge0Qwen35PhaseController()
+
+    init(profile: Edge0Qwen35InferenceProfile, prerouter: Edge0Qwen35Prerouter) throws {
+        self.profile = profile
+        self.prerouter = prerouter
+        self.state = try Edge0Qwen35InferenceRequestState(profile: profile)
+    }
+}
+
+private func profilePrediction(
+    _ runtime: Edge0Qwen35Runtime, forConsumer layer: Int
+) -> Edge0Qwen35PrerouterPrediction? {
+    guard runtime.profile.predictedConsumers.contains(layer) else { return nil }
+    return try? runtime.state.prediction(forConsumer: layer)
+}
+
 // MARK: - Text Model
 
 public class Qwen35TextModelInner: Module {
@@ -919,9 +1205,12 @@ public class Qwen35TextModelInner: Module {
 
     let ssmIdx: Int
     let faIdx: Int
+    private var recoverLoRAEnabled = false
+    private let edge0Configuration: Qwen35TextConfiguration
 
-    init(_ args: Qwen35TextConfiguration) {
+    init(_ args: Qwen35TextConfiguration, streamedExperts: Bool = false) {
         precondition(args.vocabularySize > 0)
+        self.edge0Configuration = args
 
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize,
@@ -929,7 +1218,7 @@ public class Qwen35TextModelInner: Module {
         )
 
         let layers = (0 ..< args.hiddenLayers).map { layerIdx in
-            Qwen35DecoderLayer(args, layerIdx: layerIdx)
+            Qwen35DecoderLayer(args, layerIdx: layerIdx, streamedExperts: streamedExperts)
         }
         self.layers = layers
 
@@ -962,6 +1251,68 @@ public class Qwen35TextModelInner: Module {
         super.init()
     }
 
+    var usesStreamedExperts: Bool { layers.contains { $0.usesStreamedExperts } }
+    private var streamedResidentBytes = 0
+    private var edge0Runtime: Edge0Qwen35Runtime?
+    var streamedAdditionalResidentWeightBytes: Int { streamedResidentBytes }
+    var usesEdge0: Bool { edge0Runtime != nil }
+
+    func configureStreamedExperts(
+        stores: [ExpertWeightStore<Int, StreamedQuantizedExpertWeights>], groupSize: Int,
+        maximumResidentBytesPerLayer: Int
+    ) throws {
+        guard stores.count == layers.count, maximumResidentBytesPerLayer >= 0 else {
+            throw NativeTextModelLoadingError.invalidStreamedExpertConfiguration
+        }
+        for (layer, store) in zip(layers, stores) {
+            try layer.configureStreamedExperts(
+                store: store, groupSize: groupSize,
+                maximumResidentBytes: maximumResidentBytesPerLayer)
+        }
+        let (bytes, overflow) = layers.reduce(into: (0, false)) { total, layer in
+            let (next, additionOverflow) = total.0.addingReportingOverflow(
+                layer.streamedAdditionalResidentWeightBytes)
+            total = (next, total.1 || additionOverflow)
+        }
+        guard !overflow else {
+            throw NativeTextModelLoadingError.invalidStreamedExpertConfiguration
+        }
+        streamedResidentBytes = bytes
+    }
+
+    func configureEdge0(
+        profile: Edge0Qwen35InferenceProfile,
+        prerouter: Edge0Qwen35Prerouter
+    ) throws {
+        try profile.validate()
+        try profile.validateAttachment(prerouter)
+        guard usesStreamedExperts, layers.count == 40,
+            layers.allSatisfy({ ($0.mlp as? Qwen35SparseMoeBlock)?.topK == profile.topK })
+        else {
+            throw Edge0Qwen35InferenceProfileError.invalidProfile
+        }
+        edge0Runtime = try Edge0Qwen35Runtime(profile: profile, prerouter: prerouter)
+    }
+
+    func beginEdge0Request() {
+        beginEdge0Request(promptTokenCount: 0)
+    }
+
+    func beginEdge0Request(promptTokenCount: Int) {
+        edge0Runtime?.state.resetForNewRequest()
+        edge0Runtime?.phaseController.begin(promptTokenCount: promptTokenCount)
+    }
+
+    func endEdge0Request() {
+        edge0Runtime?.state.resetForNewRequest()
+        edge0Runtime?.phaseController.reset()
+    }
+
+    func edge0PrefillPhase(forwardTokenCount: Int) -> Edge0Qwen35ForwardPhase {
+        edge0Runtime?.phaseController.prefillPhase(forwardTokenCount: forwardTokenCount)
+            ?? .prefillRealRouter
+    }
+
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
         forward(inputs, cache: cache, applyFinalNorm: true)
     }
@@ -975,9 +1326,11 @@ public class Qwen35TextModelInner: Module {
         _ inputs: MLXArray,
         cache: [KVCache?]? = nil,
         applyFinalNorm: Bool,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        checkpointIndices: [Int] = []
     ) -> MLXArray {
-        if applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
+        if !recoverLoRAEnabled,
+            applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
             let step = decodeStep(inputs, caches)
         {
             return step
@@ -1000,10 +1353,141 @@ public class Qwen35TextModelInner: Module {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i],
-                checkpointAfter: checkpointAfter)
+                checkpointAfter: checkpointAfter, checkpointIndices: checkpointIndices)
         }
 
         return applyFinalNorm ? norm(hiddenStates) : hiddenStates
+    }
+
+    func attachRecoverLoRA(_ adapter: Edge0Qwen35RecoverLoRA) throws {
+        guard configurationIsCompatibleWithEdge0RecoverLoRA else {
+            throw Edge0Qwen35RecoverLoRAAttachmentError.incompatibleModel
+        }
+        let expectedPaths = Set(Edge0Qwen35RecoverLoRA.expectedTargetPaths)
+        let actualPaths = Set(adapter.targetPaths)
+        guard actualPaths == expectedPaths else {
+            throw Edge0Qwen35RecoverLoRAAttachmentError.targetPathsMismatch(
+                expected: expectedPaths.count, actual: actualPaths.count)
+        }
+
+        for (index, layer) in layers.enumerated() {
+            let prefix = "language_model.model.layers.\(index)."
+            let linearTargets = adapter.adapters(for: [
+                prefix + "linear_attn.in_proj_qkv",
+                prefix + "linear_attn.in_proj_z",
+                prefix + "linear_attn.in_proj_b",
+                prefix + "linear_attn.in_proj_a",
+                prefix + "linear_attn.out_proj",
+            ]).reduce(into: [String: Edge0Qwen35RecoverLoRATarget]()) { targets, entry in
+                targets[String(entry.key.dropFirst(prefix.count + "linear_attn.".count))] =
+                    entry.value
+            }
+            let attentionTargets = adapter.adapters(for: [
+                prefix + "self_attn.q_proj",
+                prefix + "self_attn.k_proj",
+                prefix + "self_attn.v_proj",
+                prefix + "self_attn.o_proj",
+            ]).reduce(into: [String: Edge0Qwen35RecoverLoRATarget]()) { targets, entry in
+                targets[String(entry.key.dropFirst(prefix.count + "self_attn.".count))] =
+                    entry.value
+            }
+            let sharedExpertTargets = adapter.adapters(for: [
+                prefix + "mlp.shared_expert.gate_proj",
+                prefix + "mlp.shared_expert.up_proj",
+                prefix + "mlp.shared_expert.down_proj",
+            ]).reduce(into: [String: Edge0Qwen35RecoverLoRATarget]()) { targets, entry in
+                targets[String(entry.key.dropFirst(prefix.count + "mlp.shared_expert.".count))] =
+                    entry.value
+            }
+            layer.attachRecoverLoRA(
+                linearTargets: linearTargets, attentionTargets: attentionTargets,
+                sharedExpertTargets: sharedExpertTargets)
+        }
+        recoverLoRAEnabled = true
+        invalidateCompiledTraces()
+    }
+
+    private var configurationIsCompatibleWithEdge0RecoverLoRA: Bool {
+        let attentionHeadDim = edge0Configuration.headDim ?? 0
+        return layers.count == 40 && edge0Configuration.hiddenSize == 2048
+            && edge0Configuration.fullAttentionInterval == 4
+            && edge0Configuration.numExperts == 256 && edge0Configuration.numExpertsPerTok == 4
+            && edge0Configuration.moeIntermediateSize == 512
+            && edge0Configuration.linearNumValueHeads == 32
+            && edge0Configuration.linearNumKeyHeads == 16
+            && edge0Configuration.linearKeyHeadDim == 128
+            && edge0Configuration.linearValueHeadDim == 128
+            && edge0Configuration.linearConvKernelDim == 4
+            && edge0Configuration.sharedExpertIntermediateSize == 512
+            && edge0Configuration.attentionHeads == 16 && attentionHeadDim == 256
+            && edge0Configuration.kvHeads == 2
+    }
+
+    nonisolated(nonsending) func streamedForward(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        edge0Phase: Edge0Qwen35ForwardPhase = .decode
+    ) async throws -> MLXArray {
+        guard usesStreamedExperts, inputs.dim(0) == 1, (1 ... 2).contains(inputs.dim(1)) else {
+            throw NativeTextModelLoadingError.streamedExpertsUnsupported(
+                "Streaming requires an installed routed Qwen model with one or two input tokens")
+        }
+        var hiddenStates = embedTokens(inputs)
+        let cacheArray: [KVCache?]
+        if let cache {
+            cacheArray = cache.map { $0 }
+        } else {
+            cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
+        }
+        guard cacheArray.count == layers.count else {
+            throw NativeTextModelLoadingError.invalidStreamedExpertConfiguration
+        }
+        let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray[faIdx])
+        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray[ssmIdx] as? MambaCache)
+
+        if let edge0Runtime {
+            guard inputs.dim(1) == 1 else {
+                throw NativeTextModelLoadingError.streamedExpertsUnsupported(
+                    "Edge0 routing requires one-token forwards")
+            }
+            if edge0Phase == .prefillRealRouter {
+                for (index, layer) in layers.enumerated() {
+                    let result = try await layer.edge0StreamedForward(
+                        hiddenStates,
+                        attentionMask: layer.isLinear ? .none : faMask,
+                        ssmMask: layer.isLinear ? ssmMask : nil,
+                        cache: cacheArray[index], prediction: nil)
+                    hiddenStates = edge0Runtime.profile.stabilizedHidden(result.hidden)
+                }
+                return norm(hiddenStates)
+            }
+            var hiddenByOwner = [Int: MLXArray]()
+            for (index, layer) in layers.enumerated() {
+                let prediction = profilePrediction(edge0Runtime, forConsumer: index)
+                let result = try await layer.edge0StreamedForward(
+                    hiddenStates,
+                    attentionMask: layer.isLinear ? .none : faMask,
+                    ssmMask: layer.isLinear ? ssmMask : nil,
+                    cache: cacheArray[index], prediction: prediction)
+                try edge0Runtime.state.recordExecuted(result.executedExpertIDs, for: index)
+                if edge0Runtime.profile.artifactOwners.contains(index) {
+                    hiddenByOwner[index] = result.mlpInput
+                }
+                hiddenStates = edge0Runtime.profile.stabilizedHidden(result.hidden)
+            }
+            try edge0Runtime.state.stage(
+                prerouter: edge0Runtime.prerouter, hiddenByOwner: hiddenByOwner)
+            edge0Runtime.state.advance()
+        } else {
+            for (index, layer) in layers.enumerated() {
+                hiddenStates = try await layer.streamedForward(
+                    hiddenStates,
+                    attentionMask: layer.isLinear ? .none : faMask,
+                    ssmMask: layer.isLinear ? ssmMask : nil,
+                    cache: cacheArray[index])
+            }
+        }
+        return norm(hiddenStates)
     }
 
     // MARK: - Whole-step decode schedule
@@ -1128,12 +1612,15 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
-    public init(_ args: Qwen35TextConfiguration, mixedPreservedNorms: Bool = false) {
+    public init(
+        _ args: Qwen35TextConfiguration, mixedPreservedNorms: Bool = false,
+        streamedExperts: Bool = false
+    ) {
         self.configuration = args
         self.mixedPreservedNorms = mixedPreservedNorms
         self.vocabularySize = args.vocabularySize
         self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
-        self.model = Qwen35TextModelInner(args)
+        self.model = Qwen35TextModelInner(args, streamedExperts: streamedExperts)
 
         if !args.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
@@ -1150,25 +1637,113 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         return out
     }
 
+    var usesStreamedExperts: Bool { model.usesStreamedExperts }
+    var usesEdge0: Bool { model.usesEdge0 }
+    var streamedExpertResidentWeightBytes: Int {
+        model.streamedAdditionalResidentWeightBytes
+    }
+
+    func configureStreamedExperts(
+        stores: [ExpertWeightStore<Int, StreamedQuantizedExpertWeights>], groupSize: Int,
+        maximumResidentBytesPerLayer: Int
+    ) throws {
+        try model.configureStreamedExperts(
+            stores: stores, groupSize: groupSize,
+            maximumResidentBytesPerLayer: maximumResidentBytesPerLayer)
+    }
+
+    func configureEdge0(
+        profile: Edge0Qwen35InferenceProfile,
+        prerouter: Edge0Qwen35Prerouter
+    ) throws {
+        try model.configureEdge0(profile: profile, prerouter: prerouter)
+    }
+
+    func beginEdge0Request() {
+        model.beginEdge0Request()
+    }
+
+    func beginEdge0Request(promptTokenCount: Int) {
+        model.beginEdge0Request(promptTokenCount: promptTokenCount)
+    }
+
+    func endEdge0Request() {
+        model.endEdge0Request()
+    }
+
+    nonisolated(nonsending) func streamedScheduledForward(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) async throws -> MLXArray {
+        let hiddenStates = try await model.streamedForward(inputs, cache: cache)
+        return projectLogits(hiddenStates)
+    }
+
+    /// Projects only the final hidden state of an ordinary prefill. The cache
+    /// still receives every row; avoiding the earlier vocabulary projections is
+    /// safe because scheduled generation samples only the final row.
+    public nonisolated(nonsending) func scheduledFinalPrefillForward(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) async throws -> MLXArray {
+        guard qwen35FinalPrefillLogitEnabled || usesEdge0 else {
+            return try await scheduledForward(inputs, cache: cache)
+        }
+        let hiddenStates: MLXArray
+        if usesStreamedExperts {
+            let phase =
+                usesEdge0
+                ? model.edge0PrefillPhase(forwardTokenCount: inputs.dim(1))
+                : .decode
+            hiddenStates = try await model.streamedForward(
+                inputs, cache: cache, edge0Phase: phase)
+        } else {
+            hiddenStates = model(inputs, cache: cache)
+        }
+        guard hiddenStates.dim(1) > 0 else {
+            throw ConcurrentTextRuntimeError.invalidRequest
+        }
+        let last = hiddenStates[
+            0..., (hiddenStates.dim(1) - 1) ..< hiddenStates.dim(1), 0...
+        ]
+        return projectLogits(last)
+    }
+
+    private func projectLogits(_ hiddenStates: MLXArray) -> MLXArray {
+        if let lmHead {
+            return lmHead(hiddenStates)
+        }
+        return model.embedTokens.asLinear(hiddenStates)
+    }
+
     public func callAsFunction(
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
         let emitDrafterState = state?[mtpEmitFlagKey] ?? false
+        let finalPrefillLogitsOnly =
+            emitDrafterState && (state?[mtpFinalPrefillLogitsOnlyKey] ?? false)
         let hiddenStates: MLXArray
         if emitDrafterState {
             let hidden = model.forward(
                 input.tokens, cache: cache, applyFinalNorm: false,
-                checkpointAfter: state?[mtpCacheCheckpointIndexKey])
+                checkpointAfter: state?[mtpCacheCheckpointIndexKey],
+                checkpointIndices: state?[mtpCacheCheckpointIndicesKey] ?? [])
             hiddenStates = model.norm(hidden)
         } else {
             hiddenStates = model(input.tokens, cache: cache)
         }
 
+        let logitsInput: MLXArray
+        if finalPrefillLogitsOnly {
+            logitsInput = hiddenStates[0..., (-1)..., 0...]
+        } else {
+            logitsInput = hiddenStates
+        }
         let logits: MLXArray
         if let lmHead {
-            logits = lmHead(hiddenStates)
+            logits = lmHead(logitsInput)
         } else {
-            logits = model.embedTokens.asLinear(hiddenStates)
+            logits = model.embedTokens.asLinear(logitsInput)
         }
 
         guard emitDrafterState else {
@@ -1176,6 +1751,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         var outState = state ?? LMOutput.State()
+        outState[mtpFinalPrefillLogitsOnlyKey] = nil
         outState[mtpLastHiddenStatesKey] = hiddenStates
         outState[mtpSharedKVStatesKey] = qwen35SharedKVState(
             cache: cache, fullAttentionIndex: model.faIdx)
@@ -1201,7 +1777,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             if let linearAttn = layer.linearAttn {
                 _ = try linearAttn.prepareFusedInputProjection()
             }
+            _ = try layer.prepareFusedMLPProjection()
         }
+    }
+
+    /// Attaches Edge0's fixed Recover-LoRA sidecar without merging it into the base model.
+    public func attachRecoverLoRA(_ adapter: Edge0Qwen35RecoverLoRA) throws {
+        try model.attachRecoverLoRA(adapter)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -1273,7 +1855,7 @@ extension Qwen35TextModel: LoRAModel {
 }
 
 extension Qwen35TextModel: SpeculativeCacheRewindModel {
-    public var maximumNativeTargetCacheRewind: Int { 1 }
+    public var maximumNativeTargetCacheRewind: Int { 3 }
 }
 
 // MARK: - Top-level Model
@@ -1284,9 +1866,10 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
 
-    public init(_ args: Qwen35Configuration) {
+    public init(_ args: Qwen35Configuration, streamedExperts: Bool = false) {
         let textModel = Qwen35TextModel(
-            args.textConfig, mixedPreservedNorms: args.mixedPreservedNorms)
+            args.textConfig, mixedPreservedNorms: args.mixedPreservedNorms,
+            streamedExperts: streamedExperts)
         self.vocabularySize = textModel.vocabularySize
         self.kvHeads = textModel.kvHeads
         _languageModel.wrappedValue = textModel
@@ -1294,6 +1877,54 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         languageModel(inputs, cache: cache)
+    }
+
+    var usesStreamedExperts: Bool { languageModel.usesStreamedExperts }
+    var usesEdge0: Bool { languageModel.usesEdge0 }
+    var streamedExpertResidentWeightBytes: Int {
+        languageModel.streamedExpertResidentWeightBytes
+    }
+
+    func configureStreamedExperts(
+        stores: [ExpertWeightStore<Int, StreamedQuantizedExpertWeights>], groupSize: Int,
+        maximumResidentBytesPerLayer: Int
+    ) throws {
+        try languageModel.configureStreamedExperts(
+            stores: stores, groupSize: groupSize,
+            maximumResidentBytesPerLayer: maximumResidentBytesPerLayer)
+    }
+
+    func configureEdge0(
+        profile: Edge0Qwen35InferenceProfile,
+        prerouter: Edge0Qwen35Prerouter
+    ) throws {
+        try languageModel.configureEdge0(profile: profile, prerouter: prerouter)
+    }
+
+    func beginEdge0Request() {
+        languageModel.beginEdge0Request()
+    }
+
+    func beginEdge0Request(promptTokenCount: Int) {
+        languageModel.beginEdge0Request(promptTokenCount: promptTokenCount)
+    }
+
+    func endEdge0Request() {
+        languageModel.endEdge0Request()
+    }
+
+    nonisolated(nonsending) func streamedScheduledForward(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) async throws -> MLXArray {
+        try await languageModel.streamedScheduledForward(inputs, cache: cache)
+    }
+
+    public nonisolated(nonsending) func scheduledFinalPrefillForward(
+        _ inputs: MLXArray,
+        cache: [KVCache]
+    ) async throws -> MLXArray {
+        try await languageModel.scheduledFinalPrefillForward(inputs, cache: cache)
     }
 
     public func callAsFunction(
@@ -1308,6 +1939,11 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func prepare() throws {
         try languageModel.prepare()
+    }
+
+    /// Attaches Edge0's fixed Recover-LoRA sidecar without merging it into the base model.
+    public func attachRecoverLoRA(_ adapter: Edge0Qwen35RecoverLoRA) throws {
+        try languageModel.attachRecoverLoRA(adapter)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -1338,7 +1974,7 @@ extension Qwen35Model: LoRAModel {
 }
 
 extension Qwen35Model: SpeculativeCacheRewindModel {
-    public var maximumNativeTargetCacheRewind: Int { 1 }
+    public var maximumNativeTargetCacheRewind: Int { 3 }
 }
 
 // MARK: - Chat conventions

@@ -33,6 +33,11 @@ struct InstalledQwen35DiagnosticTests {
         let directory = URL(filePath: path, directoryHint: .isDirectory)
         let mode = environment["FMLX_INSTALLED_QWEN_MODE"] ?? "mtp"
         let usesMTP = mode == "mtp"
+        let speculativeBlockSize =
+            environment["FMLX_INSTALLED_QWEN_BLOCK_SIZE"].flatMap(Int.init) ?? 4
+        let speculativeAdaptation =
+            environment["FMLX_INSTALLED_QWEN_DISABLE_ADAPTATION"] == "1"
+            ? nil : SpeculativeDecodingAdaptation()
 
         let text = try await CheckpointTextProcessor.load(directory: directory)
         let target = try await NativeTextModelLoader.load(directory: directory)
@@ -56,7 +61,9 @@ struct InstalledQwen35DiagnosticTests {
                 maxOutputTokens: 128,
                 prefillChunkSize: 128,
                 streamBufferSize: 256,
-                batchDecode: true
+                batchDecode: true,
+                speculativeAdaptation: speculativeAdaptation,
+                speculativeBlockSize: speculativeBlockSize
             ),
             drafter: drafter
         )
@@ -117,7 +124,7 @@ struct InstalledQwen35DiagnosticTests {
             decodeSeconds > 0
             ? Double(max(generatedTokens.count - 1, 0)) / decodeSeconds : 0
         print(
-            "[InstalledQwen35Diagnostic] mode=\(mode) execution=\(String(describing: executionMode)) tokens=\(generatedTokens.count) ttft=\(String(describing: timeToFirstToken)) decode_tps=\(String(format: "%.2f", tokensPerSecond)) proposed=\(telemetry?.draftTokenCount ?? 0) accepted=\(telemetry?.acceptedDraftTokenCount ?? 0)"
+            "[InstalledQwen35Diagnostic] mode=\(mode) block=\(speculativeBlockSize) execution=\(String(describing: executionMode)) tokens=\(generatedTokens.count) hash=\(Self.tokenHash(generatedTokens)) ttft=\(String(describing: timeToFirstToken)) decode_tps=\(String(format: "%.2f", tokensPerSecond)) proposed=\(telemetry?.draftTokenCount ?? 0) accepted=\(telemetry?.acceptedDraftTokenCount ?? 0)"
         )
         print("[InstalledQwen35Diagnostic] output=\(output)")
 
@@ -132,5 +139,18 @@ struct InstalledQwen35DiagnosticTests {
     private static func seconds(_ duration: Duration) -> Double {
         let parts = duration.components
         return Double(parts.seconds) + Double(parts.attoseconds) / 1e18
+    }
+
+    private static func tokenHash(_ tokens: [Int]) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for token in tokens {
+            var value = UInt64(bitPattern: Int64(token))
+            for _ in 0 ..< MemoryLayout<UInt64>.size {
+                hash ^= value & 0xff
+                hash &*= 1_099_511_628_211
+                value >>= 8
+            }
+        }
+        return String(format: "%016llx", hash)
     }
 }

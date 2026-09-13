@@ -74,7 +74,9 @@ public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel,
             * (configuration.headDim ?? configuration.hiddenSize / configuration.attentionHeads) * 8
     }
     public let configuration: Qwen35TextConfiguration
-    public let maximumBlockSize: Int? = 2
+    /// One Qwen MTP layer is reused autoregressively; the target retains
+    /// recurrent checkpoints for at most three drafted positions plus bonus.
+    public let maximumBlockSize: Int? = 4
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
     private let preconvertedNorms: Bool
@@ -123,7 +125,7 @@ public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel,
             state.seedToken = seed.token
             state.seedLogits = seed.logits
         }
-        eval([hidden] + state.cache.flatMap { $0.innerState() })
+        // The iterator evaluates retained cache state and final seed arrays.
     }
 
     public func prepareDrafterState(
@@ -196,13 +198,43 @@ public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel,
         let (targetEmbedTokens, lmHead) = targetEmbeddingAndHead(target)
         let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
 
-        if let seed = state.seedToken {
-            let logits = state.seedLogits!
+        if let seed = state.seedToken, let seedHidden = state.seedHidden,
+            let seedLogits = state.seedLogits
+        {
             state.seedToken = nil
             state.seedHidden = nil
             state.seedLogits = nil
-            state.proposalAppended = 0
-            return MTPDraft(tokens: seed, logits: logits)
+            guard blockSize > 2 else {
+                state.proposalAppended = 0
+                return MTPDraft(tokens: seed, logits: seedLogits)
+            }
+
+            // Prompt prefill already advanced the MTP cache through the bonus
+            // and produced `seed`. Continue from that state instead of feeding
+            // the bonus a second time. The final continuation token is only
+            // predicted, so exactly `blockSize - 2` entries are tentative.
+            let continuation = draftMTPTokenBlock(
+                targetEmbedTokens: targetEmbedTokens,
+                lmHead: lmHead,
+                inputEmbedding: inputEmbedding,
+                lastToken: seed,
+                lastHidden: seedHidden,
+                queryOffset: state.nextPosition,
+                blockSize: blockSize - 1,
+                sampler: sampler,
+                cache: state.cache
+            ) { inputsEmbeds, hiddenStates, cache, positionOffset in
+                mtp(
+                    inputsEmbeds: inputsEmbeds,
+                    hiddenStates: hiddenStates,
+                    cache: cache,
+                    positionOffset: positionOffset)
+            }
+            state.proposalAppended = blockSize - 2
+            state.nextPosition += state.proposalAppended
+            return MTPDraft(
+                tokens: concatenated([normalizedMTPColumn(seed), continuation.tokens], axis: 1),
+                logits: concatenated([seedLogits, continuation.logits], axis: 1))
         }
 
         state.proposalAppended = blockSize - 1

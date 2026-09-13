@@ -160,7 +160,10 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider, ScheduledTe
             * 8
     }
 
-    public func scheduledForward(_ tokens: MLXArray, cache: [KVCache]) throws -> MLXArray {
+    public nonisolated(nonsending) func scheduledForward(
+        _ tokens: MLXArray,
+        cache: [KVCache]
+    ) async throws -> MLXArray {
         callAsFunction(tokens, cache: cache)
     }
 
