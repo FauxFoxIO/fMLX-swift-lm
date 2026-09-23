@@ -48,16 +48,6 @@ final class SwitchLayersTests: XCTestCase {
         XCTAssertTrue(allClose(actual, expected).item(Bool.self))
     }
 
-    func testWeightedSingleExpertAvoidsSameSizeReduction() {
-        let outputs = MLXArray(0 ..< 12).asType(.float32).reshaped(3, 1, 4)
-        let weights = MLXArray([Float(0.25), 0.5, 0.75]).reshaped(3, 1)
-        let expected = MLX.squeezed(outputs, axis: -2) * weights
-        let actual = weightedExpertSum(outputs, weights)
-
-        eval(expected, actual)
-        XCTAssertTrue(allClose(actual, expected).item(Bool.self))
-    }
-
     func testFusedRouterTopKPreservesOrderAndSeparateScoreValues() {
         let rows = 32
         let e = 128

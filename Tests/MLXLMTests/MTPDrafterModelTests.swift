@@ -23,13 +23,11 @@ private final class MockMTPDrafter: Module, MTPDrafterModel {
         queryOffset: Int,
         blockSize: Int,
         sampler: any LogitSampler
-    ) -> MTPDraft {
+    ) -> MLXArray {
         draftCallCount += 1
         let batch = lastToken.dim(0)
         // Return [B, blockSize - 1] zeros — the contract is shape, not value.
-        return MTPDraft(
-            tokens: MLXArray.zeros([batch, blockSize - 1], dtype: .int32),
-            logits: MLXArray.zeros([batch, blockSize - 1, 8]))
+        return MLXArray.zeros([batch, blockSize - 1], dtype: .int32)
     }
 }
 
@@ -55,8 +53,7 @@ func testMTPDrafterModelProtocolShape() {
         sampler: ArgMaxSampler()
     )
     #expect(drafter.draftCallCount == 1)
-    #expect(result.tokens.shape == [1, 3])
-    #expect(result.logits.shape == [1, 3, 8])
+    #expect(result.shape == [1, 3])
 }
 
 @Test

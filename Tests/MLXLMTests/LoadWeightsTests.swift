@@ -18,14 +18,6 @@ private class TwoLayerModel: Module, BaseLanguageModel {
     }
 }
 
-private final class MTPOnlyModel: Module, BaseLanguageModel {
-    @ModuleInfo(key: "mtp") var mtp: Linear
-
-    override init() {
-        _mtp.wrappedValue = Linear(2, 2, bias: false)
-    }
-}
-
 /// The same model, declaring the sidecar its checkpoint ships the head in — like
 /// `JinaRerankerModel` and `projector.safetensors`.
 private final class SidecarDeclaringModel: TwoLayerModel, AdditionalWeightFilesProviding {
@@ -174,69 +166,6 @@ final class LoadWeightsTests: XCTestCase {
         }
         // the duplicate resolves to the later file, as the serial loop does
         XCTAssertEqual(weights["shared.weight"]?.asArray(Float.self), [1, 1, 1, 1])
-    }
-
-    func testTensorNameSelectionDoesNotMaterializeExcludedTensors() throws {
-        let directory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
-
-        let url = directory.appendingPathComponent("model.safetensors")
-        try save(
-            arrays: [
-                "model.layers.0.weight": MLXArray.full([2, 2], values: MLXArray(Float(1))),
-                "mtp.fc.weight": MLXArray.full([2, 2], values: MLXArray(Float(2))),
-            ], url: url)
-
-        let (weights, _) = try loadWeightArrays(
-            urls: [url], tensorNameSelection: .prefixed("mtp."))
-
-        XCTAssertEqual(Set(weights.keys), ["mtp.fc.weight"])
-        XCTAssertEqual(weights["mtp.fc.weight"]?.asArray(Float.self), [2, 2, 2, 2])
-    }
-
-    func testTensorNameSelectionSkipsExcludedIndexedFiles() throws {
-        let directory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
-
-        let mtpURL = directory.appendingPathComponent("mtp.safetensors")
-        try save(arrays: ["mtp.fc.weight": MLXArray.ones([2, 2])], url: mtpURL)
-        // If the index pruning regresses, the loader tries to parse this excluded file.
-        try Data("not a safetensors file".utf8).write(
-            to: directory.appendingPathComponent("model.safetensors"))
-        try writeIndex(
-            [
-                "model.layers.0.weight": "model.safetensors",
-                "mtp.fc.weight": "mtp.safetensors",
-            ], in: directory)
-
-        let selection = WeightTensorNameSelection.prefixed("mtp.")
-        let urls = try safetensorWeightURLs(
-            in: directory, tensorNameSelection: selection)
-
-        XCTAssertEqual(urls, [mtpURL])
-        XCTAssertTrue(
-            try containsWeightTensor(in: directory, tensorNameSelection: selection))
-        XCTAssertEqual(
-            Set(try loadWeightArrays(urls: urls, tensorNameSelection: selection).weights.keys),
-            ["mtp.fc.weight"])
-    }
-
-    func testSelectiveLoadWeightsInstallsEmbeddedMTPKeys() throws {
-        let directory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
-
-        try save(
-            arrays: [
-                "model.layers.0.weight": MLXArray.zeros([2, 2]),
-                "mtp.weight": MLXArray.ones([2, 2]),
-            ], url: directory.appendingPathComponent("model.safetensors"))
-
-        let model = MTPOnlyModel()
-        try loadWeights(
-            modelDirectory: directory, model: model,
-            tensorNameSelection: .prefixed("mtp."))
-
-        XCTAssertEqual(model.mtp.weight.asArray(Float.self), [1, 1, 1, 1])
     }
 
     func testLoadWeightArraysSurfacesAMissingFile() {

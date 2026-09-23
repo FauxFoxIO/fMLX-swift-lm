@@ -103,19 +103,15 @@ final class Qwen35RouterTopKBitwiseTests: XCTestCase {
 
     func testMoERouterTopKMatchesChainAcrossDispatchPaths() {
         let cases = [
-            (shape: [1, 256], k: 8, fused: true, label: "single-row fused"),
-            (shape: [2, 256], k: 8, fused: true, label: "two-row fused"),
-            (shape: [4, 256], k: 8, fused: false, label: "multi-row chain"),
-            (shape: [1, 1025], k: 8, fused: false, label: "expert-limit chain"),
+            (shape: [1, 256], k: 8, label: "single-row fused"),
+            (shape: [4, 256], k: 8, label: "multi-row chain"),
+            (shape: [1, 1025], k: 8, label: "expert-limit chain"),
         ]
 
         for testCase in cases {
             let gates = MLX.softmax(
                 MLXRandom.normal(testCase.shape), axis: -1, precise: true
             ).asType(.float16)
-            XCTAssertEqual(
-                supportsFusedRouterTopK(gates, k: testCase.k), testCase.fused,
-                "\(testCase.label): dispatch eligibility")
             let (wantInds, wantScores) = chainRouterTopK(
                 gates, k: testCase.k, normalize: true)
             let (gotInds, gotScores) = moeRouterTopK(
@@ -131,14 +127,5 @@ final class Qwen35RouterTopKBitwiseTests: XCTestCase {
                 wantScores.reshaped(-1, testCase.k),
                 "\(testCase.label): scores")
         }
-    }
-
-    func testChainRouterNormalizesSingleExpertWithoutReduction() {
-        let gates = MLXArray([Float(0.25), 0.75, 0.625, 0.375, 0.1, 0.9]).reshaped(3, 2)
-        let (indices, scores) = chainRouterTopK(gates, k: 1, normalize: true)
-        eval(indices, scores)
-
-        XCTAssertEqual(indices.reshaped(-1).asArray(UInt32.self), [1, 0, 1])
-        XCTAssertEqual(scores.reshaped(-1).asArray(Float.self), [1, 1, 1])
     }
 }

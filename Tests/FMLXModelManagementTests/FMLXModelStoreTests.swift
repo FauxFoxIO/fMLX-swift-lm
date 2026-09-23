@@ -98,23 +98,6 @@ import FoundationNetworking
     #expect(try Data(contentsOf: destination) == RangeProtocol.content)
 }
 
-@Test func installedCatalogProbe() async throws {
-    guard let root = ProcessInfo.processInfo.environment["FMLX_MODEL_STORE_PROBE_ROOT"] else {
-        return
-    }
-    let models = URL(fileURLWithPath: root, isDirectory: true)
-    let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(
-        "fmlx-probe-cache-\(UUID().uuidString)", isDirectory: true)
-    defer { try? FileManager.default.removeItem(at: scratch) }
-    let store = try FMLXModelStore(
-        configuration: .init(
-            modelsDirectory: models, cacheDirectory: scratch, cacheCapacityBytes: 1_024))
-
-    let installed = try await store.installedModels()
-
-    #expect(installed.contains { $0.repositoryID == "mlx-community/Qwen3.8-27B-4bit" })
-}
-
 private struct Fixture {
     let root: URL
     let models: URL

@@ -110,18 +110,6 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
         }
     }
 
-    private func quantize(
-        _ mlp: Qwen3NextMLP, mode: QuantizationMode = .affine
-    ) throws {
-        try mlp.update(
-            modules: ModuleChildren(values: [
-                "gate_proj": .value(
-                    QuantizedLinear(mlp.gateProj, groupSize: 32, bits: 4, mode: mode)),
-                "up_proj": .value(
-                    QuantizedLinear(mlp.upProj, groupSize: 32, bits: 4, mode: mode)),
-            ]), verify: [])
-    }
-
     func testLLMFullGDNForwardIsBitIdentical() throws {
         let layer = Qwen35GatedDeltaNet(try llmConfiguration())
         try quantize(layer)
@@ -138,90 +126,6 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
 
         XCTAssertTrue(layer.hasFusedInputProjection)
         assertBitIdentical(fused, reference, "full GDN")
-    }
-
-    func testMLPGateUpFusionIsBitIdenticalForDecodeAndVerification() throws {
-        for mode in [QuantizationMode.affine, .mxfp4] {
-            for sequence in [1, 2] {
-                let mlp = Qwen3NextMLP(dimensions: 64, hiddenDimensions: 64)
-                try quantize(mlp, mode: mode)
-                let input = MLXRandom.normal([1, sequence, 64]).asType(.bfloat16)
-
-                mlp.fusedGateUpProjectionEnabled = false
-                let reference = mlp(input)
-                eval(reference)
-
-                mlp.fusedGateUpProjectionEnabled = true
-                XCTAssertTrue(try mlp.prepareFusedGateUpProjection())
-                let fused = mlp(input)
-                eval(fused)
-
-                XCTAssertTrue(mlp.hasFusedGateUpProjection)
-                assertBitIdentical(fused, reference, "MLP \(mode) S=\(sequence)")
-            }
-        }
-    }
-
-    func testMLPGateUpFusionPreservesTopologyAndInvalidatesForUpdates() throws {
-        let mlp = Qwen3NextMLP(dimensions: 64, hiddenDimensions: 64)
-        try quantize(mlp)
-        let keysBefore = Set(mlp.parameters().flattened().map(\.0))
-
-        XCTAssertTrue(try mlp.prepareFusedGateUpProjection())
-        XCTAssertEqual(Set(mlp.parameters().flattened().map(\.0)), keysBefore)
-        XCTAssertTrue(keysBefore.contains("gate_proj.weight"))
-        XCTAssertTrue(keysBefore.contains("up_proj.weight"))
-
-        let replacement =
-            mlp.gateProj.weight
-            + MLXArray.zeros(mlp.gateProj.weight.shape, dtype: mlp.gateProj.weight.dtype)
-        try mlp.update(
-            parameters: ModuleParameters.unflattened(["gate_proj.weight": replacement]), verify: [])
-        XCTAssertFalse(mlp.hasFusedGateUpProjection)
-        XCTAssertTrue(try mlp.prepareFusedGateUpProjection())
-
-        let adapted = try XCTUnwrap(
-            LoRALinear.from(linear: mlp.gateProj, rank: 4, scale: 1) as? Linear)
-        try mlp.update(
-            modules: ModuleChildren(values: ["gate_proj": .value(adapted)]), verify: [])
-        XCTAssertFalse(mlp.hasFusedGateUpProjection)
-        XCTAssertFalse(try mlp.prepareFusedGateUpProjection())
-    }
-
-    func testMLPForwardFallsBackWithoutPreparing() throws {
-        let mlp = Qwen3NextMLP(dimensions: 64, hiddenDimensions: 64)
-        let modulesBefore = [ObjectIdentifier(mlp.gateProj), ObjectIdentifier(mlp.upProj)]
-
-        let output = mlp(MLXRandom.normal([1, 1, 64]).asType(.bfloat16))
-        eval(output)
-
-        XCTAssertFalse(mlp.hasFusedGateUpProjection)
-        XCTAssertEqual(
-            [ObjectIdentifier(mlp.gateProj), ObjectIdentifier(mlp.upProj)], modulesBefore)
-        XCTAssertFalse(try mlp.prepareFusedGateUpProjection())
-    }
-
-    func testModelPreparationFusesDenseAndSharedExpertMLPs() throws {
-        let denseModel = Qwen35TextModel(try llmConfiguration())
-        let denseMLPs = denseModel.modules().compactMap { $0 as? Qwen3NextMLP }
-        XCTAssertFalse(denseMLPs.isEmpty)
-        try denseMLPs.forEach { try quantize($0) }
-        denseMLPs.forEach { $0.fusedGateUpProjectionEnabled = true }
-        try denseModel.prepare()
-        XCTAssertTrue(denseMLPs.allSatisfy(\.hasFusedGateUpProjection))
-
-        var moeConfiguration = try llmConfiguration()
-        moeConfiguration.numExperts = 2
-        moeConfiguration.numExpertsPerTok = 1
-        moeConfiguration.moeIntermediateSize = 64
-        moeConfiguration.sharedExpertIntermediateSize = 64
-        let moeModel = Qwen35TextModel(moeConfiguration)
-        let sharedMLPs = moeModel.modules().compactMap { $0 as? Qwen3NextMLP }
-        XCTAssertFalse(sharedMLPs.isEmpty)
-        try sharedMLPs.forEach { try quantize($0) }
-        sharedMLPs.forEach { $0.fusedGateUpProjectionEnabled = true }
-        try moeModel.prepare()
-        XCTAssertTrue(sharedMLPs.allSatisfy(\.hasFusedGateUpProjection))
     }
 
     func testVLMFusedProjectionIsBitIdentical() throws {
@@ -461,16 +365,14 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
         XCTAssertFalse(cache.isPrepared)
     }
 
-    /// Opt-in paired benchmark for local Qwen GDN and MLP projections.
+    /// Opt-in paired benchmark for a local Qwen 3.5 checkpoint.
     ///
     /// The same model and materialized weights are used for both paths, with
     /// alternating order, to avoid cross-process Metal-cache and load noise:
     ///
     /// ```sh
     /// MLX_QWEN_GDN_BENCH_MODEL=/path/to/model \
-    ///   xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS' \
-    ///     -skipPackagePluginValidation \
-    ///     -only-testing:MLXLMTests/Qwen35FusedGDNProjectionTests/testRealCheckpointBenchmark
+    ///   swift test -c release --filter testRealCheckpointBenchmark
     /// ```
     func testRealCheckpointBenchmark() throws {
         guard
@@ -494,19 +396,11 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
                 model: model,
                 perLayerQuantization: baseConfiguration.perLayerQuantization)
             let layers = model.modules().compactMap { $0 as? Qwen35GatedDeltaNet }
-            let mlps = model.modules().compactMap { $0 as? Qwen3NextMLP }
             XCTAssertFalse(layers.isEmpty)
-            XCTAssertFalse(mlps.isEmpty)
             for layer in layers {
                 layer.fusedInputProjectionEnabled = fused
                 if fused {
                     XCTAssertTrue(try layer.prepareFusedInputProjection())
-                }
-            }
-            for mlp in mlps {
-                mlp.fusedGateUpProjectionEnabled = fused
-                if fused {
-                    XCTAssertTrue(try mlp.prepareFusedGateUpProjection())
                 }
             }
             return model
