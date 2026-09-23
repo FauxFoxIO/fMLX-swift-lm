@@ -9,6 +9,8 @@ import FoundationNetworking
 final class ModelFileTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let destination: URL
     private let expectedBytes: Int64
+    private let repositoryID: String?
+    private let authorizationToken: String?
     private let sessionConfiguration: URLSessionConfiguration
     private let progress: @Sendable (Int64) -> Void
     private let lock = NSLock()
@@ -19,15 +21,19 @@ final class ModelFileTransfer: NSObject, URLSessionDataDelegate, @unchecked Send
     private var receivedBytes: Int64
     private var completed = false
     private var responseAccepted = false
+    private var authorizationOriginHost: String?
 
     init(
         destination: URL, existingBytes: Int64, expectedBytes: Int64,
+        repositoryID: String? = nil, authorizationToken: String? = nil,
         sessionConfiguration: URLSessionConfiguration = .ephemeral,
         progress: @escaping @Sendable (Int64) -> Void
     ) {
         self.destination = destination
         self.receivedBytes = existingBytes
         self.expectedBytes = expectedBytes
+        self.repositoryID = repositoryID
+        self.authorizationToken = authorizationToken
         self.sessionConfiguration = sessionConfiguration
         self.progress = progress
     }
@@ -50,8 +56,13 @@ final class ModelFileTransfer: NSObject, URLSessionDataDelegate, @unchecked Send
                     try handle.seekToEnd()
                     self.handle = handle
                     var request = URLRequest(url: url)
+                    authorizationOriginHost = url.host?.lowercased()
                     request.timeoutInterval = 30 * 60
                     request.setValue("fMLX-swift-lm", forHTTPHeaderField: "User-Agent")
+                    if let authorizationToken {
+                        request.setValue(
+                            "Bearer \(authorizationToken)", forHTTPHeaderField: "Authorization")
+                    }
                     if receivedBytes > 0 {
                         request.setValue("bytes=\(receivedBytes)-", forHTTPHeaderField: "Range")
                     }
@@ -81,12 +92,24 @@ final class ModelFileTransfer: NSObject, URLSessionDataDelegate, @unchecked Send
         willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
-        guard request.url?.scheme?.lowercased() == "https" else {
+        guard request.url?.scheme?.lowercased() == "https",
+            request.url?.user == nil, request.url?.password == nil
+        else {
             completionHandler(nil)
             finish(.failure(FMLXModelManagementError.invalidRepositoryResponse))
             return
         }
-        completionHandler(request)
+        var redirected = request
+        lock.lock()
+        let originHost = authorizationOriginHost
+        lock.unlock()
+        if redirected.url?.host?.lowercased() == originHost, let authorizationToken {
+            redirected.setValue(
+                "Bearer \(authorizationToken)", forHTTPHeaderField: "Authorization")
+        } else {
+            redirected.setValue(nil, forHTTPHeaderField: "Authorization")
+        }
+        completionHandler(redirected)
     }
 
     func urlSession(
@@ -98,7 +121,15 @@ final class ModelFileTransfer: NSObject, URLSessionDataDelegate, @unchecked Send
         else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             completionHandler(.cancel)
-            finish(.failure(FMLXModelManagementError.downloadFailed(statusCode: status)))
+            if status == 401 {
+                finish(.failure(FMLXModelManagementError.authenticationRequired))
+            } else if status == 403, let repositoryID {
+                finish(
+                    .failure(
+                        FMLXModelManagementError.gatedRepositoryAccessRequired(repositoryID)))
+            } else {
+                finish(.failure(FMLXModelManagementError.downloadFailed(statusCode: status)))
+            }
             return
         }
         lock.lock()

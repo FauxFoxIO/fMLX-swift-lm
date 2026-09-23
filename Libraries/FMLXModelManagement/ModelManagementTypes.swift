@@ -8,6 +8,14 @@ public enum FMLXModelManagementError: LocalizedError, Equatable, Sendable {
     case unsupportedModelType(String)
     case unsafePath(String)
     case downloadFailed(statusCode: Int)
+    case authenticationRequired
+    case gatedRepositoryAccessRequired(String)
+    case oauthClientNotConfigured
+    case oauthClientInvalid
+    case oauthScopeUnavailable
+    case credentialStoreUnavailable
+    case deviceLoginDenied
+    case deviceLoginExpired
     case sizeMismatch(file: String, expected: Int64, actual: Int64)
     case checksumMismatch(file: String)
     case incompleteCheckpoint(String)
@@ -22,6 +30,22 @@ public enum FMLXModelManagementError: LocalizedError, Equatable, Sendable {
         case .unsupportedModelType(let type): "fMLX does not support the model type '\(type)'."
         case .unsafePath(let path): "The model repository contains an unsafe path: \(path)"
         case .downloadFailed(let status): "The model download failed with HTTP status \(status)."
+        case .authenticationRequired:
+            "Sign in to Hugging Face again to continue this download."
+        case .gatedRepositoryAccessRequired(let repositoryID):
+            "The gated model '\(repositoryID)' requires Hugging Face access approval. Open its model page, grant access, then retry."
+        case .oauthClientNotConfigured:
+            "Hugging Face sign-in is not configured for this app. Add its public OAuth client ID to continue."
+        case .oauthClientInvalid:
+            "Hugging Face rejected this app's OAuth client ID. Check the app's public OAuth configuration."
+        case .oauthScopeUnavailable:
+            "This Hugging Face OAuth app must allow the gated-repos scope."
+        case .credentialStoreUnavailable:
+            "Hugging Face credentials could not be read from or saved to Keychain."
+        case .deviceLoginDenied:
+            "Hugging Face sign-in was denied."
+        case .deviceLoginExpired:
+            "The Hugging Face sign-in code expired. Start sign-in again."
         case .sizeMismatch(let file, let expected, let actual):
             "\(file) is incomplete (expected \(expected) bytes, found \(actual))."
         case .checksumMismatch(let file): "\(file) failed SHA-256 validation."
@@ -31,6 +55,11 @@ public enum FMLXModelManagementError: LocalizedError, Equatable, Sendable {
         case .downloadNotFound(let id): "The model download '\(id)' was not found."
         }
     }
+}
+
+public enum FMLXModelDownloadErrorKind: String, Codable, Hashable, Sendable {
+    case authenticationRequired
+    case gatedRepositoryAccessRequired
 }
 
 public struct FMLXInstalledModel: Codable, Hashable, Identifiable, Sendable {
@@ -102,6 +131,7 @@ public struct FMLXModelDownload: Codable, Hashable, Identifiable, Sendable {
     public let totalBytes: Int64
     public let currentFile: String?
     public let errorMessage: String?
+    public let errorKind: FMLXModelDownloadErrorKind?
     public let canCancel: Bool
     public let canRetry: Bool
     public let updatedAt: Date
@@ -114,7 +144,8 @@ public struct FMLXModelDownload: Codable, Hashable, Identifiable, Sendable {
     public init(
         id: UUID, repositoryID: String, revision: String?, status: FMLXModelDownloadStatus,
         downloadedBytes: Int64, totalBytes: Int64, currentFile: String? = nil,
-        errorMessage: String? = nil, canCancel: Bool = false, canRetry: Bool = false,
+        errorMessage: String? = nil, errorKind: FMLXModelDownloadErrorKind? = nil,
+        canCancel: Bool = false, canRetry: Bool = false,
         updatedAt: Date = Date()
     ) {
         self.id = id
@@ -125,6 +156,7 @@ public struct FMLXModelDownload: Codable, Hashable, Identifiable, Sendable {
         self.totalBytes = totalBytes
         self.currentFile = currentFile
         self.errorMessage = errorMessage
+        self.errorKind = errorKind
         self.canCancel = canCancel
         self.canRetry = canRetry
         self.updatedAt = updatedAt

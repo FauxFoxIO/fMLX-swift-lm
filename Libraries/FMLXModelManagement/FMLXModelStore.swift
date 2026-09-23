@@ -110,6 +110,7 @@ public actor FMLXModelStore {
     public func download(repositoryID: String, revision: String = "main") async throws
         -> FMLXModelDownload
     {
+        let repositoryID = try HuggingFaceModelHub.canonicalRepositoryID(repositoryID)
         if let existing = transactions.values.first(where: {
             $0.download.repositoryID == repositoryID
                 && [.pending, .downloading, .validating].contains($0.download.status)
@@ -267,9 +268,12 @@ public actor FMLXModelStore {
                         currentFile: file.path, canCancel: true)
                     transactions[id] = transaction
                     try persist(transaction)
+                    let authorizationToken = try await hub.accessToken()
                     let transfer = ModelFileTransfer(
                         destination: output, existingBytes: existing,
                         expectedBytes: file.sizeBytes,
+                        repositoryID: transaction.snapshot.repositoryID,
+                        authorizationToken: authorizationToken,
                         sessionConfiguration: hub.transferConfiguration
                     ) { [weak self] bytes in
                         Task { await self?.recordProgress(id: id, file: file, bytes: bytes) }
@@ -328,10 +332,14 @@ public actor FMLXModelStore {
                 try? persist(transaction)
             }
         } catch {
+            if error as? FMLXModelManagementError == .authenticationRequired {
+                await hub.invalidateAuthorization()
+            }
             if var transaction = transactions[id] {
                 transaction.download = replacing(
                     transaction.download, status: .failed,
                     errorMessage: error.localizedDescription,
+                    errorKind: Self.downloadErrorKind(error),
                     canCancel: false, canRetry: true)
                 transactions[id] = transaction
                 try? persist(transaction)
@@ -438,13 +446,27 @@ public actor FMLXModelStore {
     private func replacing(
         _ value: FMLXModelDownload, status: FMLXModelDownloadStatus,
         downloadedBytes: Int64? = nil, currentFile: String? = nil,
-        errorMessage: String? = nil, canCancel: Bool, canRetry: Bool = false
+        errorMessage: String? = nil, errorKind: FMLXModelDownloadErrorKind? = nil,
+        canCancel: Bool, canRetry: Bool = false
     ) -> FMLXModelDownload {
         FMLXModelDownload(
             id: value.id, repositoryID: value.repositoryID, revision: value.revision,
             status: status, downloadedBytes: downloadedBytes ?? value.downloadedBytes,
             totalBytes: value.totalBytes, currentFile: currentFile,
-            errorMessage: errorMessage, canCancel: canCancel, canRetry: canRetry)
+            errorMessage: errorMessage, errorKind: errorKind,
+            canCancel: canCancel, canRetry: canRetry)
+    }
+
+    private static func downloadErrorKind(_ error: Error) -> FMLXModelDownloadErrorKind? {
+        guard let error = error as? FMLXModelManagementError else { return nil }
+        switch error {
+        case FMLXModelManagementError.authenticationRequired:
+            return FMLXModelDownloadErrorKind.authenticationRequired
+        case FMLXModelManagementError.gatedRepositoryAccessRequired(_):
+            return FMLXModelDownloadErrorKind.gatedRepositoryAccessRequired
+        default:
+            return nil
+        }
     }
 
     private func persist(_ transaction: Transaction) throws {
