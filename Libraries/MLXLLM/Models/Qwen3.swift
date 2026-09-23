@@ -93,14 +93,62 @@ class Qwen3MLP: Module, UnaryLayer {
     @ModuleInfo(key: "down_proj") var down: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
 
+    private let fusedGateUpProjection = FusedQuantizedLinearProjectionCache()
+
     public init(dimensions: Int, hiddenDimensions: Int) {
         _gate.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
         _down.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
         _up.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
     }
 
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        let replacesGateOrUp = parameters.flattened().contains { key, _ in
+            key.hasPrefix("gate_proj.") || key.hasPrefix("up_proj.")
+        }
+        defer {
+            if replacesGateOrUp {
+                fusedGateUpProjection.invalidate()
+            }
+        }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        let replacesGateOrUp = key == "gate_proj" || key == "up_proj"
+        defer {
+            if replacesGateOrUp {
+                fusedGateUpProjection.invalidate()
+            }
+        }
+        try super.updateModule(key: key, value)
+    }
+
+    @discardableResult
+    func prepareFusedGateUpProjection() throws -> Bool {
+        try fusedGateUpProjection.prepare(
+            enabled: qwen35MLPGateUpEnabled,
+            linears: [gate, up]
+        ) { sourceViews in
+            try update(
+                modules: ModuleChildren(values: [
+                    "gate_proj": .value(sourceViews[0]),
+                    "up_proj": .value(sourceViews[1]),
+                ]), verify: [])
+        }
+    }
+
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        down(silu(gate(x)) * up(x))
+        guard let fused = fusedGateUpProjection.fused else {
+            return down(silu(gate(x)) * up(x))
+        }
+        let projected = fused(x)
+        let gateEnd = gate.shape.0
+        return down(silu(projected[.ellipsis, ..<gateEnd]) * projected[.ellipsis, gateEnd...])
     }
 }
 

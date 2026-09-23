@@ -79,6 +79,7 @@ internal final class RuntimePersistentPrefixStore {
         let identity: PrefixCacheIdentity
         let layout: String
         let tokens: [Int]
+        let processedTokenCount: Int?
         let layers: [Layer]
         let dataFile: String
         let dataBytes: Int
@@ -129,19 +130,27 @@ internal final class RuntimePersistentPrefixStore {
         }
     }
 
-    func store(tokens: [Int], cache: [KVCache]) throws {
+    func store(
+        tokens: [Int], cache: [KVCache], processedTokenCount: Int? = nil
+    ) throws {
         guard !tokens.isEmpty, tokens.allSatisfy({ $0 >= 0 }), !cache.isEmpty,
             cache.count <= 4096
         else { throw Failure.invalidSnapshot }
+        let processedTokenCount = processedTokenCount ?? tokens.count
+        guard processedTokenCount > 0, processedTokenCount <= tokens.count else {
+            throw Failure.invalidSnapshot
+        }
         var bytes = Data()
         var layers: [Layer] = []
         for cache in cache {
             let kind = try Self.kind(cache)
-            guard cache.offset >= 0, kind == "mamba" || cache.offset == tokens.count else {
+            guard cache.offset >= 0,
+                kind == "mamba" || cache.offset == processedTokenCount
+            else {
                 throw Failure.invalidSnapshot
             }
             let raw = cache.innerState()
-            if kind != "mamba" {
+            if kind == "simple" || kind == "quantized" {
                 guard
                     raw.allSatisfy({
                         $0.ndim == 4 && $0.dim(2) >= cache.offset
@@ -156,7 +165,7 @@ internal final class RuntimePersistentPrefixStore {
                     Tensor(
                         shape: $0.shape, dtype: String(describing: $0.dtype), byteCount: $0.nbytes)
                 })
-            try validate(layer, tokenCount: tokens.count)
+            try validate(layer, processedTokenCount: processedTokenCount)
             for array in arrays {
                 guard array.nbytes <= configuration.maximumBytes - bytes.count else {
                     throw Failure.entryTooLarge
@@ -171,7 +180,7 @@ internal final class RuntimePersistentPrefixStore {
             let name = try entryName(tokens)
             let manifest = Manifest(
                 version: Self.version, identity: identity, layout: layoutFingerprint,
-                tokens: tokens, layers: layers,
+                tokens: tokens, processedTokenCount: processedTokenCount, layers: layers,
                 dataFile: "data-v1-\(UUID().uuidString.lowercased()).bin",
                 dataBytes: bytes.count, dataDigest: Self.digest(bytes), access: nextAccess())
             let manifestData = try envelope(manifest)
@@ -201,7 +210,7 @@ internal final class RuntimePersistentPrefixStore {
     }
 
     func restore(prompt: [Int], maximumPrefixTokens: Int, prototype: [KVCache]) throws -> (
-        tokens: [Int], cache: [KVCache]
+        tokens: [Int], processedTokenCount: Int, cache: [KVCache]
     )? {
         guard maximumPrefixTokens > 0 else { return nil }
         for cache in prototype { _ = try Self.kind(cache) }
@@ -232,7 +241,11 @@ internal final class RuntimePersistentPrefixStore {
                     {
                         try remove(oldest)
                     }
-                    return (entry.manifest.tokens, restored)
+                    return (
+                        entry.manifest.tokens,
+                        entry.manifest.processedTokenCount ?? entry.manifest.tokens.count,
+                        restored
+                    )
                 } catch {
                     // A failed candidate must never leak a partially restored cache.
                     try remove(entry)
@@ -252,6 +265,7 @@ internal final class RuntimePersistentPrefixStore {
     private static func kind(_ cache: KVCache) throws -> String {
         if type(of: cache) == KVCacheSimple.self { return "simple" }
         if type(of: cache) == MambaCache.self { return "mamba" }
+        if type(of: cache) == RotatingKVCache.self { return "rotating" }
         if type(of: cache) == QuantizedKVCache.self,
             let quantized = cache as? QuantizedKVCache, quantized.mode == .affine
         {
@@ -260,10 +274,11 @@ internal final class RuntimePersistentPrefixStore {
         throw Failure.unsupportedCache
     }
 
-    private func validate(_ layer: Layer, tokenCount: Int) throws {
+    private func validate(_ layer: Layer, processedTokenCount: Int) throws {
         // Recurrent offsets follow the model's convention; attention offsets count tokens.
-        guard layer.offset >= 0, layer.kind == "mamba" || layer.offset == tokenCount,
-            tokenCount > 0, !layer.tensors.isEmpty, layer.tensors.count <= 6
+        guard layer.offset >= 0,
+            layer.kind == "mamba" || layer.offset == processedTokenCount,
+            processedTokenCount > 0, !layer.tensors.isEmpty, layer.tensors.count <= 6
         else { throw Failure.invalidSnapshot }
         for tensor in layer.tensors {
             guard !tensor.shape.isEmpty, tensor.shape.count <= 8,
@@ -291,7 +306,7 @@ internal final class RuntimePersistentPrefixStore {
         case "quantized":
             guard layer.tensors.count == 6, layer.step == nil,
                 layer.metadata.count == 4, layer.metadata[0] == "256",
-                Int(layer.metadata[1]) == tokenCount,
+                Int(layer.metadata[1]) == processedTokenCount,
                 let group = Int(layer.metadata[2]), [32, 64, 128].contains(group),
                 let bits = Int(layer.metadata[3]), [2, 3, 4, 5, 6, 8].contains(bits)
             else { throw Failure.invalidSnapshot }
@@ -320,6 +335,23 @@ internal final class RuntimePersistentPrefixStore {
                     throw Failure.invalidSnapshot
                 }
             }
+        case "rotating":
+            guard layer.tensors.count == 2, layer.step == nil,
+                (5 ... 7).contains(layer.metadata.count),
+                let keep = Int(layer.metadata[0]), let maximum = Int(layer.metadata[1]),
+                let step = Int(layer.metadata[2]), let offset = Int(layer.metadata[3]),
+                let index = Int(layer.metadata[4]), keep >= 0, maximum > 0, step > 0,
+                offset == processedTokenCount, index >= keep,
+                layer.tensors.allSatisfy({
+                    $0.shape.count == 4 && $0.shape[0] == 1
+                        && $0.shape[2] <= maximum && Self.isFloat($0.dtype)
+                }), layer.tensors[0].shape[1] == layer.tensors[1].shape[1],
+                layer.tensors[0].shape[2] == layer.tensors[1].shape[2],
+                index <= layer.tensors[0].shape[2],
+                layer.metadata.count < 6
+                    || RotatingKVCache.CapacityOrigin(rawValue: layer.metadata[5]) != nil,
+                layer.metadata.count < 7 || Bool(layer.metadata[6]) != nil
+            else { throw Failure.invalidSnapshot }
         default: throw Failure.unsupportedCache
         }
     }
@@ -343,6 +375,13 @@ internal final class RuntimePersistentPrefixStore {
             if let quantized = cache as? QuantizedKVCache {
                 guard Int(layer.metadata[2]) == quantized.groupSize,
                     Int(layer.metadata[3]) == quantized.bits
+                else { throw Failure.invalidSnapshot }
+            }
+            if let rotating = cache as? RotatingKVCache {
+                let expected = rotating.metaState
+                guard expected[0] == layer.metadata[0], expected[1] == layer.metadata[1],
+                    expected[2] == layer.metadata[2],
+                    expected.count < 6 || expected[5] == layer.metadata[5]
                 else { throw Failure.invalidSnapshot }
             }
             let tensors = cache.innerState()
@@ -394,6 +433,14 @@ internal final class RuntimePersistentPrefixStore {
                 let mamba = MambaCache()
                 mamba.restoreFromMetaState(state: arrays, savedMetaState: layer.metadata)
                 cache = mamba
+            case "rotating":
+                guard let maximum = Int(layer.metadata[1]), let keep = Int(layer.metadata[0]),
+                    let step = Int(layer.metadata[2])
+                else { throw Failure.invalidSnapshot }
+                let rotating = RotatingKVCache(maxSize: maximum, keep: keep, step: step)
+                rotating.state = arrays
+                rotating.metaState = layer.metadata
+                cache = rotating
             default: throw Failure.unsupportedCache
             }
             cache.offset = layer.offset
@@ -423,9 +470,13 @@ internal final class RuntimePersistentPrefixStore {
                     manifest.dataBytes <= configuration.maximumBytes - data.count,
                     Self.isDigest(manifest.dataDigest)
                 else { throw Failure.invalidSnapshot }
+                let processedTokenCount = manifest.processedTokenCount ?? manifest.tokens.count
+                guard processedTokenCount > 0, processedTokenCount <= manifest.tokens.count else {
+                    throw Failure.invalidSnapshot
+                }
                 var count = 0
                 for layer in manifest.layers {
-                    try validate(layer, tokenCount: manifest.tokens.count)
+                    try validate(layer, processedTokenCount: processedTokenCount)
                     for tensor in layer.tensors {
                         guard tensor.byteCount <= manifest.dataBytes - count else {
                             throw Failure.invalidSnapshot

@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/fauxfox/fmlx-swift-lm/benchmarks/splash-comparison/ledger.schema.json",
+  "title": "Splash comparison result ledger",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "protocol",
+    "session",
+    "generatedAtUTC",
+    "rawSamplesSHA256",
+    "rawSampleCount",
+    "pairIssues",
+    "complete",
+    "objectiveMet",
+    "cells"
+  ],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "protocol": {"type": "object"},
+    "session": {"type": "object"},
+    "generatedAtUTC": {"type": "string", "format": "date-time"},
+    "rawSamplesSHA256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "rawSampleCount": {"type": "integer", "minimum": 0},
+    "pairIssues": {"type": "array", "items": {"type": "string"}},
+    "complete": {"type": "boolean"},
+    "objectiveMet": {"type": "boolean"},
+    "cells": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "workload",
+          "complete",
+          "noiseIssues",
+          "engines",
+          "candidateToBaselineRatios",
+          "outcome"
+        ],
+        "properties": {
+          "workload": {"type": "string"},
+          "complete": {"type": "boolean"},
+          "noiseIssues": {"type": "array", "items": {"type": "string"}},
+          "engines": {"type": "object"},
+          "candidateToBaselineRatios": {
+            "type": ["object", "null"],
+            "properties": {
+              "throughput": {"type": "number"},
+              "ttft": {"type": "number"},
+              "endToEnd": {"type": "number"}
+            },
+            "required": ["throughput", "ttft", "endToEnd"]
+          },
+          "outcome": {"enum": ["exceed", "match", "below", "inconclusive"]}
+        }
+      }
+    }
+  }
+}

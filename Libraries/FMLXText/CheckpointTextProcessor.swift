@@ -191,7 +191,10 @@ public struct CheckpointTextProcessor: Sendable {
 
     /// Caller supplies immutable weight/layout revisions. Tokenizer/template revisions
     /// are hashes of the checkpoint assets, not paths, model names or branch names.
-    public func cacheIdentity(modelRevision: String, cacheLayoutRevision: String) throws
+    public func cacheIdentity(
+        modelRevision: String, cacheLayoutRevision: String, draftRevision: String = "none",
+        quantizationContract: String = "native", transformContract: String = "none"
+    ) throws
         -> PrefixCacheIdentity
     {
         guard !modelRevision.isEmpty, !cacheLayoutRevision.isEmpty else {
@@ -201,7 +204,8 @@ public struct CheckpointTextProcessor: Sendable {
         return PrefixCacheIdentity(
             modelRevision: modelRevision, tokenizerRevision: tokenizerRevision,
             chatTemplateRevision: chatTemplateRevision, adapterRevision: "none",
-            cacheLayoutRevision: cacheLayoutRevision)
+            cacheLayoutRevision: cacheLayoutRevision, draftRevision: draftRevision,
+            quantizationContract: quantizationContract, transformContract: transformContract)
     }
 
     /// Each generation owns its own incremental decoder; mutable decoder state is never shared.
@@ -211,7 +215,7 @@ public struct CheckpointTextProcessor: Sendable {
             decoder: tokenizer.streamingDetokenizer(skipSpecialTokens: skipSpecialTokens))
     }
 
-    fileprivate func validate(_ tokens: [Int]) throws {
+    func validate(_ tokens: [Int]) throws {
         for token in tokens
         where !(0 ..< vocabularySize).contains(token) || tokenizer.convertIdToToken(token) == nil {
             throw CheckpointTextError.invalidTokenID(token)

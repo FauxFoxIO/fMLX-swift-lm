@@ -233,30 +233,27 @@ private struct Fixture {
     #expect(try second.consume(3) == " hello")
 }
 
-@Test func installedCheckpointTokenizationProbe() async throws {
-    guard let path = ProcessInfo.processInfo.environment["FMLX_TOKENIZER_CHECKPOINT"] else {
-        return
-    }
-    let text = try await CheckpointTextProcessor.load(directory: URL(fileURLWithPath: path))
-    let input = "Hello, Bright Eyes. 你好 👋\nSwift: let answer = 42"
-    let tokens = try text.encode(input, addSpecialTokens: false)
-    if let expected = ProcessInfo.processInfo.environment["FMLX_EXPECTED_RAW_TOKENS"] {
-        let reference = try JSONDecoder().decode([Int].self, from: Data(expected.utf8))
-        #expect(tokens == reference)
-    }
-    #expect(try text.decode(tokens) == input)
-    let stream = text.makeDecoder()
-    var streamed = ""
-    for token in tokens { streamed += try stream.consume(token) ?? "" }
-    #expect(streamed == input)
-    let prompt = try text.prepareChat(
-        messages: [["role": "user", "content": input]],
-        additionalContext: ["enable_thinking": false])
-    #expect(prompt.count > tokens.count)
-    #expect(!text.stopTokenIDs.isEmpty)
-    print(
-        "fMLX checkpoint tokenizer: \(path); text tokens=\(tokens.count), chat tokens=\(prompt.count), EOS=\(text.stopTokenIDs.sorted())"
-    )
+@Test func memoryAdmissionRejectsOversizedArtifactsBeforeLoadingWeights() throws {
+    let fixture = try Fixture()
+    defer { fixture.remove() }
+    try Data(repeating: 0, count: 4_000_000).write(
+        to: fixture.directory.appendingPathComponent("model.safetensors"))
+
+    let admitted = try NativeTextModel.memoryAdmission(
+        directory: fixture.directory,
+        configuration: .init(
+            memoryBudgetBytes: 8_000_000, prefixCacheBytes: 1_000_000,
+            workingMemoryBytes: 1_000_000))
+    #expect(admitted.checkpointBytes == 4_000_000)
+    #expect(admitted.requiredBytes == 7_048_576)
+    #expect(admitted.isAdmitted)
+
+    let rejected = try NativeTextModel.memoryAdmission(
+        directory: fixture.directory,
+        configuration: .init(
+            memoryBudgetBytes: 7_000_000, prefixCacheBytes: 1_000_000,
+            workingMemoryBytes: 1_000_000))
+    #expect(!rejected.isAdmitted)
 }
 
 @Test func nativeModelLoadsItsOwnTokenizerAndGeneratesFromPreparedChat() async throws {
@@ -295,6 +292,17 @@ private struct Fixture {
         #expect(request.tokens == [1, 5, 3, 6])
         #expect(request.stopTokenIDs == [2, 11])
         #expect(request.cacheIdentity == loaded.cacheIdentity)
+        let preRendered = try loaded.prepareRequest(
+            tokens: request.tokens, maximumOutputTokens: 4, prefixTokenCount: 3,
+            promptLookup: true)
+        #expect(preRendered.tokens == request.tokens)
+        #expect(preRendered.stopTokenIDs == request.stopTokenIDs)
+        #expect(preRendered.prefixTokenCount == request.prefixTokenCount)
+        #expect(preRendered.cacheIdentity == request.cacheIdentity)
+        #expect(preRendered.promptLookup)
+        #expect(throws: CheckpointTextError.self) {
+            try loaded.prepareRequest(tokens: [12], maximumOutputTokens: 4)
+        }
         let automaticPrefix = try loaded.prepareRequest(
             messages: [["role": "user", "content": "hello"]],
             maximumOutputTokens: 4,

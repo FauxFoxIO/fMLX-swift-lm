@@ -24,6 +24,16 @@ package protocol ProbabilityLogitSampler: LogitSampler {
     func sampleUniform() -> MLXArray
 }
 
+/// A sampler that exposes the distribution used by a sparse speculative drafter.
+///
+/// Candidate-based drafters first mask the vocabulary themselves. They must apply
+/// temperature, but must not apply the target sampler's top-p/top-k/min-p filters a
+/// second time to that already-bounded candidate set.
+public protocol SpeculativeDraftSampler: LogitSampler {
+    func draftLogProbabilities(logits: MLXArray) -> MLXArray
+    func sampleDraft(logProbabilities: MLXArray) -> MLXArray
+}
+
 /// A `LogitProcessor` is an optional visitor of `logits`.
 ///
 /// The ``LogitProcessor`` is called with the input (prompt) before generating tokens:
@@ -440,6 +450,18 @@ public struct TopPSampler: LogitSampler {
     }
 }
 
+extension TopPSampler: SpeculativeDraftSampler {
+    public func draftLogProbabilities(logits: MLXArray) -> MLXArray {
+        var logits = logits
+        if logits.dtype == .bfloat16 { logits = logits.asType(.float32) }
+        return logSoftmax(logits * (1 / temp))
+    }
+
+    public func sampleDraft(logProbabilities: MLXArray) -> MLXArray {
+        sample(logProbabilities: logProbabilities)
+    }
+}
+
 /// Sampler that uses `temperature` to sample the logits.
 public struct CategoricalSampler: LogitSampler {
     let temp: MLXArray
@@ -466,6 +488,16 @@ public struct CategoricalSampler: LogitSampler {
 
     package func sampleUniform() -> MLXArray {
         withRandomState(randomState) { MLXRandom.uniform(low: 0, high: 1, [1]) }
+    }
+}
+
+extension CategoricalSampler: SpeculativeDraftSampler {
+    public func draftLogProbabilities(logits: MLXArray) -> MLXArray {
+        logProbabilities(logits: logits)
+    }
+
+    public func sampleDraft(logProbabilities: MLXArray) -> MLXArray {
+        sample(logProbabilities: logProbabilities)
     }
 }
 

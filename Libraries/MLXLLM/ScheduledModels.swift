@@ -265,7 +265,7 @@ public enum NativeTextModelLoader {
         return drafter
     }
 
-    /// Loads a standalone, preconverted MLX Qwen MTP head; the caller supplies its matching target.
+    /// Loads a standalone, preconverted MLX Qwen MTP head; the caller supplies its target.
     public static func loadMTP(directory: URL) async throws -> sending Qwen35MTPDraftModel {
         let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
         let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
@@ -274,6 +274,27 @@ public enum NativeTextModelLoader {
         }
         let configuration = try JSONDecoder().decode(Qwen35Configuration.self, from: data)
         let model = Qwen35MTPDraftModel(configuration, preconvertedNorms: true)
+        try await loadWeights(
+            modelDirectory: directory, model: model,
+            perLayerQuantization: base.perLayerQuantization)
+        return model
+    }
+
+    /// Loads either the Qwen MTP head or the published trained DFlash2 drafter.
+    public static func loadSpeculativeDrafter(directory: URL) async throws
+        -> sending any IncrementalMTPDrafterModel
+    {
+        let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
+        let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
+        if base.modelType == "qwen3_5_mtp" {
+            return try await loadMTP(directory: directory)
+        }
+        guard base.modelType == "qwen3" else {
+            throw ConcurrentTextRuntimeError.invalidConfiguration
+        }
+        let configuration = try JSONDecoder().decode(DFlash2Configuration.self, from: data)
+        try configuration.validateModelConfiguration()
+        let model = DFlash2DraftModel(configuration)
         try await loadWeights(
             modelDirectory: directory, model: model,
             perLayerQuantization: base.perLayerQuantization)
@@ -413,6 +434,12 @@ public enum NativeTextModelLoader {
                 configuration.textConfig,
                 mixedPreservedNorms: configuration.mixedPreservedNorms)
             tensorNameSelection = qwen35ResidentTensorSelection
+        case "prism_hadamard_qwen35":
+            let configuration = try JSONDecoder().decode(
+                PrismHadamardQwen35Configuration.self, from: data)
+            try configuration.validateModelConfiguration()
+            model = PrismHadamardQwen35Model(configuration)
+            tensorNameSelection = .all
         default:
             throw ConcurrentTextRuntimeError.unsupportedCache
         }

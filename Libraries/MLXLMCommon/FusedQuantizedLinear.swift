@@ -153,11 +153,20 @@ package func fuseQuantizedLinearProjections(
     guard linears.count > 1 else { return nil }
 
     let projections = linears.compactMap { $0 as? QuantizedLinear }
-    guard projections.count == linears.count,
-        zip(linears, projections).allSatisfy({ linear, projection in
-            ObjectIdentifier(type(of: linear)) == ObjectIdentifier(QuantizedLinear.self)
-                && linear === projection
-        }),
+    let stock = zip(linears, projections).allSatisfy { linear, projection in
+        ObjectIdentifier(type(of: linear)) == ObjectIdentifier(QuantizedLinear.self)
+            && linear === projection
+    }
+    let transformed = linears.compactMap { $0 as? HadamardQuantizedLinear }
+    let transform = transformed.first?.transform
+    let compatibleTransforms =
+        transformed.count == linears.count && transform != nil
+        && transformed.allSatisfy {
+            $0.transform.direction == .forward
+                && $0.transform.isCompatible(with: transform!)
+        }
+
+    guard projections.count == linears.count, stock || compatibleTransforms,
         let first = projections.first,
         first.bias == nil,
         first.weight.ndim == 2,
@@ -209,14 +218,17 @@ package func fuseQuantizedLinearProjections(
         eval(fusedBiases)
     }
 
-    let fused = QuantizedLinear(
-        weight: fusedWeight,
-        bias: nil,
-        scales: fusedScales,
-        biases: fusedBiases,
-        groupSize: first.groupSize,
-        bits: first.bits,
-        mode: first.mode)
+    let fused: QuantizedLinear
+    if let transform, compatibleTransforms {
+        fused = HadamardQuantizedLinear(
+            weight: fusedWeight, bias: nil, scales: fusedScales, biases: fusedBiases,
+            groupSize: first.groupSize, bits: first.bits, mode: first.mode,
+            globalScale: nil, transform: transform)
+    } else {
+        fused = QuantizedLinear(
+            weight: fusedWeight, bias: nil, scales: fusedScales, biases: fusedBiases,
+            groupSize: first.groupSize, bits: first.bits, mode: first.mode)
+    }
     fused.freeze()
 
     var start = 0
@@ -225,14 +237,19 @@ package func fuseQuantizedLinearProjections(
         defer { start = end }
 
         let rows = start ..< end
-        let view = QuantizedLinear(
-            weight: fusedWeight[rows],
-            bias: nil,
-            scales: fusedScales[rows],
-            biases: fusedBiases.map { $0[rows] },
-            groupSize: first.groupSize,
-            bits: first.bits,
-            mode: first.mode)
+        let view: QuantizedLinear
+        if let transform, compatibleTransforms {
+            view = HadamardQuantizedLinear(
+                weight: fusedWeight[rows], bias: nil, scales: fusedScales[rows],
+                biases: fusedBiases.map { $0[rows] }, groupSize: first.groupSize,
+                bits: first.bits, mode: first.mode, globalScale: nil,
+                transform: transform)
+        } else {
+            view = QuantizedLinear(
+                weight: fusedWeight[rows], bias: nil, scales: fusedScales[rows],
+                biases: fusedBiases.map { $0[rows] }, groupSize: first.groupSize,
+                bits: first.bits, mode: first.mode)
+        }
         view.freeze()
         return view
     }

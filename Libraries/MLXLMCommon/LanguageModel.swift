@@ -17,6 +17,32 @@ public protocol BaseLanguageModel: Module {
     func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
 }
 
+/// A model whose checkpoint includes sidecar metadata needed before weights are loaded.
+///
+/// Factories call this after creating the model and before loading any tensor payloads.
+/// Direct users of `loadWeights(...)`
+/// receive the same preparation automatically.
+public protocol ModelArtifactPreparing {
+    func prepareArtifact(in modelDirectory: URL) throws
+}
+
+/// A model that must replace or validate modules after checkpoint parameters are installed.
+public protocol LoadedWeightsPreparing {
+    func prepareLoadedWeights() throws
+}
+
+/// Lets a model exclude unrelated tensors before lazy safetensor arrays are materialized.
+///
+/// This is primarily useful for text-only loading from a combined text-and-vision artifact.
+public protocol WeightTensorSelecting {
+    func shouldLoadWeightTensor(named name: String) -> Bool
+}
+
+/// Supplies immutable artifact contracts that must participate in persistent cache identity.
+public protocol InferenceArtifactIdentityProviding {
+    var transformContractRevision: String { get }
+}
+
 /// Weight files a model needs that no naming convention or `model.safetensors.index.json`
 /// selects.
 ///

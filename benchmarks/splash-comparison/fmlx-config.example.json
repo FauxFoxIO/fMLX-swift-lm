@@ -1,0 +1,25 @@
+{
+  "models": [
+    {
+      "name": "matched-qwen3.8-27b",
+      "targetPath": "/replace/with/matched/target",
+      "drafter": {
+        "kind": "standalone",
+        "path": "/replace/with/matched/dflash2-drafter"
+      }
+    }
+  ],
+  "promptLengths": [512, 8192],
+  "prefillChunkSize": 128,
+  "outputTokens": 256,
+  "trials": 9,
+  "warmupTrials": 2,
+  "modes": ["ordinary", "mtp"],
+  "prefixWorkloads": ["uncached", "warmPrefix"],
+  "prompt": "Assess this design proposal for a local text-generation runtime. Explain the trade-offs among prefix caching, bounded memory, fair request admission, and deterministic token generation. Give concrete guidance that another engineer can apply without a UI.",
+  "systemPrompt": "You are a careful systems engineer. Give a concise, accurate technical answer.",
+  "speculativeBlockSize": 4,
+  "speculativeAdaptationEnabled": false,
+  "concurrentRequests": 1,
+  "batchDecode": true
+}

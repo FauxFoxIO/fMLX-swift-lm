@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/fauxfox/fmlx-swift-lm/benchmarks/splash-comparison/sample.schema.json",
+  "title": "Normalized Splash comparison sample",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "protocolId", "sessionId", "engine", "workload", "trial",
+    "warmup", "pairIndex", "pairOrder", "valid", "input", "output", "sampler",
+    "cache", "timing", "memory", "speculation"
+  ],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "protocolId": {"type": "string"},
+    "sessionId": {"type": "string"},
+    "engine": {"type": "string"},
+    "workload": {"type": "string"},
+    "trial": {"type": "integer", "minimum": 0},
+    "warmup": {"type": "boolean"},
+    "pairIndex": {"type": "integer", "minimum": 0},
+    "pairOrder": {
+      "type": "array",
+      "minItems": 2,
+      "items": {"type": "string"}
+    },
+    "valid": {"type": "boolean"},
+    "invalidReason": {"type": ["string", "null"]},
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requests", "promptTokenCounts", "renderedTokenSHA256"],
+      "properties": {
+        "requests": {"type": "integer", "minimum": 1},
+        "promptTokenCounts": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+        "renderedTokenSHA256": {"type": "array", "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestedTokensPerRequest", "generatedTokenCounts", "generatedTokenSHA256", "stopReasons"],
+      "properties": {
+        "requestedTokensPerRequest": {"type": "integer", "minimum": 1},
+        "generatedTokenCounts": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+        "generatedTokenSHA256": {"type": "array", "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+        "stopReasons": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "sampler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["temperature", "topP", "topK", "seed"],
+      "properties": {
+        "temperature": {"type": "number"},
+        "topP": {"type": "number"},
+        "topK": {"type": "integer"},
+        "seed": {"type": "integer"}
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "reusedPrefixTokens"],
+      "properties": {
+        "state": {"enum": ["cold", "warm-prefix"]},
+        "reusedPrefixTokens": {"type": "array", "items": {"type": "integer", "minimum": 0}}
+      }
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ttftMilliseconds", "requestTTFTMilliseconds", "prefillTokensPerSecond", "decodeTokensPerSecond", "requestDecodeTokensPerSecond", "endToEndMilliseconds", "aggregateTokensPerSecond"],
+      "properties": {
+        "ttftMilliseconds": {"type": ["number", "null"], "minimum": 0},
+        "requestTTFTMilliseconds": {"type": "array", "items": {"type": "number", "minimum": 0}},
+        "prefillTokensPerSecond": {"type": ["number", "null"], "minimum": 0},
+        "decodeTokensPerSecond": {"type": ["number", "null"], "minimum": 0},
+        "requestDecodeTokensPerSecond": {"type": "array", "items": {"type": "number", "minimum": 0}},
+        "endToEndMilliseconds": {"type": ["number", "null"], "minimum": 0},
+        "aggregateTokensPerSecond": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["peakResidentBytes", "steadyResidentBytes", "peakMLXBytes", "cachedMLXBytes"],
+      "properties": {
+        "peakResidentBytes": {"type": ["integer", "null"], "minimum": 0},
+        "steadyResidentBytes": {"type": ["integer", "null"], "minimum": 0},
+        "peakMLXBytes": {"type": ["integer", "null"], "minimum": 0},
+        "cachedMLXBytes": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "speculation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["targetForwardCount", "draftProposedTokens", "draftAcceptedTokens", "draftRounds", "fallbacks"],
+      "properties": {
+        "targetForwardCount": {"type": ["integer", "null"], "minimum": 0},
+        "draftProposedTokens": {"type": ["integer", "null"], "minimum": 0},
+        "draftAcceptedTokens": {"type": ["integer", "null"], "minimum": 0},
+        "draftRounds": {"type": ["integer", "null"], "minimum": 0},
+        "fallbacks": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

@@ -143,7 +143,10 @@ public struct Qwen35ProcessorLoadingResolver: VLMProcessorLoadingResolver {
     public func fallbackProcessorConfiguration(
         for context: VLMProcessorLoadingContext
     ) throws -> VLMProcessorConfiguration? {
-        guard context.modelType == "qwen3_5" || context.modelType == "qwen3_5_moe" else {
+        guard
+            context.modelType == "qwen3_5" || context.modelType == "qwen3_5_moe"
+                || context.modelType == "prism_hadamard_qwen35"
+        else {
             return nil
         }
 

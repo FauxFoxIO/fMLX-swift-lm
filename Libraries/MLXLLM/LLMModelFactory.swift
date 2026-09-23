@@ -42,6 +42,13 @@ private func createQwen3CompatibleModel(configuration data: Data) throws -> any 
     return Qwen3Model(configuration)
 }
 
+private func createPrismHadamardQwen35(configuration data: Data) throws -> any LanguageModel {
+    let configuration = try JSONDecoder.json5().decode(
+        PrismHadamardQwen35Configuration.self, from: data)
+    try configuration.validateModelConfiguration()
+    return PrismHadamardQwen35Model(configuration)
+}
+
 /// Registry of model type, e.g 'llama', to functions that can instantiate the model from configuration.
 ///
 /// Typically called via ``LLMModelFactory/loadContainer(from:using:configuration:useLatest:progressHandler:)``.
@@ -70,6 +77,7 @@ public enum LLMTypeRegistry {
         "qwen3_5": create(Qwen35Configuration.self) { Qwen35Model($0) },
         "qwen3_5_moe": create(Qwen35Configuration.self) { Qwen35MoEModel($0) },
         "qwen3_5_text": create(Qwen35TextConfiguration.self) { Qwen35TextModel($0) },
+        "prism_hadamard_qwen35": createPrismHadamardQwen35,
         "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
         "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
         "starcoder2": create(Starcoder2Configuration.self, Starcoder2Model.init),
@@ -359,6 +367,12 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<|im_end|>"]
     )
 
+    static public let underdogWoof4B11 = ModelConfiguration(
+        id: "ConwayResearch/Underdog-Woof-4B-1.1",
+        revision: "cf5f8db5409258e73303b78e112051fc443cb02b",
+        defaultPrompt: "Write a Swift function that returns the factorial of a nonnegative integer."
+    )
+
     static public let qwen3_6_27b_4bit = ModelConfiguration(
         id: "mlx-community/Qwen3.6-27B-4bit",
         defaultPrompt: "Why is the sky blue?",
@@ -556,6 +570,7 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             jina_reranker_v3_mlx,
             qwen3MoE_30b_a3b_4bit,
             qwen3_5_2b_4bit,
+            underdogWoof4B11,
             qwen3_6_27b_4bit,
             smolLM_135M_4bit,
             deepseek_r1_4bit,

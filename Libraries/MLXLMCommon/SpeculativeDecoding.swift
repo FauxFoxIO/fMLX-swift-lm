@@ -43,7 +43,7 @@ public struct SpeculativeDecodingTelemetry: Sendable, Equatable {
     /// Number of speculative decoding rounds.
     public private(set) var roundCount: Int
 
-    /// Number of tokens proposed by the draft model.
+    /// Number of proposed tokens, from a draft model or prompt lookup.
     public private(set) var draftTokenCount: Int
 
     /// Number of draft tokens accepted by the target model.
@@ -52,7 +52,7 @@ public struct SpeculativeDecodingTelemetry: Sendable, Equatable {
     /// Number of target-model verification calls.
     public private(set) var targetModelCallCount: Int
 
-    /// Number of draft-model calls.
+    /// Number of draft-model calls. Prompt lookup records zero.
     public private(set) var draftModelCallCount: Int
 
     /// Number of token positions evaluated by the target model during verification.

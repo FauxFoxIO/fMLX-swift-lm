@@ -944,14 +944,21 @@ final class Qwen35DecoderLayer: Module {
         checkpointAfter: Int? = nil,
         checkpointIndices: [Int] = []
     ) -> MLXArray {
+        let verificationIndices = Array(
+            Set(checkpointIndices + (checkpointAfter.map { [$0] } ?? []))
+        ).sorted()
+        let isCompiledVerificationShape =
+            (x.dim(1) == 2 && verificationIndices == [1])
+            || (x.dim(1) == 4 && verificationIndices == [1, 2, 3])
         if !recoverLoRAEnabled,
-            compiledVerificationEnabled, x.dim(1) == 2, checkpointAfter == 1, ssmMask == nil,
+            compiledVerificationEnabled, isCompiledVerificationShape, ssmMask == nil,
             positionOffset == nil
         {
             if isLinear, let mambaCache = cache as? MambaCache,
                 mambaCache[0] != nil, mambaCache[1] != nil
             {
-                return verifyLinearLayer(x, cache: mambaCache)
+                return verifyLinearLayer(
+                    x, cache: mambaCache, checkpointIndices: verificationIndices)
             }
             if !isLinear, let cache, usesPlainAttentionCacheRoute(cache) {
                 return decodeAttentionLayer(x, mask: attentionMask, cache: cache)
@@ -1043,6 +1050,7 @@ final class Qwen35DecoderLayer: Module {
     var fusedVerificationCheckpointEnabled = true
     var hasCompiledVerificationLayer: Bool {
         compiledVerificationLayer.isCompiled || compiledCheckpointVerificationLayer.isCompiled
+            || compiledFourCheckpointVerificationLayer.isCompiled
     }
 
     private let compiledVerificationLayer = CompiledTrace<Qwen35DecoderLayer> { layer, args in
@@ -1054,29 +1062,48 @@ final class Qwen35DecoderLayer: Module {
         layer.verificationLayerBody(args, fusedCheckpoint: true)
     }
 
-    private func verificationLayerBody(_ args: [MLXArray], fusedCheckpoint: Bool) -> [MLXArray] {
+    private let compiledFourCheckpointVerificationLayer = CompiledTrace<Qwen35DecoderLayer> {
+        layer, args in
+        layer.verificationLayerBody(args, checkpointIndices: [1, 2, 3])
+    }
+
+    private func verificationLayerBody(
+        _ args: [MLXArray], fusedCheckpoint: Bool = false,
+        checkpointIndices: [Int] = [1]
+    ) -> [MLXArray] {
         let (r, conv, recurrent, checkpoints) = linearAttn!.forward(
             inputLayerNorm(args[0]), convState: args[1], recState: args[2],
-            mask: nil, checkpointAfter: 1, fusedCheckpoint: fusedCheckpoint)
-        let checkpoint = checkpoints[0]
+            mask: nil, checkpointIndices: checkpointIndices,
+            fusedCheckpoint: fusedCheckpoint)
         let h = args[0] + r
-        return [
-            h + mlpForward(postAttentionLayerNorm(h)), conv, recurrent,
-            checkpoint.conv, checkpoint.recurrent,
-        ]
+        return [h + mlpForward(postAttentionLayerNorm(h)), conv, recurrent]
+            + checkpoints.flatMap { [$0.conv, $0.recurrent] }
     }
 
     // Keep the committed-token checkpoint explicit; cache mutation stays outside the trace.
-    private func verifyLinearLayer(_ x: MLXArray, cache: MambaCache) -> MLXArray {
-        let trace =
-            fusedVerificationCheckpointEnabled
-            ? compiledCheckpointVerificationLayer : compiledVerificationLayer
+    private func verifyLinearLayer(
+        _ x: MLXArray, cache: MambaCache, checkpointIndices: [Int]
+    ) -> MLXArray {
+        let trace: CompiledTrace<Qwen35DecoderLayer>
+        switch x.dim(1) {
+        case 2:
+            trace =
+                fusedVerificationCheckpointEnabled
+                ? compiledCheckpointVerificationLayer : compiledVerificationLayer
+        case 4:
+            trace = compiledFourCheckpointVerificationLayer
+        default:
+            preconditionFailure("Unsupported compiled verification width")
+        }
         let out = trace(self, [x, cache[0]!, cache[1]!])
         cache[0] = out[1]
         cache[1] = out[2]
-        cache.saveSpeculativeCheckpoint(
-            convState: out[3], recurrentState: out[4], advancedBy: 1)
-        cache.advance(2)
+        for (position, index) in checkpointIndices.enumerated() {
+            cache.saveSpeculativeCheckpoint(
+                convState: out[3 + 2 * position], recurrentState: out[4 + 2 * position],
+                advancedBy: index, rewinding: x.dim(1) - index)
+        }
+        cache.advance(x.dim(1))
         return out[0]
     }
 
@@ -1247,7 +1274,6 @@ public class Qwen35TextModelInner: Module {
             body: { model, index, arguments in
                 model.segmentBody(at: index, arguments)
             })
-
         super.init()
     }
 
@@ -1329,11 +1355,30 @@ public class Qwen35TextModelInner: Module {
         checkpointAfter: Int? = nil,
         checkpointIndices: [Int] = []
     ) -> MLXArray {
-        if !recoverLoRAEnabled,
+        forwardCapturing(
+            inputs, cache: cache, applyFinalNorm: applyFinalNorm,
+            checkpointAfter: checkpointAfter, checkpointIndices: checkpointIndices,
+            layerIDs: []
+        ).hidden
+    }
+
+    func forwardCapturing(
+        _ inputs: MLXArray,
+        cache: [KVCache?]? = nil,
+        applyFinalNorm: Bool,
+        checkpointAfter: Int? = nil,
+        checkpointIndices: [Int] = [],
+        layerIDs: [Int]
+    ) -> (hidden: MLXArray, captures: [MLXArray]) {
+        precondition(
+            Set(layerIDs).count == layerIDs.count
+                && layerIDs.allSatisfy { layers.indices.contains($0) },
+            "Qwen 3.5 hidden capture layer IDs must be unique and in range")
+        if layerIDs.isEmpty, !recoverLoRAEnabled,
             applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
             let step = decodeStep(inputs, caches)
         {
-            return step
+            return (step, [])
         }
 
         var hiddenStates = embedTokens(inputs)
@@ -1346,6 +1391,8 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
+        let requested = Set(layerIDs)
+        var captured = [Int: MLXArray]()
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -1354,9 +1401,13 @@ public class Qwen35TextModelInner: Module {
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i],
                 checkpointAfter: checkpointAfter, checkpointIndices: checkpointIndices)
+            if requested.contains(i) { captured[i] = hiddenStates }
         }
 
-        return applyFinalNorm ? norm(hiddenStates) : hiddenStates
+        return (
+            applyFinalNorm ? norm(hiddenStates) : hiddenStates,
+            layerIDs.compactMap { captured[$0] }
+        )
     }
 
     func attachRecoverLoRA(_ adapter: Edge0Qwen35RecoverLoRA) throws {
@@ -1497,7 +1548,6 @@ public class Qwen35TextModelInner: Module {
     /// one (whose SDPA runs between this segment and the next).
     private let decodeSegments: [CompiledDecodeSegment]
     private let compiledSegments: CompiledDecodeSegmentCache<Qwen35TextModelInner>
-
     var compiledDecodeSegmentCount: Int { compiledSegments.compiledCount }
 
     /// Flat argument/result lists because `compile` takes `[MLXArray]`.
@@ -1720,17 +1770,24 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
         let emitDrafterState = state?[mtpEmitFlagKey] ?? false
+        let checkpointOnly = state?[speculativeCheckpointOnlyKey] ?? false
         let finalPrefillLogitsOnly =
             emitDrafterState && (state?[mtpFinalPrefillLogitsOnlyKey] ?? false)
         let hiddenStates: MLXArray
-        if emitDrafterState {
-            let hidden = model.forward(
+        let drafterHiddenStates: MLXArray
+        if emitDrafterState || checkpointOnly {
+            let captured = model.forwardCapturing(
                 input.tokens, cache: cache, applyFinalNorm: false,
                 checkpointAfter: state?[mtpCacheCheckpointIndexKey],
-                checkpointIndices: state?[mtpCacheCheckpointIndicesKey] ?? [])
-            hiddenStates = model.norm(hidden)
+                checkpointIndices: state?[mtpCacheCheckpointIndicesKey] ?? [],
+                layerIDs: state?[mtpHiddenLayerIDsKey] ?? [])
+            hiddenStates = model.norm(captured.hidden)
+            drafterHiddenStates =
+                captured.captures.isEmpty
+                ? hiddenStates : concatenated(captured.captures, axis: -1)
         } else {
             hiddenStates = model(input.tokens, cache: cache)
+            drafterHiddenStates = hiddenStates
         }
 
         let logitsInput: MLXArray
@@ -1739,12 +1796,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         } else {
             logitsInput = hiddenStates
         }
-        let logits: MLXArray
-        if let lmHead {
-            logits = lmHead(logitsInput)
-        } else {
-            logits = model.embedTokens.asLinear(logitsInput)
-        }
+        let logits = projectLogits(logitsInput)
 
         guard emitDrafterState else {
             return LMOutput(logits: logits)
@@ -1752,7 +1804,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
         var outState = state ?? LMOutput.State()
         outState[mtpFinalPrefillLogitsOnlyKey] = nil
-        outState[mtpLastHiddenStatesKey] = hiddenStates
+        outState[mtpLastHiddenStatesKey] = drafterHiddenStates
         outState[mtpSharedKVStatesKey] = qwen35SharedKVState(
             cache: cache, fullAttentionIndex: model.faIdx)
         outState[mtpSharedKVOffsetsKey] = qwen35SharedKVOffsets(
@@ -1854,7 +1906,7 @@ extension Qwen35TextModel: LoRAModel {
     }
 }
 
-extension Qwen35TextModel: SpeculativeCacheRewindModel {
+extension Qwen35TextModel: PromptLookupHybridModel {
     public var maximumNativeTargetCacheRewind: Int { 3 }
 }
 
@@ -1973,7 +2025,7 @@ extension Qwen35Model: LoRAModel {
     }
 }
 
-extension Qwen35Model: SpeculativeCacheRewindModel {
+extension Qwen35Model: PromptLookupHybridModel {
     public var maximumNativeTargetCacheRewind: Int { 3 }
 }
 

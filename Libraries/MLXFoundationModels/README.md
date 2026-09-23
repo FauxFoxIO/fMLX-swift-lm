@@ -79,6 +79,18 @@ Declare what a model may do with the `capabilities:` list at construction. Decla
 | `.reasoning` | Run "thinking" models that emit a reasoning trace. |
 | `.vision` | Accept image inputs. |
 
+Guided requests reuse compiled schemas and tool grammars through independent,
+fresh matchers. The process-local cache retains at most 256 grammars and 8 MiB
+of source-key bytes; larger grammars still run without being retained. Cold
+compilation runs outside the model-cache actor, and concurrent requests for the
+same grammar share one compilation. Eviction drops both retained grammars and
+in-flight registrations without restoring stale entries.
+
+On an M4 Max with macOS 27.0, a Debug microbenchmark of a two-property schema
+measured 32 fresh matchers plus initial masks in 0.18 ms total, versus 80.84 ms
+for 32 full compilations plus masks. This measures grammar setup, not response
+latency; `FreshConstraintInstanceTests` contains the opt-in benchmark.
+
 ## Availability
 
 `MLXLanguageModel` exposes an `availability` property — `.available`, `.downloading`, `.unavailable(...)` — for gating on model and download state.

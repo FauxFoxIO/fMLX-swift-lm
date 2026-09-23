@@ -8,10 +8,16 @@ import MLXNN
 public struct MTPDraft {
     public let tokens: MLXArray
     public let logits: MLXArray
+    /// Exact proposal log-probabilities when the drafter uses a specialized
+    /// candidate distribution rather than the target sampler's full filter chain.
+    public let logProbabilities: MLXArray?
 
-    public init(tokens: MLXArray, logits: MLXArray) {
+    public init(
+        tokens: MLXArray, logits: MLXArray, logProbabilities: MLXArray? = nil
+    ) {
         self.tokens = tokens
         self.logits = logits
+        self.logProbabilities = logProbabilities
     }
 }
 
@@ -49,6 +55,10 @@ public protocol MTPDrafterModel: BaseLanguageModel {
     /// Whether the drafter must be prefilled over the shifted prompt before
     /// its first proposal. Qwen's private decoder cache requires this.
     var requiresPromptPrefill: Bool { get }
+
+    /// Target decoder layers whose outputs are concatenated for draft conditioning.
+    /// `nil` requests the target's ordinary final hidden representation.
+    var targetHiddenLayerIDs: [Int]? { get }
 
     /// K-step drafting from a constant position.
     ///
@@ -95,6 +105,7 @@ extension MTPDrafterModel {
     public var maximumBlockSize: Int? { nil }
     public var requiresSharedTargetKV: Bool { true }
     public var requiresPromptPrefill: Bool { false }
+    public var targetHiddenLayerIDs: [Int]? { nil }
 }
 
 /// Target-side capability for rewinding an in-place speculative verify pass.
@@ -105,6 +116,11 @@ extension MTPDrafterModel {
 public protocol SpeculativeCacheRewindModel {
     var maximumNativeTargetCacheRewind: Int { get }
 }
+
+/// A hybrid target that checkpoints recurrent state without emitting drafter tensors.
+/// Conformers honor ``speculativeCheckpointOnlyKey``, return every verifier logit row,
+/// and retain each requested rewind boundary up to `maximumNativeTargetCacheRewind`.
+public protocol PromptLookupHybridModel: SpeculativeCacheRewindModel {}
 
 /// Per-stream state for MTP drafters that need their own transient storage.
 ///
@@ -318,6 +334,13 @@ public let mtpPositionDeltasKey =
 /// ``mtpLastHiddenStatesKey`` and ``mtpSharedKVStatesKey``. An absent key
 /// reads as `false` (no emit), so non-MTP callers are unaffected.
 public let mtpEmitFlagKey = LMOutput.Key<Bool>("mtp.emitDrafterState")
+
+/// Requests only recurrent checkpoints at the positions named by the MTP checkpoint keys.
+public let speculativeCheckpointOnlyKey =
+    LMOutput.Key<Bool>("speculative.checkpointOnly")
+
+/// Decoder layers the target must capture for a drafter such as DFlash2.
+public let mtpHiddenLayerIDsKey = LMOutput.Key<[Int]>("mtp.hiddenLayerIDs")
 
 /// Requests logits only for the final row of an incremental MTP prompt
 /// prefill. Targets must still emit full hidden and shared-K/V state for the

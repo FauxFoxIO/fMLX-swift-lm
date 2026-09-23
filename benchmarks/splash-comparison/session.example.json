@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "protocolId": "fmlx-splash-same-machine-v1",
+  "sessionId": "replace-with-stable-session-id",
+  "collectedAtUTC": "2026-09-18T00:00:00Z",
+  "host": {
+    "hardwareModel": "replace",
+    "chip": "replace",
+    "cpuCores": null,
+    "gpuCores": null,
+    "memoryBytes": null,
+    "osVersion": "replace",
+    "osBuild": "replace",
+    "xcodeVersion": "replace",
+    "swiftVersion": "replace",
+    "metalCompilerVersion": "replace",
+    "powerSource": "AC",
+    "lowPowerMode": false
+  },
+  "models": {
+    "target": {
+      "modelId": "replace",
+      "revision": "replace-with-immutable-revision",
+      "sourceWeightSHA256": "replace",
+      "conversionProvenance": "replace-or-not-applicable"
+    },
+    "draft": {
+      "modelId": "replace",
+      "revision": "replace-with-immutable-revision",
+      "sourceWeightSHA256": "replace",
+      "conversionProvenance": "replace-or-not-applicable"
+    }
+  },
+  "engines": [
+    {
+      "id": "fmlx-dflash2",
+      "revision": "replace-with-git-commit",
+      "backendVersion": "replace-with-MLX-version",
+      "buildConfiguration": "Release",
+      "accelerationState": "DFlash2 enabled",
+      "targetWeightRepresentation": "replace",
+      "targetArtifactSHA256": "replace",
+      "draftWeightRepresentation": "replace",
+      "draftArtifactSHA256": "replace",
+      "command": ["replace-with-exact-command-and-arguments"]
+    },
+    {
+      "id": "splash-accelerated",
+      "revision": "replace-with-git-commit-or-installed-build",
+      "backendVersion": "replace",
+      "buildConfiguration": "Release",
+      "accelerationState": "replace-with-source-or-protocol evidence for native DFlash and compressed KV",
+      "targetWeightRepresentation": "replace",
+      "targetArtifactSHA256": "replace",
+      "draftWeightRepresentation": "replace",
+      "draftArtifactSHA256": "replace",
+      "command": ["replace-with-exact-command-and-arguments"]
+    },
+    {
+      "id": "fmlx-ordinary",
+      "revision": "replace-with-same-fMLX-git-commit",
+      "backendVersion": "replace-with-MLX-version",
+      "buildConfiguration": "Release",
+      "accelerationState": "speculation disabled",
+      "targetWeightRepresentation": "replace",
+      "targetArtifactSHA256": "replace",
+      "draftWeightRepresentation": null,
+      "draftArtifactSHA256": null,
+      "command": ["replace-with-exact-command-and-arguments"]
+    }
+  ],
+  "rawEvidence": {
+    "directory": "replace-with-cache-path",
+    "samplesSHA256": "replace-after-collection",
+    "notes": []
+  }
+}

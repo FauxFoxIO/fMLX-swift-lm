@@ -481,13 +481,13 @@ public final class GrammarConstraint: @unchecked Sendable {
         self.forkParent = nil
     }
 
-    /// Private initializer used by `clone()`. Adopts the already-forked
-    /// matcher handle and records that this constraint is *not*
+    /// Adopts a matcher that shares this constraint's compiled grammar.
+    /// This constraint is *not*
     /// responsible for freeing the shared `compiler` / `compiled`
     /// handles — those belong to `forkParent`, which is retained here
     /// so its `deinit` is deferred past this fork's own lifetime.
     private init(
-        fromFork matcherHandle: OpaquePointer,
+        sharingCompiledGrammar matcherHandle: OpaquePointer,
         parent: GrammarConstraint
     ) {
         self.tokenizer = parent.tokenizer
@@ -730,7 +730,23 @@ public final class GrammarConstraint: @unchecked Sendable {
                 Self.captureShimError(status: status, fallback: "xg_matcher_fork")
             )
         }
-        return GrammarConstraint(fromFork: forkedHandle, parent: self)
+        return GrammarConstraint(sharingCompiledGrammar: forkedHandle, parent: self)
+    }
+
+    /// Creates a matcher at the grammar's initial state without recompiling it.
+    /// This does not copy the current matcher state; use `clone()` for that.
+    public func freshInstance() throws -> GrammarConstraint {
+        lock.lock()
+        defer { lock.unlock() }
+
+        var matcherHandle: OpaquePointer?
+        let status = xg_matcher_new(compiled, &matcherHandle)
+        guard status == XG_OK, let matcherHandle else {
+            throw GrammarError.constraintCompilationFailed(
+                Self.captureShimError(status: status, fallback: "xg_matcher_new")
+            )
+        }
+        return GrammarConstraint(sharingCompiledGrammar: matcherHandle, parent: self)
     }
 
     /// Query termination while already holding `lock`. Named `Locked`

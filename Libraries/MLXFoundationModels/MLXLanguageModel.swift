@@ -23,7 +23,7 @@ import MLXGuidedGeneration
 /// Selects which xgrammar constructor a cached template was compiled
 /// with. Used by the constraint cache so a JSON-schema source and a
 /// structural-tag source can never alias even if their text collides.
-enum ConstraintKind {
+enum ConstraintKind: Sendable {
     case json
     case structuralTag
 }
@@ -62,6 +62,11 @@ private actor ModelCache {
         init(_ task: Task<ModelContainer, Error>) { self.task = task }
     }
 
+    private final class ConstraintCompileTask {
+        let task: Task<GrammarConstraint, Error>
+        init(_ task: Task<GrammarConstraint, Error>) { self.task = task }
+    }
+
     private var containers: [String: ModelContainer] = [:]
     private var loadingTasks: [String: LoadTask] = [:]
     /// In-flight loads tagged as a warmup of an already-present model, which
@@ -69,9 +74,10 @@ private actor ModelCache {
     /// A subset of `loadingTasks`' keys. See `load` and `isDownloading`.
     private var suppressedLoadIDs: Set<String> = []
     private var xgTokenizers: [String: GrammarTokenizer] = [:]
-    /// Cached compiled constraint templates keyed by (modelID, schemaJSON).
-    /// Clone from template instead of recompiling the grammar each request.
-    private var constraintTemplates: [String: GrammarConstraint] = [:]
+    /// Reuse compiled grammars while bounding retained source keys and handles.
+    private var constraintTemplates = ConstraintTemplateCache<GrammarConstraint>(
+        maximumEntries: 256, maximumSourceBytes: 8 * 1_024 * 1_024)
+    private var compilingConstraints: [String: ConstraintCompileTask] = [:]
     /// Cached per-model logit biases (closing + whitespace). Pure functions of
     /// the tokenizer, so computed once per model and reused across requests.
     private var tokenizerBiases: [String: TokenizerBias] = [:]
@@ -79,6 +85,10 @@ private actor ModelCache {
     /// load. Surfaced through `MLXLanguageModel.availability` so callers can
     /// distinguish "never tried" from "tried and failed".
     private var lastErrors: [String: any Error] = [:]
+
+    private static func constraintCachePrefix(modelID: String) -> String {
+        "\(modelID.utf8.count):\(modelID):"
+    }
 
     /// Gets the cached model container for the given model ID, loading it if necessary.
     /// Concurrent callers for the same model will share the same loading task, preventing duplicate loads.
@@ -210,50 +220,62 @@ private actor ModelCache {
         return bias
     }
 
-    /// Gets a fresh constraint by cloning a cached template, or compiles and caches one first.
+    /// Gets a fresh matcher from a cached grammar, or compiles the grammar first.
     ///
-    /// Grammar compilation is expensive (~5-20ms). By caching the compiled template
-    /// and cloning it (~0.1ms), repeated requests with the same schema skip recompilation.
-    /// When Fork() is unavailable (xgrammar < v0.1.34), the clone attempt fails gracefully
-    /// and each request compiles a fresh constraint instead.
+    /// A cached template lets repeated requests skip grammar compilation.
+    /// Cold compiles run outside the actor and same-key callers share one task.
     func makeConstraint(
         modelID: String,
         kind: ConstraintKind,
         source: String,
-        tokenizer: GrammarTokenizer,
-        hostTokenizer: any Tokenizer,
-        fastForward: Bool
-    ) throws -> GrammarConstraint {
-        let cacheKey = "\(modelID):\(kind):\(source)"
-        if let template = constraintTemplates[cacheKey] {
+        fastForward: Bool,
+        compile: @Sendable @escaping () throws -> GrammarConstraint
+    ) async throws -> GrammarConstraint {
+        let cacheKey =
+            "\(Self.constraintCachePrefix(modelID: modelID))\(kind):\(fastForward):\(source)"
+        if let template = constraintTemplates.value(for: cacheKey) {
             do {
-                return try template.clone()
-            } catch GrammarError.forkFailed {
-                constraintTemplates.removeValue(forKey: cacheKey)
+                return try template.freshInstance()
+            } catch GrammarError.constraintCompilationFailed {
+                constraintTemplates.removeValue(for: cacheKey)
             }
         }
-        let constraint: GrammarConstraint
-        switch kind {
-        case .json:
-            constraint = try GrammarConstraint(
-                tokenizer: tokenizer,
-                jsonSchema: source,
-                fastForward: fastForward,
-                hostTokenizer: hostTokenizer
-            )
-        case .structuralTag:
-            constraint = try GrammarConstraint(
-                tokenizer: tokenizer,
-                structuralTag: source,
-                fastForward: fastForward,
-                hostTokenizer: hostTokenizer
-            )
+
+        let compilation: ConstraintCompileTask
+        let ownsCompilation: Bool
+        if let pending = compilingConstraints[cacheKey] {
+            compilation = pending
+            ownsCompilation = false
+        } else {
+            compilation = ConstraintCompileTask(
+                Task.detached(priority: Task.currentPriority, operation: compile))
+            compilingConstraints[cacheKey] = compilation
+            ownsCompilation = true
         }
-        if let cloned = try? constraint.clone() {
-            constraintTemplates[cacheKey] = constraint
-            return cloned
+
+        do {
+            let template = try await compilation.task.value
+            if ownsCompilation && compilingConstraints[cacheKey] === compilation {
+                compilingConstraints.removeValue(forKey: cacheKey)
+                if constraintTemplates.canRetain(cacheKey),
+                    let fresh = try? template.freshInstance()
+                {
+                    constraintTemplates.insert(template, for: cacheKey)
+                    return fresh
+                }
+                return template
+            }
+            if let fresh = try? template.freshInstance() {
+                return fresh
+            }
+            if ownsCompilation { return template }
+            return try await Task.detached(priority: Task.currentPriority, operation: compile).value
+        } catch {
+            if ownsCompilation && compilingConstraints[cacheKey] === compilation {
+                compilingConstraints.removeValue(forKey: cacheKey)
+            }
+            throw error
         }
-        return constraint
     }
 
     /// Evicts all cached state: model containers, tokenizers, constraint
@@ -266,6 +288,7 @@ private actor ModelCache {
         suppressedLoadIDs.removeAll()
         xgTokenizers.removeAll()
         constraintTemplates.removeAll()
+        compilingConstraints.removeAll()
         tokenizerBiases.removeAll()
         lastErrors.removeAll()
     }
@@ -285,9 +308,9 @@ private actor ModelCache {
         suppressedLoadIDs.remove(modelID)
         containers.removeValue(forKey: modelID)
         xgTokenizers.removeValue(forKey: modelID)
-        constraintTemplates = constraintTemplates.filter {
-            !$0.key.hasPrefix("\(modelID):")
-        }
+        let constraintPrefix = Self.constraintCachePrefix(modelID: modelID)
+        constraintTemplates.removeAll { $0.hasPrefix(constraintPrefix) }
+        compilingConstraints = compilingConstraints.filter { !$0.key.hasPrefix(constraintPrefix) }
         tokenizerBiases.removeValue(forKey: modelID)
         lastErrors.removeValue(forKey: modelID)
     }
@@ -435,7 +458,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         await cache.makeTokenizerBias(modelID: modelID, tokenizer: tokenizer)
     }
 
-    /// Gets a constraint by cloning a cached compiled template (or compiling one first).
+    /// Gets a fresh matcher from a cached compiled grammar (or compiles one first).
     static func makeConstraint(
         modelID: String,
         kind: ConstraintKind,
@@ -444,13 +467,41 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         hostTokenizer: any Tokenizer,
         fastForward: Bool
     ) async throws -> GrammarConstraint {
+        try await makeConstraint(
+            modelID: modelID, kind: kind, source: source, fastForward: fastForward
+        ) {
+            switch kind {
+            case .json:
+                try GrammarConstraint(
+                    tokenizer: tokenizer,
+                    jsonSchema: source,
+                    fastForward: fastForward,
+                    hostTokenizer: hostTokenizer
+                )
+            case .structuralTag:
+                try GrammarConstraint(
+                    tokenizer: tokenizer,
+                    structuralTag: source,
+                    fastForward: fastForward,
+                    hostTokenizer: hostTokenizer
+                )
+            }
+        }
+    }
+
+    static func makeConstraint(
+        modelID: String,
+        kind: ConstraintKind,
+        source: String,
+        fastForward: Bool = false,
+        compile: @Sendable @escaping () throws -> GrammarConstraint
+    ) async throws -> GrammarConstraint {
         try await cache.makeConstraint(
             modelID: modelID,
             kind: kind,
             source: source,
-            tokenizer: tokenizer,
-            hostTokenizer: hostTokenizer,
-            fastForward: fastForward
+            fastForward: fastForward,
+            compile: compile
         )
     }
 
@@ -632,7 +683,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         // single contiguous, serialized block.
         //
         // We deliberately do NOT pre-build a constraint template here:
-        // makeConstraint is keyed on modelID:kind:source, where `source` is the
+        // makeConstraint is keyed on modelID, kind, fast-forward mode and the
         // per-request schema/tool grammar that prewarm doesn't possess — a
         // pre-built constraint would land under a key no real respond() reads.
         let tokenizer = await container.tokenizer

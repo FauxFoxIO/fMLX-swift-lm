@@ -68,14 +68,13 @@ struct RuntimeBatchCache {
         }
     }
 
-    func commit() {
+    func commit(advancedBy tokenCount: Int = 1) {
         for layer in cache.indices {
             guard let merged = cache[layer] as? MambaCache else { continue }
             for row in rows.indices {
                 let target = rows[row][layer] as! MambaCache
-                target[0] = merged[0]![row ..< row + 1]
-                target[1] = merged[1]![row ..< row + 1]
-                target.advance(1)
+                target.commitSpeculativeBatchRow(
+                    from: merged, row: row, advancedBy: tokenCount)
             }
         }
     }

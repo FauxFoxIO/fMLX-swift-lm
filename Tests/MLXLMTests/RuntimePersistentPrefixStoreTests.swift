@@ -194,6 +194,35 @@ final class RuntimePersistentPrefixStoreTests: XCTestCase {
         }
     }
 
+    func testSpeculativeLookaheadRestoresRotatingDraftCacheAndProcessedFrontier() throws {
+        try withDirectory { directory in
+            let main = cache([1, 2, 3])
+            let draft = RotatingKVCache(maxSize: 7)
+            let keys = MLXArray(0 ..< 24).asType(.float32).reshaped(1, 2, 3, 4)
+            _ = draft.update(keys: keys, values: keys + 100)
+            do {
+                try store(directory, layout: "speculative-rotating").store(
+                    tokens: [1, 2, 3, 4], cache: [main, draft], processedTokenCount: 3)
+            }
+
+            let reader = try store(directory, layout: "speculative-rotating")
+            let restored = try XCTUnwrap(
+                reader.restore(
+                    prompt: [1, 2, 3, 4, 5], maximumPrefixTokens: 4,
+                    prototype: [KVCacheSimple(), RotatingKVCache(maxSize: 7)]))
+            XCTAssertEqual(restored.tokens, [1, 2, 3, 4])
+            XCTAssertEqual(restored.processedTokenCount, 3)
+            XCTAssertEqual(restored.cache.map(\.offset), [3, 3])
+            let restoredDraft = try XCTUnwrap(restored.cache[1] as? RotatingKVCache)
+            XCTAssertEqual(restoredDraft.metaState, draft.metaState)
+            for (actual, expected) in zip(restoredDraft.state, draft.state) {
+                XCTAssertEqual(
+                    actual.asData(access: .copy).data,
+                    expected.asData(access: .copy).data)
+            }
+        }
+    }
+
     func testAffineQuantizedCacheRestoresAgainstSimplePrototype() throws {
         try withDirectory { directory in
             let quantized = try cache([1, 2, 3], width: 64).toQuantized(groupSize: 32, bits: 4)

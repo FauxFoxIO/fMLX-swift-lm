@@ -21,6 +21,7 @@ For some example applications and tools that use MLX Swift LM, check out [MLX Sw
 ## Documentation
 
 - [FMLXText: model-specific tokenizer and native runtime pairing](docs/checkpoint-text.md)
+- [Bonsai PTQ1 and DFlash2 native artifacts](docs/bonsai-dflash.md)
 
 Developers can use these examples in their own programs -- just import the swift package!
 

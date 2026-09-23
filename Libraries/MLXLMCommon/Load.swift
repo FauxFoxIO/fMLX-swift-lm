@@ -109,14 +109,14 @@ private let minimumBytesPerLoadGroup: Int64 = 256 * 1024 * 1024
 /// Most callers use ``all``.  Checkpoint components that share files can select their own
 /// namespace, avoiding materializing the rest of a combined checkpoint only to discard it in
 /// `sanitize(weights:)`.
-package struct WeightTensorNameSelection: Sendable {
-    private let matches: @Sendable (String) -> Bool
+package struct WeightTensorNameSelection: @unchecked Sendable {
+    private let matches: (String) -> Bool
     fileprivate let filtersNames: Bool
 
     package static let all = Self(matches: { _ in true }, filtersNames: false)
 
     private init(
-        matches: @escaping @Sendable (String) -> Bool, filtersNames: Bool
+        matches: @escaping (String) -> Bool, filtersNames: Bool
     ) {
         self.matches = matches
         self.filtersNames = filtersNames
@@ -131,9 +131,15 @@ package struct WeightTensorNameSelection: Sendable {
     /// This is used by streamed checkpoint components to keep their lazy
     /// safetensor arrays out of the normal materialization path.
     package static func excluding(
-        _ predicate: @escaping @Sendable (String) -> Bool
+        _ predicate: @escaping (String) -> Bool
     ) -> Self {
         Self(matches: { !predicate($0) }, filtersNames: true)
+    }
+
+    package func intersecting(
+        _ predicate: @escaping (String) -> Bool
+    ) -> Self {
+        Self(matches: { self.matches($0) && predicate($0) }, filtersNames: true)
     }
 
     package func contains(_ name: String) -> Bool {
@@ -486,6 +492,19 @@ package func loadWeights(
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
     weightFileSelection: WeightFileSelection = .automatic
 ) throws {
+    if let preparing = model as? any ModelArtifactPreparing {
+        try preparing.prepareArtifact(in: modelDirectory)
+    }
+
+    let effectiveTensorNameSelection: WeightTensorNameSelection
+    if let selecting = model as? any WeightTensorSelecting {
+        effectiveTensorNameSelection = tensorNameSelection.intersecting {
+            selecting.shouldLoadWeightTensor(named: $0)
+        }
+    } else {
+        effectiveTensorNameSelection = tensorNameSelection
+    }
+
     // load the weights and collect metadata from the first safetensor file
     var weights = [String: MLXArray]()
     var metadata = [String: String]()
@@ -494,9 +513,9 @@ package func loadWeights(
         in: modelDirectory,
         selection: weightFileSelection,
         additionalFiles: additionalFiles ?? [],
-        tensorNameSelection: tensorNameSelection)
+        tensorNameSelection: effectiveTensorNameSelection)
     (weights, metadata) = try loadWeightArrays(
-        urls: weightURLs, tensorNameSelection: tensorNameSelection)
+        urls: weightURLs, tensorNameSelection: effectiveTensorNameSelection)
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
@@ -524,6 +543,10 @@ package func loadWeights(
     // Derived fused projections replace their source modules. Drop loader-owned
     // references first so each replaced source can be reclaimed immediately.
     weights.removeAll(keepingCapacity: false)
+
+    if let preparing = model as? any LoadedWeightsPreparing {
+        try preparing.prepareLoadedWeights()
+    }
 
     // Build derived inference-only state and realize the model while the loader
     // still has exclusive access. Forward passes must remain read-only.

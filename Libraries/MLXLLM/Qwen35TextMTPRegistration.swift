@@ -10,6 +10,20 @@ import MLXLMCommon
 public enum Qwen35TextMTPRegistration {
     public static func register() async {
         await MTPDrafterTypeRegistry.shared.registerModelType(
+            "qwen3",
+            matches: { data in
+                guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                    let architectures = root["architectures"] as? [String]
+                else { return false }
+                return architectures == ["DFlash2DraftModel"]
+            },
+            creator: { data in
+                let config = try JSONDecoder.json5().decode(DFlash2Configuration.self, from: data)
+                try config.validateModelConfiguration()
+                return DFlash2DraftModel(config)
+            }
+        )
+        await MTPDrafterTypeRegistry.shared.registerModelType(
             "qwen3_5_text",
             creator: { data in
                 let config = try JSONDecoder.json5().decode(

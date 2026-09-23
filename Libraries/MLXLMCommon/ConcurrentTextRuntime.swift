@@ -86,16 +86,42 @@ public struct PrefixCacheIdentity: Hashable, Codable, Sendable {
     public let chatTemplateRevision: String
     public let adapterRevision: String
     public let cacheLayoutRevision: String
+    public let draftRevision: String
+    public let quantizationContract: String
+    public let transformContract: String
 
     public init(
         modelRevision: String, tokenizerRevision: String, chatTemplateRevision: String,
-        adapterRevision: String, cacheLayoutRevision: String
+        adapterRevision: String, cacheLayoutRevision: String, draftRevision: String = "none",
+        quantizationContract: String = "native", transformContract: String = "none"
     ) {
         self.modelRevision = modelRevision
         self.tokenizerRevision = tokenizerRevision
         self.chatTemplateRevision = chatTemplateRevision
         self.adapterRevision = adapterRevision
         self.cacheLayoutRevision = cacheLayoutRevision
+        self.draftRevision = draftRevision
+        self.quantizationContract = quantizationContract
+        self.transformContract = transformContract
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case modelRevision, tokenizerRevision, chatTemplateRevision, adapterRevision
+        case cacheLayoutRevision, draftRevision, quantizationContract, transformContract
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        modelRevision = try values.decode(String.self, forKey: .modelRevision)
+        tokenizerRevision = try values.decode(String.self, forKey: .tokenizerRevision)
+        chatTemplateRevision = try values.decode(String.self, forKey: .chatTemplateRevision)
+        adapterRevision = try values.decode(String.self, forKey: .adapterRevision)
+        cacheLayoutRevision = try values.decode(String.self, forKey: .cacheLayoutRevision)
+        draftRevision = try values.decodeIfPresent(String.self, forKey: .draftRevision) ?? "none"
+        quantizationContract =
+            try values.decodeIfPresent(String.self, forKey: .quantizationContract) ?? "native"
+        transformContract =
+            try values.decodeIfPresent(String.self, forKey: .transformContract) ?? "none"
     }
 }
 
@@ -116,7 +142,7 @@ public enum ConcurrentTextRuntimeError: Error, Equatable {
 /// through bounded GPU forwards, with optional batched decode or speculative rounds.
 public actor ConcurrentTextRuntime {
     public enum ExecutionMode: String, Codable, Sendable {
-        case interleaved, batchedDecode, speculative
+        case interleaved, batchedDecode, speculative, promptLookup
     }
 
     public struct CacheQuantization: Hashable, Codable, Sendable {
@@ -146,6 +172,8 @@ public actor ConcurrentTextRuntime {
         public let speculativeAdaptation: SpeculativeDecodingAdaptation?
         /// Total target verification positions: one committed bonus plus draft tokens.
         public let speculativeBlockSize: Int
+        /// Maximum prompt-derived candidates verified in one target forward.
+        public let promptLookupDraftTokens: Int
 
         public init(
             memoryBudgetBytes: Int, prefixCacheBytes: Int, workingMemoryBytes: Int,
@@ -156,7 +184,7 @@ public actor ConcurrentTextRuntime {
             cacheQuantization: CacheQuantization? = nil,
             persistentCache: RuntimePersistentCacheConfiguration? = nil,
             speculativeAdaptation: SpeculativeDecodingAdaptation? = .init(),
-            speculativeBlockSize: Int = 4
+            speculativeBlockSize: Int = 4, promptLookupDraftTokens: Int = 1
         ) {
             self.memoryBudgetBytes = memoryBudgetBytes
             self.prefixCacheBytes = prefixCacheBytes
@@ -173,6 +201,7 @@ public actor ConcurrentTextRuntime {
             self.persistentCache = persistentCache
             self.speculativeAdaptation = speculativeAdaptation
             self.speculativeBlockSize = speculativeBlockSize
+            self.promptLookupDraftTokens = promptLookupDraftTokens
         }
     }
 
@@ -184,6 +213,7 @@ public actor ConcurrentTextRuntime {
         public let tokens: [Int]
         public let maxTokens: Int
         public let speculative: Bool
+        public let promptLookup: Bool
         public let temperature: Float
         public let topP: Float
         public let topK: Int
@@ -191,7 +221,7 @@ public actor ConcurrentTextRuntime {
         public let stopTokenIDs: Set<Int>
         public let priority: Priority
         /// Cache this many initial tokens. Must leave at least one prompt token to evaluate.
-        /// MTP reuses whole chunks whose one-token lookahead also lies within this prefix.
+        /// MTP reuses the safe frontier whose one-token lookahead also lies within this prefix.
         public let prefixTokenCount: Int
         /// A mismatch disables reuse and publication for this request; generation stays cold.
         public let cacheIdentity: PrefixCacheIdentity?
@@ -201,9 +231,10 @@ public actor ConcurrentTextRuntime {
             topP: Float = 1, topK: Int = 0, seed: UInt64? = nil,
             stopTokenIDs: Set<Int> = [], priority: Priority = .interactive,
             prefixTokenCount: Int = 0, cacheIdentity: PrefixCacheIdentity? = nil,
-            speculative: Bool = true
+            speculative: Bool = true, promptLookup: Bool = false
         ) {
             self.speculative = speculative
+            self.promptLookup = promptLookup
             self.tokens = tokens
             self.maxTokens = maxTokens
             self.temperature = temperature
@@ -250,6 +281,7 @@ public actor ConcurrentTextRuntime {
         public let recurrentState: Bool
         public let speculativeDecoding: Bool
         public let speculativeLimitation: String?
+        public let promptLookupDecoding: Bool
         public let fusedBatching: Bool
         public let executionMode: ExecutionMode
         public let limitation: String?
@@ -262,8 +294,10 @@ public actor ConcurrentTextRuntime {
     private var ownedModel: (any ScheduledTextModel)?
     private var model: any ScheduledTextModel { ownedModel! }
     private let configuration: Configuration
+    private let speculativeKVCacheConfiguration: KVCacheConfiguration?
     private let weightBytes: Int
     private let scheduledSpeculativeBlockSize: Int
+    private let scheduledPromptLookupDraftTokens: Int
     private var active: [Slot] = []
     private var pending: [Slot] = []
     private var prefixes: [Prefix] = []
@@ -273,6 +307,7 @@ public actor ConcurrentTextRuntime {
     private var residentReservation: UUID?
     private var releasedReservations: [UUID] = []
     private var persistentStore: RuntimePersistentPrefixStore?
+    private var persistentSpeculativeStore: RuntimePersistentPrefixStore?
     private var persistentCacheFailures = 0
     private var batchedForwardCount = 0
     private var maximumBatchSize = 1
@@ -291,6 +326,14 @@ public actor ConcurrentTextRuntime {
         var lastToken: Int?
         var service: Double = 0
         var iterator: MTPSpeculativeTokenIterator?
+        var lookup: PromptLookupCandidates?
+        var lookupStorage: KVCacheStorage?
+        var lookupRecentTokens: [Int] = []
+        var lookupPendingTokens: [Int] = []
+        var lookupPendingIndex = 0
+        var lookupCommittedPendingTokenCount = 0
+        var lookupNativeHybridRound = false
+        var lookupTelemetry = SpeculativeDecodingTelemetry()
         var reportedMTPFallback: String?
         var modelRequestBegan = false
         var cancellationRequested = false
@@ -341,6 +384,7 @@ public actor ConcurrentTextRuntime {
             configuration.maxQueuedRequests > 0, configuration.maxPromptTokens > 0,
             configuration.maxOutputTokens > 0, configuration.prefillChunkSize > 0,
             configuration.streamBufferSize > 0, configuration.speculativeBlockSize >= 2,
+            (1 ... 32).contains(configuration.promptLookupDraftTokens),
             model.scheduledCacheBytesPerToken > 0,
             model.scheduledAdditionalResidentWeightBytes >= 0,
             model.scheduledMaximumForwardTokens.map({ $0 > 0 }) ?? true,
@@ -386,6 +430,13 @@ public actor ConcurrentTextRuntime {
                 throw ConcurrentTextRuntimeError.invalidConfiguration
             }
         }
+        let speculativeKVCacheConfiguration = try configuration.cacheQuantization.map {
+            KVCacheConfiguration(
+                strategy: .affine(
+                    try AffineKVCacheConfiguration(
+                        bits: $0.bits, groupSize: $0.groupSize, compressionStart: 0)),
+                compatibility: .allowPartial)
+        }
         if let adaptation = configuration.speculativeAdaptation {
             guard adaptation.minimumDraftTokens > 0,
                 adaptation.minimumAcceptanceRate.isFinite,
@@ -404,26 +455,44 @@ public actor ConcurrentTextRuntime {
         self.ownedDrafter = drafter
         self.identity = identity
         self.configuration = configuration
+        self.speculativeKVCacheConfiguration = speculativeKVCacheConfiguration
         self.weightBytes = weights
         self.scheduledSpeculativeBlockSize = scheduledSpeculativeBlockSize
+        let hasRecurrentCache = cache.contains { $0 is MambaCache }
+        let hybridRewind =
+            (model as? any PromptLookupHybridModel)?.maximumNativeTargetCacheRewind ?? 0
+        self.scheduledPromptLookupDraftTokens =
+            hasRecurrentCache
+            ? min(configuration.promptLookupDraftTokens, hybridRewind)
+            : configuration.promptLookupDraftTokens
         let streamed = model.scheduledRequiresExclusiveExecution
         let batching = configuration.batchDecode && model.scheduledSupportsBatchDecode && !streamed
+        let simpleLookup = cache.allSatisfy { type(of: $0) == KVCacheSimple.self }
+        let hybridLookup =
+            hasRecurrentCache && hybridRewind >= 1
+            && cache.allSatisfy {
+                type(of: $0) == KVCacheSimple.self || type(of: $0) == MambaCache.self
+            }
+        let promptLookup =
+            !streamed && configuration.cacheQuantization == nil
+            && (model.scheduledMaximumForwardTokens.map { $0 >= 2 } ?? true)
+            && (simpleLookup || hybridLookup)
         self.capabilities = Capabilities(
             immutablePrefixSnapshots: model.scheduledSupportsPrefixCache,
             independentPrefixForks: model.scheduledSupportsPrefixCache,
             prefixRestore: model.scheduledSupportsPrefixCache,
             recurrentState: cache.contains { $0 is MambaCache },
-            speculativeDecoding: drafter != nil && configuration.cacheQuantization == nil
-                && !streamed,
+            speculativeDecoding: drafter != nil && !streamed,
             speculativeLimitation: streamed
                 ? "Streamed experts only support direct scheduled execution"
                 : drafter == nil
                     ? "No matching trained MTP head supplied"
-                    : configuration.cacheQuantization != nil
-                        ? "MTP with quantized target KV is not qualified"
-                        : drafter is any ScheduledMTPPrefixCachingDrafter
-                            ? "MTP disk prefix restore and batched verification are unavailable"
-                            : "MTP prefix restore and batched verification are unavailable",
+                    : drafter is any ScheduledMTPPrefixCachingDrafter
+                        ? drafter!.requiresSharedTargetKV
+                            ? "MTP in-memory and disk prefix restore are available; shared-KV verification is interleaved"
+                            : "MTP in-memory and disk prefix restore and batched verification are available"
+                        : "MTP prefix restore and batched verification are unavailable",
+            promptLookupDecoding: promptLookup,
             fusedBatching: batching, executionMode: batching ? .batchedDecode : .interleaved,
             limitation: streamed
                 ? "Streamed experts serialize ownership and disable batch decode"
@@ -435,6 +504,15 @@ public actor ConcurrentTextRuntime {
                 + ":" + String(describing: configuration.cacheQuantization)
             self.persistentStore = try RuntimePersistentPrefixStore(
                 configuration: persistent, identity: identity, layoutFingerprint: layout)
+            if let drafter = drafter as? any ScheduledMTPPrefixCachingDrafter {
+                let draftCache = drafter.makeState(parameters: nil).cache
+                let speculativeLayout =
+                    layout + "/speculative:"
+                    + draftCache.map { String(describing: type(of: $0)) }.joined(separator: ",")
+                self.persistentSpeculativeStore = try RuntimePersistentPrefixStore(
+                    configuration: persistent, identity: identity,
+                    layoutFingerprint: speculativeLayout)
+            }
         }
     }
 
@@ -457,7 +535,10 @@ public actor ConcurrentTextRuntime {
         let (kvBytes, overflow3) = padded.multipliedReportingOverflow(
             by: model.scheduledCacheBytesPerToken
                 + (usesMTP(request) ? ownedDrafter!.cacheBytesPerToken : 0))
-        let verificationBlockSize = usesMTP(request) ? scheduledSpeculativeBlockSize : 1
+        let verificationBlockSize =
+            usesMTP(request)
+            ? scheduledSpeculativeBlockSize
+            : usesPromptLookup(request) ? scheduledPromptLookupDraftTokens + 1 : 1
         let (stateBytes, stateOverflow) = kvBytes.addingReportingOverflow(
             model.scheduledRecurrentStateBytes(
                 forVerificationBlockSize: verificationBlockSize))
@@ -514,7 +595,10 @@ public actor ConcurrentTextRuntime {
 
     public func clearCaches(persistent: Bool = false) throws {
         clearPrefixCache()
-        if persistent { try persistentStore?.clear() }
+        if persistent {
+            try persistentStore?.clear()
+            try persistentSpeculativeStore?.clear()
+        }
     }
 
     public func shutdown() async {
@@ -605,16 +689,31 @@ public actor ConcurrentTextRuntime {
                 var selected = [slot]
                 do {
                     if capabilities.fusedBatching, slot.iterator == nil,
+                        !promptLookupReady(slot),
                         slot.position == slot.request.tokens.count
                     {
                         selected += active.filter {
-                            $0.id != slot.id && $0.iterator == nil
+                            $0.id != slot.id && $0.iterator == nil && !promptLookupReady($0)
                                 && $0.position == $0.request.tokens.count
+                                && $0.service <= slot.service + 1
+                        }
+                    } else if capabilities.fusedBatching,
+                        let width = slot.iterator?.scheduledBatchVerificationWidth,
+                        slot.position == slot.request.tokens.count
+                    {
+                        selected += active.filter {
+                            $0.id != slot.id
+                                && $0.position == $0.request.tokens.count
+                                && $0.iterator?.scheduledBatchVerificationWidth == width
                                 && $0.service <= slot.service + 1
                         }
                     }
                     if selected.count > 1 {
-                        try await batchStep(selected)
+                        if selected[0].iterator == nil {
+                            try await batchStep(selected)
+                        } else {
+                            try batchSpeculativeStep(selected)
+                        }
                     } else {
                         try await step(slot)
                     }
@@ -695,17 +794,38 @@ public actor ConcurrentTextRuntime {
                 }
                 if usesMTP(slot.request), let drafter = ownedDrafter {
                     let prefix = takePrefix(for: slot.request, speculative: true)
-                    let snapshot: MTPSpeculativeTokenIterator.ScheduledPrefix?
+                    var snapshot: MTPSpeculativeTokenIterator.ScheduledPrefix?
                     if case .speculative(let state) = prefix?.state {
                         snapshot = state
                     } else {
                         snapshot = nil
+                    }
+                    if snapshot == nil, model.scheduledSupportsPrefixCache,
+                        slot.request.cacheIdentity == identity,
+                        let persistentSpeculativeStore,
+                        let cachingDrafter = drafter as? any ScheduledMTPPrefixCachingDrafter
+                    {
+                        do {
+                            let draftPrototype = cachingDrafter.makeState(parameters: nil).cache
+                            if let restored = try persistentSpeculativeStore.restore(
+                                prompt: slot.request.tokens,
+                                maximumPrefixTokens: slot.request.prefixTokenCount,
+                                prototype: slot.cache + draftPrototype)
+                            {
+                                let mainCount = slot.cache.count
+                                snapshot = .init(
+                                    mainCache: Array(restored.cache[..<mainCount]),
+                                    drafterCache: Array(restored.cache[mainCount...]),
+                                    processedTokenCount: restored.processedTokenCount)
+                            }
+                        } catch { persistentCacheFailures += 1 }
                     }
                     slot.iterator = try MTPSpeculativeTokenIterator(
                         scheduledPrompt: slot.request.tokens, mainModel: model, drafter: drafter,
                         mainCache: slot.cache,
                         parameters: GenerateParameters(
                             maxTokens: slot.request.maxTokens,
+                            kvCache: speculativeKVCacheConfiguration,
                             temperature: slot.request.temperature,
                             topP: slot.request.topP,
                             topK: slot.request.topK,
@@ -735,17 +855,33 @@ public actor ConcurrentTextRuntime {
                         }
                     } catch { persistentCacheFailures += 1 }
                 }
+                if usesPromptLookup(slot.request) {
+                    slot.lookup = PromptLookupCandidates(
+                        prompt: slot.request.tokens, maximumNgramSize: 4)
+                }
                 try model.scheduledBeginRequest(promptTokenCount: slot.request.tokens.count)
                 slot.modelRequestBegan = true
                 slot.service = active.map(\.service).min() ?? 0
                 active.append(slot)
                 try emit(.admitted(reusedPrefixTokens: slot.position), to: slot)
                 try emit(
-                    .execution(slot.iterator != nil ? .speculative : capabilities.executionMode),
+                    .execution(
+                        slot.iterator != nil
+                            ? .speculative
+                            : slot.lookup != nil ? .promptLookup : capabilities.executionMode),
                     to: slot)
-                if slot.request.speculative, ownedDrafter != nil, slot.iterator == nil {
+                if slot.request.promptLookup, slot.lookup == nil {
                     try emit(
-                        .fallback(reason: "MTP requires unquantized target KV"), to: slot)
+                        .fallback(
+                            reason: slot.request.temperature == 0
+                                ? "Prompt lookup is unavailable for this cache or model"
+                                : "Prompt lookup requires greedy sampling"), to: slot)
+                }
+                if slot.request.speculative, ownedDrafter != nil, slot.iterator == nil,
+                    slot.lookup == nil
+                {
+                    try emit(
+                        .fallback(reason: "MTP is unavailable for this request"), to: slot)
                 }
                 if slot.iterator != nil, slot.request.prefixTokenCount > 0 {
                     if !(ownedDrafter is any ScheduledMTPPrefixCachingDrafter) {
@@ -761,7 +897,22 @@ public actor ConcurrentTextRuntime {
     }
 
     private func usesMTP(_ request: Request) -> Bool {
-        request.speculative && capabilities.speculativeDecoding
+        request.speculative && capabilities.speculativeDecoding && !usesPromptLookup(request)
+    }
+
+    private func usesPromptLookup(_ request: Request) -> Bool {
+        request.promptLookup && request.temperature == 0 && capabilities.promptLookupDecoding
+    }
+
+    private func promptLookupReady(_ slot: Slot) -> Bool {
+        guard let lookup = slot.lookup else { return false }
+        if slot.lookupPendingIndex < slot.lookupPendingTokens.count { return true }
+        let remaining = slot.request.maxTokens - slot.generated
+        guard remaining > 1 else { return false }
+        return !lookup.continuation(
+            after: slot.lookupRecentTokens,
+            limit: min(scheduledPromptLookupDraftTokens, remaining - 1)
+        ).isEmpty
     }
 
     private func takePrefix(for request: Request, speculative: Bool) -> Prefix? {
@@ -777,9 +928,167 @@ public actor ConcurrentTextRuntime {
         return prefix
     }
 
+    private func promptLookupStep(_ slot: Slot) async throws -> Bool {
+        if slot.lookupPendingIndex < slot.lookupPendingTokens.count {
+            try emitPromptLookupPending(slot)
+            return true
+        }
+        slot.lookupPendingTokens.removeAll(keepingCapacity: true)
+        slot.lookupPendingIndex = 0
+        slot.lookupCommittedPendingTokenCount = 0
+        slot.lookupNativeHybridRound = false
+        discardSpeculativePromptCacheCheckpoints(slot.cache)
+
+        guard let lookup = slot.lookup, let lastToken = slot.lastToken else { return false }
+        let remaining = slot.request.maxTokens - slot.generated
+        guard remaining > 1 else { return false }
+        let proposals = lookup.continuation(
+            after: slot.lookupRecentTokens,
+            limit: min(scheduledPromptLookupDraftTokens, remaining - 1))
+        guard !proposals.isEmpty else { return false }
+
+        let storage = slot.lookupStorage ?? KVCacheStorage(slot.cache, plan: .disabled)
+        slot.lookupStorage = storage
+        if slot.cache.contains(where: { $0 is MambaCache }) {
+            try promptLookupHybridStep(
+                slot, storage: storage, lastToken: lastToken, proposals: proposals)
+            return true
+        }
+        guard let round = storage.beginRound(maximumPositions: proposals.count + 1) else {
+            try disablePromptLookup(slot, reason: "Target cache cannot stage prompt lookup")
+            return false
+        }
+
+        let input = MLXArray([lastToken] + proposals).expandedDimensions(axis: 0)
+        beginForward(for: [slot])
+        let logits: MLXArray
+        do {
+            logits = try await model.scheduledForward(input, cache: round.caches)
+        } catch {
+            let finishing = completedForward(for: slot)
+            Stream().synchronize()
+            storage.rollback(round)
+            if finishing { settle(slot) }
+            throw error
+        }
+        eval([logits] + round.caches.flatMap { $0.innerState() })
+        if completedForward(for: slot) {
+            storage.rollback(round)
+            Stream().synchronize()
+            settle(slot)
+            return true
+        }
+
+        let width = proposals.count + 1
+        guard round.writtenPositions == width, logits.ndim == 3,
+            logits.dim(0) == 1, logits.dim(1) >= width
+        else {
+            storage.rollback(round)
+            try disablePromptLookup(slot, reason: "Target did not return every verification row")
+            return false
+        }
+        let targets = argMax(logits[0, 0 ..< width, 0...], axis: -1)
+        eval(targets)
+        let values = targets.asArray(Int.self)
+        var accepted = 0
+        while accepted < proposals.count, values[accepted] == proposals[accepted] {
+            accepted += 1
+        }
+        storage.commit(round, retaining: accepted + 1)
+        slot.lookupPendingTokens = Array(values.prefix(accepted + 1))
+        slot.lookupCommittedPendingTokenCount = accepted
+        slot.lookupTelemetry.recordRound(
+            drafted: proposals.count, accepted: accepted, targetVerified: width,
+            draftModelCalls: 0)
+        let bytes = slot.cache.flatMap { $0.innerState() }.reduce(0) { $0 + $1.nbytes }
+        guard bytes <= slot.reservation - configuration.workingMemoryBytes else {
+            throw ConcurrentTextRuntimeError.memoryBudgetExceeded
+        }
+        try emitPromptLookupPending(slot)
+        return true
+    }
+
+    private func promptLookupHybridStep(
+        _ slot: Slot, storage: KVCacheStorage, lastToken: Int, proposals: [Int]
+    ) throws {
+        let width = proposals.count + 1
+        var state = LMOutput.State()
+        state[speculativeCheckpointOnlyKey] = true
+        if proposals.count == 1 {
+            state[mtpCacheCheckpointIndexKey] = 1
+        } else {
+            state[mtpCacheCheckpointIndicesKey] = Array(1 ... proposals.count)
+        }
+        let input = LMInput.Text(tokens: MLXArray([lastToken] + proposals))
+        let output = model(input[text: .newAxis], cache: slot.cache, state: state)
+        eval([output.logits] + slot.cache.flatMap { $0.innerState() })
+        precondition(
+            output.logits.ndim == 3 && output.logits.dim(0) == 1
+                && output.logits.dim(1) >= width,
+            "Hybrid prompt-lookup target must return every verification row")
+
+        let targets = argMax(output.logits[0, 0 ..< width, 0...], axis: -1)
+        eval(targets)
+        let values = targets.asArray(Int.self)
+        var accepted = 0
+        while accepted < proposals.count, values[accepted] == proposals[accepted] {
+            accepted += 1
+        }
+        let rejected = proposals.count - accepted
+        if rejected > 0 {
+            let rewound = rewindSpeculativePromptCache(slot.cache, numTokens: rejected)
+            precondition(
+                rewound == rejected,
+                "Hybrid prompt-lookup target did not retain its recurrent checkpoint")
+        }
+        storage.commitProcessedTokens(accepted + 1)
+        slot.lookupPendingTokens = Array(values.prefix(accepted + 1))
+        slot.lookupCommittedPendingTokenCount = accepted
+        slot.lookupNativeHybridRound = true
+        slot.lookupTelemetry.recordRound(
+            drafted: proposals.count, accepted: accepted, targetVerified: width,
+            draftModelCalls: 0)
+        let bytes = slot.cache.flatMap { $0.innerState() }.reduce(0) { $0 + $1.nbytes }
+        guard bytes <= slot.reservation - configuration.workingMemoryBytes else {
+            throw ConcurrentTextRuntimeError.memoryBudgetExceeded
+        }
+        try emitPromptLookupPending(slot)
+    }
+
+    private func emitPromptLookupPending(_ slot: Slot) throws {
+        let token = slot.lookupPendingTokens[slot.lookupPendingIndex]
+        slot.lookupPendingIndex += 1
+        if slot.lookupNativeHybridRound {
+            let consumed = min(
+                slot.lookupPendingIndex, slot.lookupCommittedPendingTokenCount)
+            let lookahead = slot.lookupCommittedPendingTokenCount - consumed
+            for case let cache as MambaCache in slot.cache {
+                if lookahead == 0 {
+                    cache.discardSpeculativeCheckpoint()
+                } else {
+                    cache.retainSpeculativeCheckpoints(rewindingAtMost: lookahead)
+                }
+            }
+        }
+        slot.lookupTelemetry.recordGeneratedToken()
+        try accept(token, slot: slot, fromPromptLookup: true)
+    }
+
+    private func disablePromptLookup(_ slot: Slot, reason: String) throws {
+        slot.lookup = nil
+        slot.lookupStorage = nil
+        try emit(.execution(capabilities.executionMode), to: slot)
+        try emit(.fallback(reason: reason), to: slot)
+    }
+
     private func step(_ slot: Slot) async throws {
         if slot.iterator != nil {
             try speculativeStep(slot)
+            return
+        }
+        if slot.lookup != nil, slot.position == slot.request.tokens.count,
+            try await promptLookupStep(slot)
+        {
             return
         }
         let request = slot.request
@@ -825,6 +1134,7 @@ public actor ConcurrentTextRuntime {
         }
         // Intermediate chunks only contribute cache state; their vocabulary scores are unused.
         eval((needsLogits ? [logits] : []) + slot.cache.flatMap { $0.innerState() })
+        if !isPrefill { slot.lookupStorage?.commitProcessedTokens(tokens.count) }
         try compress(slot)
         let bytes = slot.cache.flatMap { $0.innerState() }.reduce(0) { $0 + $1.nbytes }
         guard bytes <= slot.reservation - configuration.workingMemoryBytes else {
@@ -894,18 +1204,23 @@ public actor ConcurrentTextRuntime {
         try accept(token, slot: slot)
     }
 
-    private func accept(_ token: Int, slot: Slot) throws {
+    private func accept(_ token: Int, slot: Slot, fromPromptLookup: Bool = false) throws {
         let request = slot.request
         guard token >= 0, token < model.vocabularySize else {
             throw ConcurrentTextRuntimeError.invalidRequest
         }
         if request.stopTokenIDs.contains(token) {
             slot.iterator?.discardGeneratedToken()
+            if fromPromptLookup { slot.lookupTelemetry.discardGeneratedToken() }
             finish(slot, reason: .stop)
             return
         }
         slot.lastToken = token
         slot.generated += 1
+        if slot.lookup != nil {
+            slot.lookupRecentTokens.append(token)
+            if slot.lookupRecentTokens.count > 4 { slot.lookupRecentTokens.removeFirst() }
+        }
         try emit(.token(token), to: slot)
         if slot.generated == request.maxTokens { finish(slot, reason: .length) }
     }
@@ -919,6 +1234,81 @@ public actor ConcurrentTextRuntime {
                 }
             }
             eval(slot.cache.flatMap { $0.innerState() })
+        }
+    }
+
+    private func batchSpeculativeStep(_ slots: [Slot]) throws {
+        guard let width = slots.first?.iterator?.scheduledBatchVerificationWidth,
+            width >= 2
+        else { throw ConcurrentTextRuntimeError.invalidRequest }
+
+        var prepared = [MTPSpeculativeTokenIterator.ScheduledVerification]()
+        prepared.reserveCapacity(slots.count)
+        for slot in slots {
+            guard var iterator = slot.iterator,
+                iterator.scheduledBatchVerificationWidth == width,
+                let verification = iterator.prepareScheduledVerification(maximumWidth: width)
+            else { throw ConcurrentTextRuntimeError.invalidRequest }
+            slot.iterator = iterator
+            prepared.append(verification)
+        }
+
+        let batch = try RuntimeBatchCache(rows: prepared.map(\.cache))
+        let inputs = concatenated(
+            prepared.map { $0.tokens.expandedDimensions(axis: 0) }, axis: 0)
+        var state = LMOutput.State()
+        state[mtpEmitFlagKey] = true
+        state[mtpHiddenLayerIDsKey] = prepared[0].hiddenLayerIDs
+        if width == 2 {
+            state[mtpCacheCheckpointIndexKey] = 1
+        } else {
+            state[mtpCacheCheckpointIndicesKey] = Array(1 ..< width)
+        }
+
+        beginForward(for: slots)
+        let output = model(LMInput.Text(tokens: inputs), cache: batch.cache, state: state)
+        eval(
+            [output.logits]
+                + (output.state?[mtpLastHiddenStatesKey].map { [$0] } ?? [])
+                + batch.cache.flatMap { $0.innerState() }
+                + slots.flatMap { $0.cache.flatMap { $0.innerState() } })
+        batch.commit(advancedBy: width)
+        let finishing = slots.filter { completedForward(for: $0) }
+        if !finishing.isEmpty {
+            Stream().synchronize()
+            for slot in finishing { settle(slot) }
+        }
+
+        batchedForwardCount += 1
+        maximumBatchSize = max(maximumBatchSize, slots.count)
+        for (row, slot) in slots.enumerated() where !slot.finishing {
+            do {
+                var rowState = output.state ?? state
+                if let hidden = output.state?[mtpLastHiddenStatesKey] {
+                    rowState[mtpLastHiddenStatesKey] = hidden[row ..< row + 1]
+                }
+                rowState[mtpSharedKVOffsetsKey] = [
+                    "full_attention": prepared[row].targetOffsetAfterVerification
+                ]
+                var iterator = slot.iterator!
+                iterator.completeScheduledVerification(
+                    prepared[row],
+                    result: LMOutput(
+                        logits: output.logits[row ..< row + 1], state: rowState),
+                    cacheAlreadyEvaluated: true)
+                slot.iterator = iterator
+                slot.cache = iterator.mainCache
+                guard let token = slot.iterator!.next() else {
+                    finish(slot, reason: .length)
+                    continue
+                }
+                let arrays = slot.iterator!.scheduledResidentArrays
+                eval(arrays)
+                guard arrays.reduce(0, { $0 + $1.nbytes }) <= slot.reservation else {
+                    throw ConcurrentTextRuntimeError.memoryBudgetExceeded
+                }
+                try accept(token, slot: slot)
+            } catch { finish(slot, error: error) }
         }
     }
 
@@ -952,6 +1342,7 @@ public actor ConcurrentTextRuntime {
         for (row, slot) in slots.enumerated() {
             guard !slot.finishing else { continue }
             do {
+                slot.lookupStorage?.commitProcessedTokens(1)
                 try compress(slot)
                 let bytes = slot.cache.flatMap { $0.innerState() }.reduce(0) { $0 + $1.nbytes }
                 guard bytes <= slot.reservation - configuration.workingMemoryBytes else {
@@ -989,11 +1380,18 @@ public actor ConcurrentTextRuntime {
         let (tokenBytes, tokenOverflow) = count.multipliedReportingOverflow(
             by: MemoryLayout<Int>.stride)
         let (bytes, overflow) = cacheBytes.addingReportingOverflow(tokenBytes)
-        guard !tokenOverflow, !overflow, bytes <= configuration.prefixCacheBytes else { return }
+        guard !tokenOverflow, !overflow else { return }
         let tokens = Array(slot.request.tokens.prefix(count))
-        guard !prefixes.contains(where: { $0.speculative && $0.tokens == tokens }) else { return }
-        while prefixBytes > configuration.prefixCacheBytes - bytes { prefixes.removeFirst() }
         guard let snapshot = iterator.snapshotScheduledPrefix() else { return }
+        do {
+            try persistentSpeculativeStore?.store(
+                tokens: tokens, cache: snapshot.persistentCaches,
+                processedTokenCount: snapshot.processedTokenCount)
+        } catch { persistentCacheFailures += 1 }
+        guard bytes <= configuration.prefixCacheBytes,
+            !prefixes.contains(where: { $0.speculative && $0.tokens == tokens })
+        else { return }
+        while prefixBytes > configuration.prefixCacheBytes - bytes { prefixes.removeFirst() }
         prefixes.append(Prefix(tokens: tokens, state: .speculative(snapshot), bytes: bytes))
     }
 
@@ -1028,8 +1426,24 @@ public actor ConcurrentTextRuntime {
         }
         active.removeAll { $0.id == slot.id }
         pending.removeAll { $0.id == slot.id }
+        if let storage = slot.lookupStorage {
+            let consumed = min(
+                slot.lookupPendingIndex, slot.lookupCommittedPendingTokenCount)
+            let lookahead = slot.lookupCommittedPendingTokenCount - consumed
+            if lookahead > 0 {
+                if slot.lookupNativeHybridRound {
+                    storage.rewindSpeculative(lookahead)
+                } else {
+                    storage.rewindLastRound(lookahead)
+                }
+            }
+        }
+        discardSpeculativePromptCacheCheckpoints(slot.cache)
         var error = slot.finishError
-        if error == nil, let telemetry = slot.iterator?.speculativeDecodingTelemetry {
+        let telemetry =
+            slot.iterator?.speculativeDecodingTelemetry
+            ?? (slot.lookupTelemetry.roundCount > 0 ? slot.lookupTelemetry : nil)
+        if error == nil, let telemetry {
             if case .dropped = slot.continuation.yield(.speculation(telemetry)) {
                 error = ConcurrentTextRuntimeError.consumerTooSlow
             }
@@ -1037,6 +1451,8 @@ public actor ConcurrentTextRuntime {
         slot.iterator?.finalizeGeneration()
         if let iterator = slot.iterator { eval(iterator.scheduledResidentArrays) }
         slot.iterator = nil
+        slot.lookupStorage = nil
+        slot.lookup = nil
         slot.cache.removeAll()
         if let error {
             slot.continuation.finish(throwing: error)

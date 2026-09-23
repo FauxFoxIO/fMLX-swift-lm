@@ -261,6 +261,35 @@ final class ConcurrentTextRuntimeTests: XCTestCase {
                 cache: [RotatingKVCache(maxSize: 2)]), 3)
     }
 
+    func testSpeculativeBatchCommitSplitsRecurrentRollbackRows() throws {
+        let first = MambaCache()
+        let second = MambaCache()
+        for (cache, value) in [(first, Float(1)), (second, Float(2))] {
+            cache[0] = MLXArray([value]).reshaped(1, 1)
+            cache[1] = MLXArray([value + 10]).reshaped(1, 1)
+            cache.advance(5)
+        }
+        let batch = try RuntimeBatchCache(rows: [[first], [second]])
+        let merged = batch.cache[0] as! MambaCache
+        merged[0] = MLXArray([13, 23] as [Float]).reshaped(2, 1)
+        merged[1] = MLXArray([113, 123] as [Float]).reshaped(2, 1)
+        merged.saveSpeculativeCheckpoint(
+            convState: MLXArray([11, 21] as [Float]).reshaped(2, 1),
+            recurrentState: MLXArray([111, 121] as [Float]).reshaped(2, 1),
+            advancedBy: 1, rewinding: 2)
+        merged.saveSpeculativeCheckpoint(
+            convState: MLXArray([12, 22] as [Float]).reshaped(2, 1),
+            recurrentState: MLXArray([112, 122] as [Float]).reshaped(2, 1),
+            advancedBy: 2, rewinding: 1)
+
+        batch.commit(advancedBy: 3)
+        XCTAssertTrue(first.restoreSpeculativeCheckpoint(rewinding: 2))
+        XCTAssertTrue(second.restoreSpeculativeCheckpoint(rewinding: 1))
+        eval(first.innerState() + second.innerState())
+        XCTAssertEqual(first[0]!.item(Float.self), 11)
+        XCTAssertEqual(second[0]!.item(Float.self), 22)
+    }
+
     func testStreamedScheduledForwardCapsPrefillAndDisablesBatchDecode() async throws {
         let model = ScheduledChecksumModel(streamed: true)
         let runtime = try Runtime(
@@ -714,7 +743,8 @@ final class ConcurrentTextRuntimeTests: XCTestCase {
                         tokens: long,
                         maxTokens: 16, speculative: false))
             ).tokens
-            for speculative in bits == 0 ? [false, true] : [false] {
+            for speculative in [false, true] {
+                let batchedBefore = await runtime.status().batchedForwardCount
                 let a = try await runtime.generate(
                     .init(tokens: short, maxTokens: 16, speculative: speculative))
                 let b = try await runtime.generate(
@@ -727,6 +757,10 @@ final class ConcurrentTextRuntimeTests: XCTestCase {
                 if speculative {
                     XCTAssertGreaterThan(result.0.speculativeRounds, 0)
                     XCTAssertGreaterThan(result.1.speculativeRounds, 0)
+                    if bits == 0 {
+                        let batchedAfter = await runtime.status().batchedForwardCount
+                        XCTAssertGreaterThan(batchedAfter, batchedBefore)
+                    }
                 }
             }
             let status = await runtime.status()

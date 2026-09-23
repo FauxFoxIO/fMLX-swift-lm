@@ -1,5 +1,6 @@
 // Copyright © 2026 Faux Fox.
 
+import Darwin
 import Foundation
 import MLX
 import XCTest
@@ -65,7 +66,10 @@ final class Qwen35MTPPrefixCacheTests: XCTestCase {
         )
     }
 
-    private func runtime(prefixBytes: Int = 2_000_000) throws -> PrefixRuntime {
+    private func runtime(
+        prefixBytes: Int = 2_000_000,
+        persistent: RuntimePersistentCacheConfiguration? = nil
+    ) throws -> PrefixRuntime {
         let config = try modelConfiguration()
         let model = withRandomState(MLXRandom.RandomState(seed: 112)) { Qwen35TextModel(config) }
         let head = withRandomState(MLXRandom.RandomState(seed: 113)) { Qwen35MTPDraftModel(config) }
@@ -74,7 +78,8 @@ final class Qwen35MTPPrefixCacheTests: XCTestCase {
             configuration: .init(
                 memoryBudgetBytes: 64_000_000, prefixCacheBytes: prefixBytes,
                 workingMemoryBytes: 2_000_000, maxPromptTokens: 512, maxOutputTokens: 256,
-                prefillChunkSize: 4, streamBufferSize: 2048, speculativeAdaptation: nil),
+                prefillChunkSize: 4, streamBufferSize: 2048, persistentCache: persistent,
+                speculativeAdaptation: nil),
             drafter: head)
     }
 
@@ -105,6 +110,37 @@ final class Qwen35MTPPrefixCacheTests: XCTestCase {
         XCTAssertEqual(warm.tokens, cold.tokens)
         XCTAssertTrue(warm.fallbacks.isEmpty)
         await runtime.shutdown()
+    }
+
+    func testPairedPrefixRestoresFromDiskAfterRuntimeRestart() async throws {
+        let canonical = try XCTUnwrap(
+            FileManager.default.temporaryDirectory.withUnsafeFileSystemRepresentation { path in
+                path.flatMap { realpath($0, nil) }
+            })
+        defer { free(canonical) }
+        let directory = URL(fileURLWithPath: String(cString: canonical), isDirectory: true)
+            .appendingPathComponent(
+                "qwen-mtp-persistent-\(UUID())", isDirectory: true)
+        defer {
+            if FileManager.default.fileExists(atPath: directory.path) {
+                try? FileManager.default.removeItem(at: directory)
+            }
+        }
+        let persistent = RuntimePersistentCacheConfiguration(
+            directory: directory, maximumBytes: 8_000_000)
+        let tokens = Array(1 ... 17)
+
+        let writer = try runtime(prefixBytes: 0, persistent: persistent)
+        let cold = try await collectPrefix(writer.generate(request(tokens)))
+        XCTAssertEqual(cold.reused, 0)
+        await writer.shutdown()
+
+        let reader = try runtime(prefixBytes: 0, persistent: persistent)
+        let warm = try await collectPrefix(reader.generate(request(tokens)))
+        XCTAssertEqual(warm.reused, 12)
+        XCTAssertEqual(warm.tokens, cold.tokens)
+        XCTAssertTrue(warm.fallbacks.isEmpty)
+        await reader.shutdown()
     }
 
     func testPairedPrefixesPreserveBranchesStopsAndExecutionKinds() async throws {
@@ -163,7 +199,7 @@ final class Qwen35MTPPrefixCacheTests: XCTestCase {
             await runtime.clearPrefixCache()
             let seed = try await collectPrefix(runtime.generate(request(tokens, prefix: limit)))
             let hit = try await collectPrefix(runtime.generate(request(tokens, prefix: limit)))
-            let reused = max(0, (limit - 1) / 4) * 4
+            let reused = max(0, limit - 1)
             XCTAssertEqual(seed.reused, 0, "prefix \(limit)")
             XCTAssertEqual(hit.reused, reused, "prefix \(limit)")
             XCTAssertEqual(seed.tokens, expected.tokens, "prefix \(limit)")

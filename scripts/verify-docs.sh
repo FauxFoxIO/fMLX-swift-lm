@@ -5,10 +5,18 @@ cd "$(dirname "$0")/.."
 
 export MLX_SWIFT_BUILD_DOC=1
 
+SWIFT_PACKAGE_ARGS=()
+if [ -n "${SWIFTPM_SCRATCH_PATH:-}" ]; then
+    SWIFT_PACKAGE_ARGS+=(--scratch-path "$SWIFTPM_SCRATCH_PATH")
+fi
+if [ -n "${SWIFTPM_BUILD_SYSTEM:-}" ]; then
+    SWIFT_PACKAGE_ARGS+=(--build-system "$SWIFTPM_BUILD_SYSTEM")
+fi
+
 # Discover library product targets from Package.swift, skipping test/macro/executable targets.
 # MLXFoundationModels is filtered out: it is gated on the FoundationModels v2 SDK, so its DocC
 # catalog can't be verified on SDKs that lack it.
-TARGETS=$(swift package dump-package | python3 -c "
+TARGETS=$(swift package "${SWIFT_PACKAGE_ARGS[@]}" dump-package | python3 -c "
 import json, sys
 pkg = json.load(sys.stdin)
 targets = set()
@@ -28,7 +36,7 @@ FAILED=0
 
 while IFS= read -r TARGET; do
     echo "Building documentation for $TARGET..."
-    if ! swift package generate-documentation --target "$TARGET" --warnings-as-errors; then
+    if ! swift package "${SWIFT_PACKAGE_ARGS[@]}" generate-documentation --target "$TARGET" --warnings-as-errors; then
         FAILED=1
     fi
     echo ""

@@ -1,8 +1,17 @@
 // Copyright © 2026 Faux Fox.
 
 import Foundation
+import MLX
 import MLXLLM
 import MLXLMCommon
+
+/// Conservative pre-load admission result for a resident native model.
+public struct NativeTextModelMemoryAdmission: Sendable, Equatable {
+    public let checkpointBytes: Int
+    public let requiredBytes: Int
+    public let deviceBudgetBytes: Int
+    public var isAdmitted: Bool { requiredBytes <= deviceBudgetBytes }
+}
 
 /// Selects an optional prefill chunk-size policy for native text models.
 public enum NativeTextPrefillChunkPolicy: Sendable, Equatable {
@@ -33,14 +42,26 @@ public struct NativeTextModel: Sendable {
         configuration: ConcurrentTextRuntime.Configuration,
         extraEOSTokens: Set<String> = [],
         mtpCompanionDirectory: URL? = nil,
+        mtpRevision: String? = nil,
+        transformContract: String? = nil,
         loadPolicy: NativeTextModelLoadPolicy = .resident,
         prefillChunkPolicy: NativeTextPrefillChunkPolicy = .balanced
     ) async throws -> Self {
+        if mtpCompanionDirectory != nil, mtpRevision?.isEmpty != false {
+            throw CheckpointTextError.invalidConfiguration(
+                "An immutable MTP revision is required for a companion checkpoint")
+        }
+        let admission = try memoryAdmission(
+            directory: directory, mtpCompanionDirectory: mtpCompanionDirectory,
+            configuration: configuration)
+        guard admission.isAdmitted else {
+            throw ConcurrentTextRuntimeError.memoryBudgetExceeded
+        }
         let text = try await CheckpointTextProcessor.load(
             directory: directory, extraEOSTokens: extraEOSTokens)
         let model = try await NativeTextModelLoader.load(
             directory: directory, policy: loadPolicy)
-        let drafter: Qwen35MTPDraftModel?
+        let drafter: (any IncrementalMTPDrafterModel)?
         if case .streamedExperts = loadPolicy {
             guard mtpCompanionDirectory == nil else {
                 throw NativeTextModelLoadingError.streamedExpertsUnsupported(
@@ -54,7 +75,8 @@ public struct NativeTextModel: Sendable {
             }
             drafter = nil
         } else if let mtpCompanionDirectory {
-            drafter = try await NativeTextModelLoader.loadMTP(directory: mtpCompanionDirectory)
+            drafter = try await NativeTextModelLoader.loadSpeculativeDrafter(
+                directory: mtpCompanionDirectory)
         } else {
             drafter = try await NativeTextModelLoader.loadCombinedMTP(directory: directory)
         }
@@ -66,8 +88,15 @@ public struct NativeTextModel: Sendable {
         }
         let quantization =
             configuration.cacheQuantization.map { "kv\($0.bits)-group\($0.groupSize)" } ?? "native"
+        let draftRevision = drafter == nil ? "none" : mtpRevision ?? "\(modelRevision)/combined-mtp"
+        let resolvedTransformContract =
+            transformContract
+            ?? (model as? any InferenceArtifactIdentityProviding)?.transformContractRevision
+            ?? "none"
         let baseIdentity = try text.cacheIdentity(
-            modelRevision: modelRevision, cacheLayoutRevision: "fmlx-text-v1/\(quantization)")
+            modelRevision: modelRevision, cacheLayoutRevision: "fmlx-text-v1/\(quantization)",
+            draftRevision: draftRevision, quantizationContract: quantization,
+            transformContract: resolvedTransformContract)
         let identity: PrefixCacheIdentity
         if case .edge0 = loadPolicy {
             identity = PrefixCacheIdentity(
@@ -75,7 +104,10 @@ public struct NativeTextModel: Sendable {
                 tokenizerRevision: baseIdentity.tokenizerRevision,
                 chatTemplateRevision: baseIdentity.chatTemplateRevision,
                 adapterRevision: "edge0-recover-lora-dbdef1af692986ad1937562c0d2aab7f",
-                cacheLayoutRevision: baseIdentity.cacheLayoutRevision + "/edge0-ae1ee2d")
+                cacheLayoutRevision: baseIdentity.cacheLayoutRevision + "/edge0-ae1ee2d",
+                draftRevision: baseIdentity.draftRevision,
+                quantizationContract: baseIdentity.quantizationContract,
+                transformContract: baseIdentity.transformContract)
         } else {
             identity = baseIdentity
         }
@@ -94,6 +126,52 @@ public struct NativeTextModel: Sendable {
             prefillChunkSize: prefillChunkSize, configuration: runtimeConfiguration)
     }
 
+    /// Estimates resident checkpoint and runtime storage before any tensors are loaded.
+    /// The device ceiling is deliberately conservative so oversized models fail before
+    /// unified-memory pressure can terminate an iPhone process.
+    public static func memoryAdmission(
+        directory: URL, mtpCompanionDirectory: URL? = nil,
+        configuration: ConcurrentTextRuntime.Configuration
+    ) throws -> NativeTextModelMemoryAdmission {
+        func checkpointBytes(_ directory: URL) throws -> Int {
+            let urls = try FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: [.fileSizeKey],
+                options: [.skipsHiddenFiles])
+            return try urls.filter {
+                ["safetensors", "gguf"].contains($0.pathExtension.lowercased())
+            }.reduce(into: 0) { total, url in
+                let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+                let (next, overflow) = total.addingReportingOverflow(size)
+                guard !overflow else { throw ConcurrentTextRuntimeError.memoryBudgetExceeded }
+                total = next
+            }
+        }
+        let target = try checkpointBytes(directory)
+        let draft = try mtpCompanionDirectory.map(checkpointBytes) ?? 0
+        let (checkpoint, checkpointOverflow) = target.addingReportingOverflow(draft)
+        guard !checkpointOverflow, checkpoint > 0 else {
+            throw ConcurrentTextRuntimeError.invalidConfiguration
+        }
+        let (runtimeReservation, runtimeOverflow) = configuration.prefixCacheBytes
+            .addingReportingOverflow(configuration.workingMemoryBytes)
+        guard !runtimeOverflow else { throw ConcurrentTextRuntimeError.memoryBudgetExceeded }
+        // Scale scratch space with the artifact. A fixed desktop-sized floor would reject
+        // valid tiny checkpoints whose complete configured budget is intentionally smaller.
+        let loaderWorkspace = max(1 * 1024 * 1024, checkpoint / 10)
+        let (base, baseOverflow) = checkpoint.addingReportingOverflow(runtimeReservation)
+        let (required, requiredOverflow) = base.addingReportingOverflow(loaderWorkspace)
+        guard !baseOverflow, !requiredOverflow else {
+            throw ConcurrentTextRuntimeError.memoryBudgetExceeded
+        }
+        let physical = Int(clamping: ProcessInfo.processInfo.physicalMemory)
+        let physicalCeiling = physical - physical / 5
+        let gpuCeiling = GPU.maxRecommendedWorkingSetBytes() ?? physicalCeiling
+        let deviceBudget = min(configuration.memoryBudgetBytes, min(physicalCeiling, gpuCeiling))
+        return NativeTextModelMemoryAdmission(
+            checkpointBytes: checkpoint, requiredBytes: required,
+            deviceBudgetBytes: max(0, deviceBudget))
+    }
+
     /// Constructs a raw runtime request using this model's exact chat tokens and stop IDs.
     /// String-stop checkpoints need a text-stream stop matcher and are explicitly rejected here.
     public func prepareRequest(
@@ -102,7 +180,7 @@ public struct NativeTextModel: Sendable {
         maximumOutputTokens: Int = 512, temperature: Float? = nil,
         topP: Float? = nil, topK: Int? = nil, seed: UInt64? = nil,
         priority: ConcurrentTextRuntime.Priority = .interactive, prefixTokenCount: Int = 0,
-        cachePromptPrefix: Bool = false
+        cachePromptPrefix: Bool = false, promptLookup: Bool = false
     ) throws -> ConcurrentTextRuntime.Request {
         guard text.stopStrings.isEmpty else {
             throw CheckpointTextError.stringStopsRequireTextGeneration
@@ -112,6 +190,27 @@ public struct NativeTextModel: Sendable {
         }
         let tokens = try text.prepareChat(
             messages: messages, tools: tools, additionalContext: additionalContext)
+        return try prepareRequest(
+            tokens: tokens, maximumOutputTokens: maximumOutputTokens, temperature: temperature,
+            topP: topP, topK: topK, seed: seed, priority: priority,
+            prefixTokenCount: prefixTokenCount, cachePromptPrefix: cachePromptPrefix,
+            promptLookup: promptLookup)
+    }
+
+    /// Constructs a runtime request from chat tokens rendered by this model's text processor.
+    public func prepareRequest(
+        tokens: [Int], maximumOutputTokens: Int = 512, temperature: Float? = nil,
+        topP: Float? = nil, topK: Int? = nil, seed: UInt64? = nil,
+        priority: ConcurrentTextRuntime.Priority = .interactive, prefixTokenCount: Int = 0,
+        cachePromptPrefix: Bool = false, promptLookup: Bool = false
+    ) throws -> ConcurrentTextRuntime.Request {
+        guard text.stopStrings.isEmpty else {
+            throw CheckpointTextError.stringStopsRequireTextGeneration
+        }
+        guard maximumOutputTokens <= configuration.maxOutputTokens else {
+            throw ConcurrentTextRuntimeError.invalidRequest
+        }
+        try text.validate(tokens)
         let resolvedPrefixTokenCount = cachePromptPrefix ? tokens.count - 1 : prefixTokenCount
         guard tokens.count <= configuration.maxPromptTokens, resolvedPrefixTokenCount >= 0,
             resolvedPrefixTokenCount < tokens.count
@@ -126,7 +225,8 @@ public struct NativeTextModel: Sendable {
             topP: topP ?? text.topP, topK: topK ?? text.topK,
             seed: seed, stopTokenIDs: text.stopTokenIDs,
             priority: priority,
-            prefixTokenCount: resolvedPrefixTokenCount, cacheIdentity: cacheIdentity)
+            prefixTokenCount: resolvedPrefixTokenCount, cacheIdentity: cacheIdentity,
+            promptLookup: promptLookup)
     }
 }
 
@@ -161,6 +261,7 @@ extension ConcurrentTextRuntime.Configuration {
             cacheQuantization: cacheQuantization,
             persistentCache: persistentCache,
             speculativeAdaptation: speculativeAdaptation,
-            speculativeBlockSize: speculativeBlockSize)
+            speculativeBlockSize: speculativeBlockSize,
+            promptLookupDraftTokens: promptLookupDraftTokens)
     }
 }

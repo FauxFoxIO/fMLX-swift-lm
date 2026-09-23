@@ -1666,6 +1666,26 @@ public class MambaCache: ArraysCache {
         speculativeCheckpoints.removeAll()
     }
 
+    /// Commit one row from a transient batched speculative cache.
+    package func commitSpeculativeBatchRow(
+        from source: MambaCache, row: Int, advancedBy tokenCount: Int
+    ) {
+        let startOffset = offset
+        cache = source.cache.map { value in
+            value.map { $0[row ..< row + 1] }
+        }
+        speculativeCheckpoints = source.speculativeCheckpoints.mapValues { checkpoint in
+            SpeculativeCheckpoint(
+                state: checkpoint.state.map { value in
+                    value.map { $0[row ..< row + 1] }
+                },
+                offset: startOffset,
+                leftPadding: leftPadding.map { $0 - tokenCount },
+                lengths: lengths.map { $0 - tokenCount })
+        }
+        advance(tokenCount)
+    }
+
     public override func copy() -> any KVCache {
         let new = MambaCache()
         copyContents(to: new)

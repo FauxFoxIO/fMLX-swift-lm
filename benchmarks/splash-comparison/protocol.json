@@ -1,0 +1,110 @@
+{
+  "schemaVersion": 1,
+  "protocolId": "fmlx-splash-same-machine-v1",
+  "objective": "Compare optimized fMLX and fully accelerated Splash on the same Apple silicon host with identical model inputs and generation semantics.",
+  "comparison": {
+    "baselineEngine": "splash-accelerated",
+    "candidateEngine": "fmlx-dflash2",
+    "ordinaryAblations": ["fmlx-ordinary"],
+    "sameHostRequired": true,
+    "sameLogicalCheckpointRevisionRequired": true,
+    "sameSourceWeightDigestRequiredWhenBothEnginesReadTheSameContainer": true,
+    "quantizationEquivalenceRequired": true,
+    "sameDraftCheckpointRevisionRequiredForAcceleratedModes": true,
+    "sameRenderedTokenIDsRequired": true,
+    "exactGreedyOutputRequired": true,
+    "minimumThroughputRatioForMatch": 0.95,
+    "minimumThroughputRatioForExceed": 1.0,
+    "maximumLatencyRatioForMatch": 1.05
+  },
+  "sampling": {
+    "temperature": 0.0,
+    "topP": 1.0,
+    "topK": 0,
+    "seed": 0,
+    "stopPolicy": "same explicit token IDs; a cell is invalid if any engine stops before requested output length"
+  },
+  "measurement": {
+    "warmupTrialsPerCell": 2,
+    "measuredTrialsPerCell": 7,
+    "pairOrder": [
+      ["fmlx-dflash2", "splash-accelerated"],
+      ["splash-accelerated", "fmlx-dflash2"]
+    ],
+    "engineIsolation": "Only one engine may own or submit GPU work at a time.",
+    "ttftBoundary": "Immediately before request submission through receipt of the first generated token, including admission and prefill.",
+    "decodeBoundary": "Receipt of the first generated token through completion of the requested output; throughput excludes the first token.",
+    "endToEndBoundary": "Immediately before request submission through terminal completion after the requested output.",
+    "fanoutBoundary": "Immediately before submitting all four requests through completion of the last request.",
+    "memoryBoundary": "Peak process resident bytes and peak/cached MLX bytes from immediately before request submission through terminal completion.",
+    "steadyMemoryPoint": "Process resident bytes after warmup and before the measured request, with weights resident.",
+    "statistics": ["median", "p10", "p90", "medianAbsoluteDeviation"],
+    "noisePolicy": {
+      "maximumRelativeMAD": 0.1,
+      "maximumFirstToLastMedianDrift": 0.1,
+      "action": "Mark the cell inconclusive and repeat the complete cell after cooling; retain the rejected samples."
+    }
+  },
+  "workloads": [
+    {
+      "id": "cold-512",
+      "promptTokens": 512,
+      "outputTokens": 256,
+      "requests": 1,
+      "cacheState": "cold",
+      "expectedReusedPrefixTokens": 0,
+      "prefixPattern": "single"
+    },
+    {
+      "id": "cold-8192",
+      "promptTokens": 8192,
+      "outputTokens": 256,
+      "requests": 1,
+      "cacheState": "cold",
+      "expectedReusedPrefixTokens": 0,
+      "prefixPattern": "single"
+    },
+    {
+      "id": "warm-appended-turn-8192",
+      "promptTokens": 8192,
+      "outputTokens": 256,
+      "requests": 1,
+      "cacheState": "warm-prefix",
+      "expectedReusedPrefixTokens": 7936,
+      "prefixPattern": "7936-token saved conversation prefix plus a 256-token appended turn"
+    },
+    {
+      "id": "fanout-shared-512",
+      "promptTokens": 512,
+      "outputTokens": 256,
+      "requests": 4,
+      "cacheState": "cold",
+      "expectedReusedPrefixTokens": 0,
+      "prefixPattern": "four identical rendered prompts submitted together"
+    },
+    {
+      "id": "fanout-distinct-512",
+      "promptTokens": 512,
+      "outputTokens": 256,
+      "requests": 4,
+      "cacheState": "cold",
+      "expectedReusedPrefixTokens": 0,
+      "prefixPattern": "four distinct rendered prompts submitted together"
+    }
+  ],
+  "requiredMetrics": [
+    "ttftMilliseconds",
+    "prefillTokensPerSecond",
+    "decodeTokensPerSecond",
+    "endToEndMilliseconds",
+    "aggregateTokensPerSecond",
+    "peakResidentBytes",
+    "steadyResidentBytes",
+    "peakMLXBytes",
+    "cachedMLXBytes",
+    "targetForwardCount",
+    "draftProposedTokens",
+    "draftAcceptedTokens",
+    "draftRounds"
+  ]
+}

@@ -114,5 +114,10 @@ retaining quantization metadata and already-converted norms. The runtime uses th
 existing greedy, block-size-two rollback contract; checkpoint `block_size: 3` does
 not override that limit.
 
+The separately published trained DFlash2 companion is also supported. It uses raw
+captures from target layers 5/19/33/47/61 and its own rotating draft cache rather
+than the Qwen MTP head above. Its artifact and qualification details are recorded
+in [Bonsai PTQ1 and DFlash2](bonsai-dflash.md).
+
 Sources: [companion](https://huggingface.co/mlx-community/Qwen3.8-27B-MTP-4bit),
 [pinned model card](https://huggingface.co/mlx-community/Qwen3.8-27B-MTP-4bit/blob/b643c01b6d3b094e325edb6ebd832e16c486c575/README.md).
