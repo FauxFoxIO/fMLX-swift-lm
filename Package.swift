@@ -63,7 +63,7 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/DePasqualeOrg/swift-tokenizers.git", exact: "0.7.3"),
+        .package(url: "https://github.com/FauxFoxIO/swift-tokenizers.git", branch: "main"),
         .package(
             url: "https://github.com/ml-explore/mlx-swift",
             revision: "3a24fa39e059ea5de65cdefc09d3d351b1053f52"
