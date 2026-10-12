@@ -1847,8 +1847,9 @@ private final class Gemma4VisionPooler: Module {
     }
 }
 
-private final class Gemma4VisionTransformerModel: Module {
-    @ModuleInfo(key: "layers") var layers: [Gemma4VisionTransformerBlock]
+// Shared by the causal Gemma4 model and the bidirectional EmbeddingGemma 2 encoder.
+final class Gemma4VisionTransformerModel: Module {
+    @ModuleInfo(key: "layers") private var layers: [Gemma4VisionTransformerBlock]
 
     init(config: Gemma4VisionConfiguration) {
         self._layers.wrappedValue = (0 ..< config.hiddenLayers).map { _ in

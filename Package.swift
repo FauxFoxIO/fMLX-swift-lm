@@ -115,6 +115,7 @@ let package = Package(
             name: "MLXVLM",
             dependencies: [
                 "MLXLMCommon",
+                .product(name: "Tokenizers", package: "swift-tokenizers"),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
