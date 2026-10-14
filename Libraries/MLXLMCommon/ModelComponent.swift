@@ -123,9 +123,13 @@ public class AnyOnDemandComponent: @unchecked Sendable {
             case .unavailable:
                 throw OnDemandComponentError.unavailable(component)
             case .pending(let source):
-                let module = make()
-                try applyCheckpoint(source.checkpoint(), to: module)
-                eval(module)
+                // Callers need not be in a withError scope, on any thread.
+                let module = try withLoaderThreadError {
+                    let module = make()
+                    try applyCheckpoint(source.checkpoint(), to: module)
+                    eval(module)
+                    return module
+                }
                 stateLock.withLock { state = .loaded(module) }
                 return module
             }
