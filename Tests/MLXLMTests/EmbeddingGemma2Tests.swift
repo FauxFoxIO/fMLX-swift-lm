@@ -89,6 +89,59 @@ struct EmbeddingGemma2Tests {
         #expect(abs(selected.last!.patches.asArray(Float.self)[0] - Float(40) / 255) < 1e-7)
     }
 
+    @Test("Selected video keyframes retain count and order while honoring the patch budget")
+    func videoKeyframes() async throws {
+        let frames = [0.0, 5.0, 11.0].enumerated().map { index, time in
+            EmbeddingGemma2VideoFrame(
+                image: .rgb(
+                    bytes: Array(repeating: UInt8(index * 80), count: 384 * 384 * 3),
+                    width: 384, height: 384), time: time)
+        }
+        let compact = try await EmbeddingGemma2MediaProcessor.video(
+            .keyframes(frames, softTokenBudget: 70))
+        let standard = try await EmbeddingGemma2MediaProcessor.video(
+            .keyframes(frames, softTokenBudget: 140))
+        #expect(compact.count == 3)
+        #expect(standard.count == 3)
+        for index in frames.indices {
+            #expect(compact[index].tokenCount == 64)
+            #expect(compact[index].patches.shape == [1, 630, 768])
+            #expect(standard[index].patches.shape == [1, 1260, 768])
+            #expect(standard[index].tokenCount > compact[index].tokenCount)
+            let expected = Float(index * 80) / 255
+            #expect(abs(compact[index].patches.asArray(Float.self)[0] - expected) < 1e-7)
+        }
+        let wide = EmbeddingGemma2VideoFrame(
+            image: .rgb(
+                bytes: Array(repeating: UInt8(128), count: 768 * 384 * 3),
+                width: 768, height: 384), time: 0)
+        let wideFrames = try await EmbeddingGemma2MediaProcessor.video(
+            .keyframes([wide], softTokenBudget: 140))
+        #expect(wideFrames.first?.tokenCount == 128)
+    }
+
+    @Test("Selected video keyframes reject invalid counts, timestamps, and budgets")
+    func invalidVideoKeyframes() async throws {
+        let rgb = EmbeddingGemma2Image.rgb(bytes: [0, 0, 0], width: 1, height: 1)
+        let invalidTimes: [[Double]] = [
+            [], [0, 0], [1, 0], [-1], [.nan], [.infinity], [-.infinity],
+            (0 ... 32).map(Double.init),
+        ]
+        for times in invalidTimes {
+            let frames = times.map { EmbeddingGemma2VideoFrame(image: rgb, time: $0) }
+            await #expect(throws: EmbeddingGemma2Error.self) {
+                try await EmbeddingGemma2MediaProcessor.video(
+                    .keyframes(frames, softTokenBudget: 70))
+            }
+        }
+        for budget in [0, 69, 141, 1121] {
+            await #expect(throws: EmbeddingGemma2Error.self) {
+                try await EmbeddingGemma2MediaProcessor.video(
+                    .keyframes([.init(image: rgb, time: 0)], softTokenBudget: budget))
+            }
+        }
+    }
+
     @Test(
         "Pinned checkpoint executes all modalities and reloads identical text embeddings",
         .enabled(if: ProcessInfo.processInfo.environment["EMBEDDINGGEMMA2_MODEL_DIRECTORY"] != nil))

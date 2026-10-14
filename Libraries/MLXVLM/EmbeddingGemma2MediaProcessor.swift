@@ -64,6 +64,29 @@ enum EmbeddingGemma2MediaProcessor {
         -> [EmbeddingGemma2PreparedImage]
     {
         switch input {
+        case .keyframes(let frames, let softTokenBudget):
+            guard (1 ... 32).contains(frames.count) else {
+                throw EmbeddingGemma2Error.invalidInput("Video requires between 1 and 32 keyframes")
+            }
+            guard [70, 140, 280, 560, 1120].contains(softTokenBudget) else {
+                throw EmbeddingGemma2Error.invalidConfiguration(
+                    "Unsupported video soft-token budget")
+            }
+            var previous = -Double.infinity
+            for frame in frames {
+                guard frame.time.isFinite, frame.time >= 0, frame.time > previous else {
+                    throw EmbeddingGemma2Error.invalidInput(
+                        "Keyframe timestamps must be finite, nonnegative and strictly increasing")
+                }
+                previous = frame.time
+            }
+            var result: [EmbeddingGemma2PreparedImage] = []
+            result.reserveCapacity(frames.count)
+            for frame in frames {
+                try Task.checkCancellation()
+                result.append(try image(frame.image, softTokenBudget: softTokenBudget))
+            }
+            return result
         case .frames(let frames):
             guard let first = frames.first else {
                 throw EmbeddingGemma2Error.invalidInput("Video has no frames")

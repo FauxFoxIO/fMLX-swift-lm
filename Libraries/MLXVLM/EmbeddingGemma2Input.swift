@@ -28,6 +28,8 @@ public enum EmbeddingGemma2Video: Sendable {
     case file(URL)
     /// Contiguous source frames with their presentation times in seconds.
     case frames([EmbeddingGemma2VideoFrame])
+    /// Already selected frames, processed once in order without reference 1 Hz resampling.
+    case keyframes([EmbeddingGemma2VideoFrame], softTokenBudget: Int)
 }
 
 public struct EmbeddingGemma2VideoFrame: Sendable {
