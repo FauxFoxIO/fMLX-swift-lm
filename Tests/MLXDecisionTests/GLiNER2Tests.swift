@@ -52,6 +52,24 @@ struct GLiNER2Tests {
         }
     }
 
+    @Test("Reserved GLiNER2 tokens in task strings are rejected, not interpreted")
+    func reservedTokens() {
+        for task in [
+            GLiNER2Task(name: "intent", labels: ["a", "[SEP_STRUCT]"]),
+            GLiNER2Task(name: "[L]", labels: ["a", "b"]),
+            GLiNER2Task(name: "intent", labels: ["a", "b"], prompt: "pick [P] one"),
+            GLiNER2Task(name: "intent", labels: ["a", "b"], descriptions: ["a": "x [SEP_TEXT]"]),
+        ] {
+            #expect(throws: DecisionError.self) {
+                try GLiNER2Schema.encode(
+                    text: "text", tasks: [task], tokenizer: FakeGLiNERTokenizer(),
+                    maximumTokens: 1000)
+            }
+        }
+        // Text cannot inject them: the word splitter breaks brackets apart.
+        #expect(GLiNER2Schema.words("[SEP_TEXT] x") == ["[", "sep_text", "]", "x"])
+    }
+
     @Test("Decision questions become GLiNER2 tasks")
     func questionTasks() {
         let choice = GLiNER2Task(
@@ -83,7 +101,7 @@ struct GLiNER2Tests {
             contentsOf: Fixtures.directory.appendingPathComponent("tiny-deberta/config.json"))
         let configuration = try JSONDecoder().decode(GLiNER2Configuration.self, from: data).encoder
         #expect(configuration.relativeSpan == 32)
-        let positions = configuration.relativePositions(length: 40)
+        let positions = configuration.relativePositions(length: 40).asArray(Int32.self)
         #expect(positions[0 * 40 + 1] == -1)
         #expect(positions[1 * 40 + 0] == 1)
         #expect(positions[0 * 40 + 4] == -4)
@@ -167,10 +185,10 @@ struct GLiNER2Tests {
         for (index, text) in texts.enumerated() {
             let alone = try runtime.classify(
                 [(text, tasks)], maximumTokens: 2048, tokenBudget: 16384)
-            for (a, b) in zip(together[index].0, alone[0].0) {
+            for (a, b) in paired(together[index].0, alone[0].0) {
                 expectClose(a.scores, b.scores, tolerance: 1e-4)
             }
-            for (a, b) in zip(tight[index].0, alone[0].0) {
+            for (a, b) in paired(tight[index].0, alone[0].0) {
                 expectClose(a.scores, b.scores, tolerance: 1e-4)
             }
             #expect(abs(together[index].0[0].scores.reduce(0, +) - 1) < 1e-9)

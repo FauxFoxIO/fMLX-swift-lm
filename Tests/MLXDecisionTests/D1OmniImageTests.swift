@@ -54,7 +54,7 @@ struct D1OmniImageTests {
                     image, height: layout.thumbnail.height, width: layout.thumbnail.width))
             let expected = entry["crops"] as! [[String: Any]]
             #expect(crops.count == expected.count)
-            for (crop, reference) in zip(crops, expected) {
+            for (crop, reference) in paired(crops, expected) {
                 #expect(crop.height == reference["height"] as! Int)
                 #expect(crop.width == reference["width"] as! Int)
                 #expect(
@@ -127,6 +127,31 @@ struct D1OmniImageTests {
         return data as Data
     }
 
+    @Test("Transparent pixels keep their stored color, as PIL's convert(\"RGB\") does")
+    func straightAlpha() throws {
+        var rgba = [UInt8](repeating: 0, count: 8 * 4 * 4)
+        for pixel in 0 ..< 32 {
+            rgba[pixel * 4] = 250
+            rgba[pixel * 4 + 1] = UInt8(pixel * 7)
+            rgba[pixel * 4 + 2] = 3
+            rgba[pixel * 4 + 3] = pixel % 2 == 0 ? 0 : 255
+        }
+        let image = CGImage(
+            width: 8, height: 4, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 32,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+            provider: CGDataProvider(data: Data(rgba) as CFData)!, decode: nil,
+            shouldInterpolate: false, intent: .defaultIntent)!
+        let data = NSMutableData()
+        let destination = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil)!
+        CGImageDestinationAddImage(destination, image, nil)
+        #expect(CGImageDestinationFinalize(destination))
+        let decoded = try DecisionMedia.rgb(.encoded(data as Data)).bytes
+        for pixel in 0 ..< 32 {
+            #expect(decoded[pixel * 3 ..< pixel * 3 + 3] == [250, UInt8(pixel * 7), 3][...])
+        }
+    }
+
     @Test("Encoded images decode to their RGB bytes and turn upright by EXIF orientation")
     func encodedImages() throws {
         let bytes = Fixtures.rgb(width: 40, height: 24)
@@ -137,6 +162,19 @@ struct D1OmniImageTests {
         let rotated = try DecisionMedia.rgb(
             .encoded(try Self.png(bytes, width: 40, height: 24, orientation: 6)))
         #expect(rotated.width == 24 && rotated.height == 40)
+        // Upright pixel (row r, column c) is stored pixel (row 23 - c, column r).
+        let upright = rotated.bytes
+        for (r, c) in [(0, 0), (5, 7), (39, 23), (17, 2)] {
+            let source = ((23 - c) * 40 + r) * 3
+            #expect(
+                Array(upright[((r * 24 + c) * 3) ..< ((r * 24 + c) * 3 + 3)])
+                    == Array(bytes[source ..< source + 3]))
+        }
+        for orientation in 1 ... 8 {
+            let image = try DecisionMedia.decode(
+                .encoded(try Self.png(bytes, width: 40, height: 24, orientation: orientation)))
+            #expect(image.orientation == orientation)
+        }
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("decision-\(UUID().uuidString).png")
         try Self.png(bytes, width: 40, height: 24).write(to: url)

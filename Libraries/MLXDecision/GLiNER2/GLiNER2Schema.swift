@@ -62,7 +62,12 @@ struct GLiNER2Encoding: Sendable {
 enum GLiNER2Schema {
     static let special = (
         sepStruct: "[SEP_STRUCT]", sepText: "[SEP_TEXT]", prompt: "[P]", label: "[L]",
-        description: "[DESCRIPTION]"
+        description: "[DESCRIPTION]",
+        all: [
+            "[SEP_STRUCT]", "[SEP_TEXT]", "[P]", "[C]", "[E]", "[R]", "[L]", "[EXAMPLE]",
+            "[OUTPUT]",
+            "[DESCRIPTION]",
+        ]
     )
 
     private static let word = "[\\p{L}\\p{N}\\p{M}_\\u200c\\u200d]"
@@ -106,20 +111,15 @@ enum GLiNER2Schema {
     static func encode(
         text: String, tasks: [GLiNER2Task], tokenizer: some DecisionTokenizer, maximumTokens: Int
     ) throws -> GLiNER2Encoding {
-        let schemas = tasks.map(schemaTokens)
-        var combined = [String]()
-        var markers = Set<Int>()
-        var offset = 0
-        for schema in schemas {
-            if schema.count > 1 { markers.insert(offset + 1) }
-            for index in stride(from: 4, to: schema.count - 2, by: 2) {
-                markers.insert(offset + index)
+        for task in tasks {
+            for value in [task.name, task.prompt ?? ""] + task.labels
+                + Array(task.descriptions.values)
+            where special.all.contains(where: value.contains) {
+                throw DecisionError.invalidInput(
+                    "GLiNER2 task \(task.name) uses a reserved token such as [L] or [SEP_STRUCT]")
             }
-            combined += schema + [special.sepStruct]
-            offset += schema.count + 1
         }
-        if !combined.isEmpty { combined.removeLast() }
-        combined.append(special.sepText)
+        let schemas = tasks.map(schemaTokens)
 
         var cache = [String: [String]]()
         func pieces(_ token: String) throws -> [String] {
@@ -129,14 +129,19 @@ enum GLiNER2Schema {
             return result
         }
 
+        // Markers sit at fixed slots of each schema: `[P]` at 1, then every `[L]` from 4.
         var subwords = [String]()
         var markerPositions = [[Int]](repeating: [], count: schemas.count)
-        var schemaIndex = 0
-        for (index, token) in combined.enumerated() {
-            if token == special.sepStruct { schemaIndex += 1 }
-            if markers.contains(index) { markerPositions[schemaIndex].append(subwords.count) }
-            subwords += try pieces(token)
+        for (schemaIndex, schema) in schemas.enumerated() {
+            if schemaIndex > 0 { subwords += try pieces(special.sepStruct) }
+            for (index, token) in schema.enumerated() {
+                if index == 1 || (index >= 4 && index < schema.count - 2 && index % 2 == 0) {
+                    markerPositions[schemaIndex].append(subwords.count)
+                }
+                subwords += try pieces(token)
+            }
         }
+        subwords += try pieces(special.sepText)
         guard subwords.count < maximumTokens else {
             throw DecisionError.contextOverflow(
                 "the GLiNER2 schema takes \(subwords.count) of \(maximumTokens) tokens")

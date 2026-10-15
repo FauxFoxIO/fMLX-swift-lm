@@ -24,6 +24,14 @@ enum D1OmniMelFrontend {
         return x
     }
 
+    /// Prefix positions a clip of `sampleCount` samples becomes: one per 80 ms.
+    static func prefixLength(sampleCount: Int) -> Int {
+        let samples = max(minimumSamples, min(sampleCount, maximumSeconds * sampleRate))
+        var length = samples / hop
+        for _ in 0 ..< 3 { length = (length - 1) / 2 + 1 }
+        return length
+    }
+
     /// Features [frames + 1, bins] in float32 and the valid frame count.
     static func features(_ clip: [Float], bins: Int) -> (MLXArray, Int) {
         let n = clip.count

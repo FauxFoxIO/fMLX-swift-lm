@@ -202,10 +202,14 @@ public final class D1OmniModel: DecisionModel {
     }
 
     public func decide(_ requests: [DecisionRequest]) async throws -> [DecisionResult] {
+        // Media decode outside the model's lock; only GPU work runs inside it.
+        var decoded = [D1OmniRequest]()
+        for request in requests { decoded.append(try await D1OmniRequest(request)) }
         let artifact = artifact
         let budget = tokenBudget
+        let ready = decoded
         return try await state.read { runtime in
-            try await runtime.decide(requests, tokenBudget: budget, artifact: artifact)
+            try runtime.decide(ready, tokenBudget: budget, artifact: artifact)
         }
     }
 
@@ -217,6 +221,33 @@ public final class D1OmniModel: DecisionModel {
 
     public var loadedModalities: Set<DecisionModality> {
         get async { await state.read { $0.loadedModalities } }
+    }
+}
+
+/// A checked request with its media decoded into plain values.
+struct D1OmniRequest: Sendable {
+    let state: String?
+    let questions: [DecisionQuestion]
+    let images: [DecodedImage]
+    let audio: [Float]?
+
+    init(_ request: DecisionRequest) async throws {
+        guard !request.questions.isEmpty else {
+            throw DecisionError.invalidInput("a request needs at least one question")
+        }
+        for question in request.questions { try question.validate() }
+        guard request.images.isEmpty || request.audio == nil else {
+            throw DecisionError.invalidInput("a request carries images or audio, not both")
+        }
+        state = request.state
+        questions = request.questions
+        images = try request.images.map(DecisionMedia.decode)
+        if let audio = request.audio {
+            self.audio = try await DecisionMedia.waveform(
+                audio, maximumSeconds: D1OmniMelFrontend.maximumSeconds)
+        } else {
+            audio = nil
+        }
     }
 }
 
@@ -314,39 +345,40 @@ final class D1OmniRuntime {
         let calibrate: Bool
     }
 
-    func decide(_ requests: [DecisionRequest], tokenBudget: Int, artifact: DecisionArtifact)
-        async throws -> [DecisionResult]
+    func decide(_ requests: [D1OmniRequest], tokenBudget: Int, artifact: DecisionArtifact) throws
+        -> [DecisionResult]
     {
         let configuration = network.configuration
         var pending = [[Pending]]()
         var read = [Int]()
         for request in requests {
             try Task.checkCancellation()
-            guard !request.questions.isEmpty else {
-                throw DecisionError.invalidInput("a request needs at least one question")
-            }
-            for question in request.questions { try question.validate() }
-            guard request.images.isEmpty || request.audio == nil else {
-                throw DecisionError.invalidInput("a request carries images or audio, not both")
-            }
             var prefix: MLXArray?
             var maxLength = maximumLength
             var mode = D1OmniMediaMode.text
             var state = request.state ?? ""
+            // The prefix length is known before the encoders run, so oversized media cost nothing.
+            func checkRoom(_ media: Int) throws {
+                guard min(maxLength, maximumLength - media) >= 64 else {
+                    throw DecisionError.contextOverflow(
+                        "the media take \(media) of the \(maximumLength) positions; send fewer images"
+                    )
+                }
+            }
             if !request.images.isEmpty {
                 let prepared = try request.images.map {
-                    try D1OmniImageProcessor.prepare(DecisionMedia.rgb($0))
+                    try D1OmniImageProcessor.prepare(DecisionRGBImage(pixels: $0.pixels()))
                 }
-                prefix = try visionTower()(prepared)
                 maxLength = configuration.imageTextLength
                 mode = .image
-            } else if let audio = request.audio {
-                let samples = try await DecisionMedia.waveform(
-                    audio, maximumSeconds: D1OmniMelFrontend.maximumSeconds)
-                prefix = try audioEncoder()(samples)
+                try checkRoom(prepared.reduce(0) { $0 + $1.tokenCount })
+                prefix = try visionTower()(prepared)
+            } else if let samples = request.audio {
                 maxLength = configuration.audioTextLength
                 mode = .audio
                 state = request.state ?? "{}"
+                try checkRoom(D1OmniMelFrontend.prefixLength(sampleCount: samples.count))
+                prefix = try audioEncoder()(samples)
             }
             if let prefix { eval(prefix) }
             let media = prefix?.dim(0) ?? 0
@@ -405,19 +437,13 @@ final class D1OmniRuntime {
 
     /// Rows -> logits, batched longest first under a padded-token budget.
     func run(_ rows: [D1OmniNetwork.Row], tokenBudget: Int) throws -> [[Float]] {
-        var results = [[Float]?](repeating: nil, count: rows.count)
-        var order = rows.indices.sorted { rows[$0].length > rows[$1].length }
-        while !order.isEmpty {
+        var results = [[Float]](repeating: [], count: rows.count)
+        for batch in decisionBatches(lengths: rows.map(\.length), budget: tokenBudget) {
             try Task.checkCancellation()
-            let longest = rows[order[0]].length
-            var size = 1
-            while size < order.count, (size + 1) * longest <= tokenBudget { size += 1 }
-            let batch = Array(order.prefix(size))
-            order.removeFirst(size)
             for (index, logits) in zip(batch, network.logits(batch.map { rows[$0] })) {
                 results[index] = logits
             }
         }
-        return results.map { $0! }
+        return results
     }
 }

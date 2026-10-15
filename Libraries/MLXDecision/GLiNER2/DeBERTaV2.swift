@@ -68,33 +68,27 @@ public struct DeBERTaV2Configuration: Codable, Sendable {
         }
     }
 
-    /// `make_log_bucket_position` over `build_relative_position`, as Int32 [L, L].
-    func relativePositions(length: Int) -> [Int32] {
-        var result = [Int32](repeating: 0, count: length * length)
+    /// `make_log_bucket_position` for one query-minus-key distance.
+    func bucket(_ relative: Int) -> Int32 {
         let bucket = positionBuckets
         let maximum = relativeSpan
-        for q in 0 ..< length {
-            for k in 0 ..< length {
-                let relative = q - k
-                guard bucket > 0, maximum > 0 else {
-                    result[q * length + k] = Int32(relative)
-                    continue
-                }
-                let middle = bucket / 2
-                let absolute = relative < middle && relative > -middle ? middle - 1 : abs(relative)
-                if absolute <= middle {
-                    result[q * length + k] = Int32(relative)
-                } else {
-                    // Transformers computes this in float32.
-                    let ratio = Float(absolute) / Float(middle)
-                    let scale = log(Float(Double(maximum - 1) / Double(middle)))
-                    let logPosition =
-                        (log(ratio) / scale * Float(middle - 1)).rounded(.up) + Float(middle)
-                    result[q * length + k] = Int32(logPosition) * Int32(relative.signum())
-                }
-            }
-        }
-        return result
+        guard bucket > 0, maximum > 0 else { return Int32(relative) }
+        let middle = bucket / 2
+        let absolute = relative < middle && relative > -middle ? middle - 1 : abs(relative)
+        if absolute <= middle { return Int32(relative) }
+        // Transformers computes this in float32.
+        let ratio = Float(absolute) / Float(middle)
+        let scale = log(Float(Double(maximum - 1) / Double(middle)))
+        let position = (log(ratio) / scale * Float(middle - 1)).rounded(.up) + Float(middle)
+        return Int32(position) * Int32(relative.signum())
+    }
+
+    /// Bucketed relative positions [L, L], built from the 2L - 1 distinct distances.
+    func relativePositions(length: Int) -> MLXArray {
+        let table = MLXArray((-(length - 1) ..< length).map(bucket))
+        let positions = MLXArray(Int32(0) ..< Int32(length))
+        let distance = positions.expandedDimensions(axis: 1) - positions.expandedDimensions(axis: 0)
+        return take(table, distance + Int32(length - 1))
     }
 }
 
@@ -247,7 +241,7 @@ final class DeBERTaV2Encoder: Module {
         let span = configuration.positionEmbeddingSize
         let table = relativeEmbeddings(MLXArray(Int32(0) ..< Int32(2 * span)))
         let relative = layerNorm(table)[.newAxis]
-        let positions = MLXArray(configuration.relativePositions(length: length), [length, length])
+        let positions = configuration.relativePositions(length: length)
         let c2p =
             configuration.positionAttentionTypes.contains("c2p")
             ? clip(positions + Int32(span), min: 0, max: 2 * span - 1)[.newAxis, .newAxis] : nil

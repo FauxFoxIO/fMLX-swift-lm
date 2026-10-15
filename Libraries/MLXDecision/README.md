@@ -38,9 +38,10 @@ result.distributions[1].top          // "billing"
 result.distributions[0].probabilities  // [P(yes), P(no)]
 ```
 
-States are text. For JSON, `DecisionJSON(...).serialized` writes exactly what
-Python's `json.dumps(state, ensure_ascii=False)` writes, the form d1-omni was
-trained on.
+States are text. For JSON, build a `DecisionJSON` value, such as
+`.object([.init("page", .string("Release notes"))])`; its `serialized` text is
+exactly what Python's `json.dumps(state, ensure_ascii=False)` writes, the form
+d1-omni was trained on.
 
 Loaders read a local snapshot and never download. The installer supplies the
 artifact identity and revision.
@@ -51,7 +52,10 @@ artifact identity and revision.
   request. A request carries images or audio, not both.
 - Images are tiled as LFM2-VL tiles them (up to ten 512 px tiles plus a
   thumbnail) and resized exactly as torchvision's uint8 antialiased bilinear
-  resize does. Files and encoded images are turned upright by EXIF orientation.
+  resize does. Files and encoded images keep their stored 8-bit samples, without
+  color management or alpha compositing, as PIL's `convert("RGB")` reads them,
+  and are turned upright by EXIF orientation. Media decode before the model's
+  lock; the media prefix length is checked before an encoder runs.
 - Audio is mixed to mono, resampled to 16 kHz, cut to 30 s, and padded to
   0.5 s. Every 80 ms becomes one prefix position.
 - Text answers are divided by the per-type temperatures in `config.json`.

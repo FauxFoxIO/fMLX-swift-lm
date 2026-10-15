@@ -210,3 +210,18 @@ func softmax(_ values: [Double]) -> [Double] {
     let total = exps.reduce(0, +)
     return exps.map { $0 / total }
 }
+
+/// Row indices in forward batches: longest first, each batch padding to at most `budget`
+/// positions. A row longer than the budget runs alone.
+func decisionBatches(lengths: [Int], budget: Int) -> [[Int]] {
+    var order = lengths.indices.sorted { lengths[$0] > lengths[$1] }
+    var batches = [[Int]]()
+    while !order.isEmpty {
+        let longest = lengths[order[0]]
+        var size = 1
+        while size < order.count, (size + 1) * longest <= budget { size += 1 }
+        batches.append(Array(order.prefix(size)))
+        order.removeFirst(size)
+    }
+    return batches
+}

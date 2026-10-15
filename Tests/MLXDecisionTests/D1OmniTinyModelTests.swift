@@ -61,7 +61,7 @@ struct D1OmniTinyModelTests {
         let entries = text["rows"] as! [[String: Any]]
         let expected = text["logits"] as! [[Double]]
         let logits = network.logits(Self.rows(entries, prefix: nil))
-        for (row, reference) in zip(logits, expected) {
+        for (row, reference) in paired(logits, expected) {
             expectClose(row.map(Double.init), reference, tolerance: 2e-4)
         }
         // A row alone matches the same row in a padded batch.
@@ -88,7 +88,7 @@ struct D1OmniTinyModelTests {
             #expect(prefix.shape == entry["prefix_shape"] as! [Int])
             expectSummary(prefix, entry["prefix"] as! [String: Any], tolerance: 2e-3)
             let logits = network.logits(Self.rows(entries, prefix: prefix))
-            for (row, expected) in zip(logits, entry["logits"] as! [[Double]]) {
+            for (row, expected) in paired(logits, entry["logits"] as! [[Double]]) {
                 expectClose(row.map(Double.init), expected, tolerance: 2e-3)
             }
         }
@@ -117,7 +117,7 @@ struct D1OmniTinyModelTests {
             #expect(prefix.shape == entry["prefix_shape"] as! [Int])
             expectSummary(prefix, entry["prefix"] as! [String: Any], tolerance: 2e-3)
             let logits = network.logits(Self.rows(entries, prefix: prefix))
-            for (row, expected) in zip(logits, entry["logits"] as! [[Double]]) {
+            for (row, expected) in paired(logits, entry["logits"] as! [[Double]]) {
                 expectClose(row.map(Double.init), expected, tolerance: 2e-3)
             }
         }
@@ -146,7 +146,7 @@ struct D1OmniTinyModelTests {
             let result = try await runtime.decide(
                 [request], tokenBudget: 65536, artifact: artifact)[0]
             #expect(result.inputTokens == entry["input_tokens"] as! Int)
-            for (distribution, expected) in zip(
+            for (distribution, expected) in paired(
                 result.distributions, entry["probabilities"] as! [[Double]])
             {
                 expectClose(distribution.probabilities, expected, tolerance: 2e-3)
@@ -240,8 +240,8 @@ struct D1OmniTinyModelTests {
         let plain = D1OmniNetwork(configuration)
         try DecisionWeights.apply(
             dequantized, to: plain, groupSize: nil, bits: nil, mode: nil, precision: .checkpoint)
-        for ((row, reference), quantizedRow) in zip(
-            zip(plain.logits(rows), expected), network.logits(rows))
+        for ((row, reference), quantizedRow) in paired(
+            Array(paired(plain.logits(rows), expected)), network.logits(rows))
         {
             expectClose(quantizedRow.map(Double.init), row.map(Double.init), tolerance: 1e-3)
             expectClose(row.map(Double.init), reference.map(Double.init), tolerance: 0.5)
@@ -257,7 +257,9 @@ struct D1OmniTinyModelTests {
         try DecisionWeights.apply(
             half, to: float32, groupSize: nil, bits: nil, mode: nil, precision: .float32)
         #expect(float32.dtype == .float32)
-        for ((a, b), reference) in zip(zip(float16.logits(rows), float32.logits(rows)), expected) {
+        for ((a, b), reference) in paired(
+            Array(paired(float16.logits(rows), float32.logits(rows))), expected)
+        {
             expectClose(a.map(Double.init), reference.map(Double.init), tolerance: 0.05)
             expectClose(b.map(Double.init), reference.map(Double.init), tolerance: 0.05)
         }

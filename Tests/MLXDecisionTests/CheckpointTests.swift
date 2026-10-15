@@ -43,7 +43,7 @@ func checkD1Omni(snapshot: URL, fixture: String, tolerance: Double) async throws
         let result = try await model.decide(DecisionRequest(state: state, questions: questions))
         print("\(fixture) text decision: \(clock.now - start)")
         #expect(result.inputTokens == entry["input_tokens"] as! Int)
-        for (distribution, expected) in zip(
+        for (distribution, expected) in paired(
             result.distributions, entry["probabilities"] as! [[Double]])
         {
             expectClose(distribution.probabilities, expected, tolerance: tolerance)
@@ -53,11 +53,11 @@ func checkD1Omni(snapshot: URL, fixture: String, tolerance: Double) async throws
         // Upcast weights isolate the port from float16 rounding.
         let upcast = try await D1OmniLoader.load(
             from: snapshot, artifact: model.artifact, precision: .float32)
-        for (entry, expected) in zip(reference["text"] as! [[String: Any]], float32) {
+        for (entry, expected) in paired(reference["text"] as! [[String: Any]], float32) {
             let questions = (entry["questions"] as! [[String: Any]]).map(decisionQuestion)
             let result = try await upcast.decide(
                 DecisionRequest(state: entry["state"] as? String, questions: questions))
-            for (distribution, probabilities) in zip(result.distributions, expected) {
+            for (distribution, probabilities) in paired(result.distributions, expected) {
                 expectClose(distribution.probabilities, probabilities, tolerance: 5e-4)
             }
         }
@@ -77,7 +77,7 @@ func checkD1Omni(snapshot: URL, fixture: String, tolerance: Double) async throws
                 ]))
         print("\(fixture) \(width)x\(height) image decision: \(clock.now - start)")
         #expect(result.inputTokens == entry["input_tokens"] as! Int)
-        for (distribution, expected) in zip(
+        for (distribution, expected) in paired(
             result.distributions, entry["probabilities"] as! [[Double]])
         {
             expectClose(distribution.probabilities, expected, tolerance: tolerance * 2)
@@ -94,7 +94,7 @@ func checkD1Omni(snapshot: URL, fixture: String, tolerance: Double) async throws
                 audio: .pcm16(
                     samples: Fixtures.pcm(count: entry["samples"] as! Int), sampleRate: 16000)))
         #expect(result.inputTokens == entry["input_tokens"] as! Int)
-        for (distribution, expected) in zip(
+        for (distribution, expected) in paired(
             result.distributions, entry["probabilities"] as! [[Double]])
         {
             expectClose(distribution.probabilities, expected, tolerance: tolerance * 2)

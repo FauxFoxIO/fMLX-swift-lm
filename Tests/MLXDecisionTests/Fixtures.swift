@@ -143,3 +143,22 @@ struct FakeGLiNERTokenizer: DecisionTokenizer {
 
     var unknownToken: String? { "[UNK]" }
 }
+
+extension D1OmniRuntime {
+    /// Decodes media as `D1OmniModel.decide` does, then runs the requests.
+    func decide(_ requests: [DecisionRequest], tokenBudget: Int, artifact: DecisionArtifact)
+        async throws -> [DecisionResult]
+    {
+        var decoded = [D1OmniRequest]()
+        for request in requests { decoded.append(try await D1OmniRequest(request)) }
+        return try decide(decoded, tokenBudget: tokenBudget, artifact: artifact)
+    }
+}
+
+/// `zip` that first expects both sides to have the same length.
+func paired<A: Collection, B: Collection>(
+    _ a: A, _ b: B, sourceLocation: SourceLocation = #_sourceLocation
+) -> Zip2Sequence<A, B> {
+    #expect(a.count == b.count, "\(a.count) vs \(b.count) items", sourceLocation: sourceLocation)
+    return zip(a, b)
+}

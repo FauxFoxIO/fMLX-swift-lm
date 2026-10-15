@@ -149,4 +149,17 @@ struct DecisionTypesTests {
         #expect(cut.count == 16_000)
     }
     #endif
+
+    @Test("Batches go longest first and stay within the padded-token budget")
+    func batches() {
+        let lengths = [5, 40, 12, 40, 3, 100]
+        let batches = decisionBatches(lengths: lengths, budget: 90)
+        #expect(batches.flatMap { $0 }.sorted() == Array(lengths.indices))
+        #expect(batches.first == [5])
+        for batch in batches where batch.count > 1 {
+            let longest = batch.map { lengths[$0] }.max()!
+            #expect(longest * batch.count <= 90)
+        }
+        #expect(decisionBatches(lengths: [], budget: 10).isEmpty)
+    }
 }

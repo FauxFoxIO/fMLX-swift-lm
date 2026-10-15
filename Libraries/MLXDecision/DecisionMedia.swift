@@ -34,10 +34,61 @@ struct DecisionRGBImage {
     }
 }
 
+/// A decoded image as plain values, so it can cross into a model's serialized domain.
+/// Pixel values are the file's own samples, without color management, as PIL reads them.
+struct DecodedImage: Sendable {
+    let bytes: [UInt8]
+    let width: Int
+    let height: Int
+    let bytesPerRow: Int
+    let bytesPerPixel: Int
+    /// Byte offsets of red, green, and blue within a pixel.
+    let channels: [Int]
+    /// Byte offset of a premultiplied alpha value, when the samples carry one.
+    let premultipliedAlpha: Int?
+    /// EXIF orientation, 1 through 8.
+    let orientation: Int
+
+    /// Upright RGB [height, width, 3] as uint8.
+    func pixels() -> MLXArray {
+        let rows = MLXArray(bytes, [height, bytesPerRow])[0..., ..<(width * bytesPerPixel)]
+        let pixels = rows.reshaped(height, width, bytesPerPixel)
+        var rgb = take(pixels, MLXArray(channels.map(Int32.init)), axis: 2)
+        if let premultipliedAlpha {
+            let alpha = pixels[0..., 0..., premultipliedAlpha ..< (premultipliedAlpha + 1)]
+                .asType(.float32)
+            let straight = round(rgb.asType(.float32) * 255 / maximum(alpha, MLXArray(Float(1))))
+            rgb = clip(straight, min: 0, max: 255).asType(.uint8)
+        }
+        return Self.upright(rgb, orientation: orientation)
+    }
+
+    /// PIL's `exif_transpose` as array flips and transposes.
+    static func upright(_ x: MLXArray, orientation: Int) -> MLXArray {
+        func flipRows(_ a: MLXArray) -> MLXArray { a[.stride(by: -1)] }
+        func flipColumns(_ a: MLXArray) -> MLXArray { a[0..., .stride(by: -1)] }
+        func transpose(_ a: MLXArray) -> MLXArray { a.transposed(1, 0, 2) }
+        switch orientation {
+        case 2: return flipColumns(x)
+        case 3: return flipRows(flipColumns(x))
+        case 4: return flipRows(x)
+        case 5: return transpose(x)
+        case 6: return flipColumns(transpose(x))
+        case 7: return flipRows(flipColumns(transpose(x)))
+        case 8: return flipRows(transpose(x))
+        default: return x
+        }
+    }
+}
+
 enum DecisionMedia {
     static let maximumPixels = 64 * 1024 * 1024
 
     static func rgb(_ image: DecisionImage) throws -> DecisionRGBImage {
+        DecisionRGBImage(pixels: try decode(image).pixels())
+    }
+
+    static func decode(_ image: DecisionImage) throws -> DecodedImage {
         switch image {
         case .rgb(let bytes, let width, let height):
             let (pixels, overflow) = width.multipliedReportingOverflow(by: height)
@@ -48,7 +99,9 @@ enum DecisionMedia {
                     "an RGB image needs width * height * 3 bytes and at most \(maximumPixels) pixels"
                 )
             }
-            return DecisionRGBImage(bytes: bytes, width: width, height: height)
+            return DecodedImage(
+                bytes: bytes, width: width, height: height, bytesPerRow: width * 3,
+                bytesPerPixel: 3, channels: [0, 1, 2], premultipliedAlpha: nil, orientation: 1)
         case .file(let url):
             guard url.isFileURL else {
                 throw DecisionError.invalidInput("an image file needs a local file URL")
@@ -74,50 +127,83 @@ enum DecisionMedia {
     }
 
     #if canImport(CoreGraphics) && canImport(ImageIO)
-    private static func decode(_ source: CGImageSource) throws -> DecisionRGBImage {
-        guard let decoded = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+    private static func decode(_ source: CGImageSource) throws -> DecodedImage {
+        guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw DecisionError.invalidInput("cannot decode the image")
         }
-        guard decoded.width * decoded.height <= maximumPixels else {
-            throw DecisionError.invalidInput("the image has more than \(maximumPixels) pixels")
+        guard image.width > 0, image.height > 0, image.width * image.height <= maximumPixels else {
+            throw DecisionError.invalidInput(
+                "the image is empty or has more than \(maximumPixels) pixels")
         }
         let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any]
         let orientation =
             (properties?[kCGImagePropertyOrientation as String] as? NSNumber)?.intValue ?? 1
-        if orientation != 1 {
-            let options: [String: Any] = [
-                kCGImageSourceCreateThumbnailFromImageAlways as String: true,
-                kCGImageSourceCreateThumbnailWithTransform as String: true,
-                kCGImageSourceThumbnailMaxPixelSize as String: max(decoded.width, decoded.height),
-            ]
-            guard
-                let oriented = CGImageSourceCreateThumbnailAtIndex(
-                    source, 0, options as CFDictionary)
-            else {
-                throw DecisionError.invalidInput("cannot apply the image orientation")
-            }
-            return try render(oriented)
+        guard (1 ... 8).contains(orientation) else {
+            throw DecisionError.invalidInput("invalid EXIF orientation \(orientation)")
         }
-        return try render(decoded)
+        return try samples(image, orientation: orientation)
+            ?? render(image, orientation: orientation)
     }
 
-    private static func render(_ image: CGImage) throws -> DecisionRGBImage {
+    /// The decoded 8-bit samples of an RGB or gray image with straight or no alpha.
+    private static func samples(_ image: CGImage, orientation: Int) throws -> DecodedImage? {
+        guard image.bitsPerComponent == 8, let model = image.colorSpace?.model,
+            model == .rgb || model == .monochrome,
+            let data = image.dataProvider?.data
+        else { return nil }
+        let bytesPerPixel = image.bitsPerPixel / 8
+        let components = model == .rgb ? 3 : 1
+        let alpha = image.alphaInfo
+        let hasAlphaSlot = alpha != .none
+        guard bytesPerPixel == components + (hasAlphaSlot ? 1 : 0),
+            alpha != .premultipliedFirst, alpha != .premultipliedLast, alpha != .alphaOnly,
+            image.bytesPerRow >= image.width * bytesPerPixel,
+            CFDataGetLength(data) >= image.bytesPerRow * (image.height - 1) + image.width
+                * bytesPerPixel
+        else { return nil }
+        let alphaFirst = alpha == .first || alpha == .noneSkipFirst
+        var color = model == .rgb ? [0, 1, 2] : [0, 0, 0]
+        if hasAlphaSlot, alphaFirst { color = color.map { $0 + 1 } }
+        switch image.byteOrderInfo {
+        case .orderDefault, .order32Big, .order16Big:
+            break
+        case .order32Little where bytesPerPixel == 4:
+            color = color.map { 3 - $0 }
+        default:
+            return nil
+        }
+        var bytes = [UInt8](repeating: 0, count: CFDataGetLength(data))
+        CFDataGetBytes(data, CFRange(location: 0, length: bytes.count), &bytes)
+        return DecodedImage(
+            bytes: bytes, width: image.width, height: image.height, bytesPerRow: image.bytesPerRow,
+            bytesPerPixel: bytesPerPixel, channels: color, premultipliedAlpha: nil,
+            orientation: orientation)
+    }
+
+    /// Other layouts (16-bit, indexed, CMYK, premultiplied) drawn into 8-bit RGBA.
+    private static func render(_ image: CGImage, orientation: Int) throws -> DecodedImage {
         let width = image.width
         let height = image.height
         var rgba = [UInt8](repeating: 0, count: width * height * 4)
+        let space =
+            image.colorSpace.flatMap { $0.model == .rgb ? $0 : nil }
+            ?? CGColorSpace(name: CGColorSpace.sRGB)!
         let rendered = rgba.withUnsafeMutableBytes { bytes -> Bool in
-            guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+            guard
                 let context = CGContext(
                     data: bytes.baseAddress, width: width, height: height, bitsPerComponent: 8,
                     bytesPerRow: width * 4, space: space,
                     bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
-                        | CGImageAlphaInfo.noneSkipLast.rawValue)
+                        | CGImageAlphaInfo.premultipliedLast.rawValue)
             else { return false }
             context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
             return true
         }
         guard rendered else { throw DecisionError.invalidInput("cannot render the image as RGB") }
-        return DecisionRGBImage(pixels: MLXArray(rgba, [height, width, 4])[0..., 0..., ..<3])
+        return DecodedImage(
+            bytes: rgba, width: width, height: height, bytesPerRow: width * 4, bytesPerPixel: 4,
+            channels: [0, 1, 2], premultipliedAlpha: image.alphaInfo == .none ? nil : 3,
+            orientation: orientation)
     }
     #endif
 
@@ -126,16 +212,32 @@ enum DecisionMedia {
         let limit = maximumSeconds * 16_000
         switch audio {
         case .pcm(let samples, let rate, let channels):
+            let kept = try frames(samples, sampleRate: rate, channels: channels, limit: limit)
             return try resample(
-                try mix(samples, channels: channels), sampleRate: rate, limit: limit)
+                try mix(Array(kept), channels: channels), sampleRate: rate, limit: limit)
         case .pcm16(let samples, let rate, let channels):
             // Scale after mixing, as the reference divides the mono int16 clip by 32768.
-            let floats = samples.map { Float($0) }
-            let mono = try mix(floats, channels: channels).map { $0 / 32768 }
+            let kept = try frames(samples, sampleRate: rate, channels: channels, limit: limit)
+            let mono = try mix(kept.map { Float($0) }, channels: channels).map { $0 / 32768 }
             return try resample(mono, sampleRate: rate, limit: limit)
         case .file(let url):
             return try await decode(url, limit: limit)
         }
+    }
+
+    /// The leading frames that cover `limit` output samples, plus resampler history.
+    private static func frames<T>(_ samples: [T], sampleRate: Int, channels: Int, limit: Int) throws
+        -> ArraySlice<T>
+    {
+        guard sampleRate > 0, channels > 0, !samples.isEmpty, samples.count % channels == 0 else {
+            throw DecisionError.invalidInput(
+                "audio needs a positive rate, complete frames, and at least one sample")
+        }
+        let keep =
+            sampleRate == 16_000
+            ? limit
+            : Int((Double(limit) * Double(sampleRate) / 16_000).rounded(.up)) + sampleRate / 10
+        return samples.prefix(keep * channels)
     }
 
     private static func mix(_ samples: [Float], channels: Int) throws -> [Float] {

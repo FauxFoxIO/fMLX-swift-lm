@@ -233,15 +233,9 @@ final class GLiNER2Runtime {
                 try GLiNER2Schema.encode(
                     text: text, tasks: tasks, tokenizer: tokenizer, maximumTokens: maximumTokens))
         }
-        var logits = [[[Float]]?](repeating: nil, count: encodings.count)
-        var order = encodings.indices.sorted { encodings[$0].ids.count > encodings[$1].ids.count }
-        while !order.isEmpty {
+        var logits = [[[Float]]](repeating: [], count: encodings.count)
+        for batch in decisionBatches(lengths: encodings.map(\.ids.count), budget: tokenBudget) {
             try Task.checkCancellation()
-            let longest = encodings[order[0]].ids.count
-            var size = 1
-            while size < order.count, (size + 1) * longest <= tokenBudget { size += 1 }
-            let batch = Array(order.prefix(size))
-            order.removeFirst(size)
             for (index, values) in zip(batch, network.logits(batch.map { encodings[$0] })) {
                 logits[index] = values
             }
@@ -249,7 +243,7 @@ final class GLiNER2Runtime {
         var results = [([GLiNER2Classification], Int)]()
         for ((_, tasks), (encoding, values)) in zip(inputs, zip(encodings, logits)) {
             var classifications = [GLiNER2Classification]()
-            for (task, z) in zip(tasks, values!) {
+            for (task, z) in zip(tasks, values) {
                 let logits = z.map(Double.init)
                 guard logits.allSatisfy(\.isFinite) else { throw DecisionError.nonFiniteOutput }
                 let scores =
