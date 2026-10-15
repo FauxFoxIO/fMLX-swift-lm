@@ -20,9 +20,6 @@ For some example applications and tools that use MLX Swift LM, check out [MLX Sw
 
 ## Documentation
 
-- [FMLXText: model-specific tokenizer and native runtime pairing](docs/checkpoint-text.md)
-- [Bonsai PTQ1 and DFlash2 native artifacts](docs/bonsai-dflash.md)
-
 Developers can use these examples in their own programs -- just import the swift package!
 
 - [Porting and implementing models](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/porting)
@@ -105,7 +102,7 @@ print(try await session.respond(to: "How about a great place to eat?"))
 For alternative integration approaches (custom downloaders, alternative tokenizer packages, local-only weights), see the [using documentation](Libraries/MLXLMCommon/Documentation.docc/using.md).
 
 Applications that need an in-process installed-model catalog, resumable downloads, and persistent
-cache management can use [`FMLXModelManagement`](docs/model-management.md).
+cache management can use `FMLXModelManagement`.
 
 ## `FoundationModels` integration
 
