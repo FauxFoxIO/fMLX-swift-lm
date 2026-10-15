@@ -80,6 +80,20 @@ artifact identity and revision.
   name and the instructions are the prompt.
 - Text words past `maximumTokens` are dropped; the schema always stays whole.
 
+## d1-3B
+
+Liquid d1-3B is an LFM2-VL checkpoint (`lfm2_vl`) that answers through the
+language model's next-token logits, so it runs on `MLXVLM.LFM2VL` rather than in
+this library. Render d1's own prompt (its `prompt.py`, with one `<image>` token
+per picture where the chat template would place it), then pass the token ids
+and pictures to `LFM2VLProcessor.prepare(tokens:images:processing:)`. It lays
+out, resizes, and marks up each picture exactly as Transformers'
+`Lfm2VlProcessor` does for d1-3B. d1's reference first scales pictures above
+1 MP down with PIL bicubic; callers do that before `prepare`. Read each option's
+best token log-probability at the last position and softmax over the options.
+`Tests/LFM2VLTests` checks this path against Transformers and, with a local
+`LiquidAI/d1-3B-MLX-8bit` snapshot, against MLX-VLM.
+
 ## Parity
 
 `Tests/MLXDecisionTests` checks the Swift code against the reference
