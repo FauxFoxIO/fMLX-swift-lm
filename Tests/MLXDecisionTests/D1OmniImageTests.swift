@@ -6,6 +6,11 @@ import Testing
 
 @testable import MLXDecision
 
+#if canImport(ImageIO)
+import CoreGraphics
+import ImageIO
+#endif
+
 struct D1OmniImageTests {
     @Test("Smart resize, grid, and thumbnail match LFM2-VL")
     func layouts() throws {
@@ -98,4 +103,45 @@ struct D1OmniImageTests {
         let image = try DecisionMedia.rgb(.rgb(bytes: [1, 2, 3, 4, 5, 6], width: 2, height: 1))
         #expect(image.crop(x: 1, y: 0, width: 1, height: 1).bytes == [4, 5, 6])
     }
+
+    #if canImport(ImageIO)
+    /// PNG data for packed RGB bytes, with an optional EXIF orientation.
+    static func png(_ bytes: [UInt8], width: Int, height: Int, orientation: Int = 1) throws -> Data
+    {
+        var rgba = [UInt8](repeating: 255, count: width * height * 4)
+        for pixel in 0 ..< width * height {
+            for channel in 0 ..< 3 { rgba[pixel * 4 + channel] = bytes[pixel * 3 + channel] }
+        }
+        let provider = CGDataProvider(data: Data(rgba) as CFData)!
+        let image = CGImage(
+            width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+            bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+        let data = NSMutableData()
+        let destination = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil)!
+        CGImageDestinationAddImage(
+            destination, image,
+            [kCGImagePropertyOrientation as String: orientation] as CFDictionary)
+        #expect(CGImageDestinationFinalize(destination))
+        return data as Data
+    }
+
+    @Test("Encoded images decode to their RGB bytes and turn upright by EXIF orientation")
+    func encodedImages() throws {
+        let bytes = Fixtures.rgb(width: 40, height: 24)
+        let decoded = try DecisionMedia.rgb(.encoded(try Self.png(bytes, width: 40, height: 24)))
+        #expect(decoded.width == 40 && decoded.height == 24)
+        #expect(decoded.bytes == bytes)
+        // Orientation 6: the stored image is shown rotated 90 degrees clockwise.
+        let rotated = try DecisionMedia.rgb(
+            .encoded(try Self.png(bytes, width: 40, height: 24, orientation: 6)))
+        #expect(rotated.width == 24 && rotated.height == 40)
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("decision-\(UUID().uuidString).png")
+        try Self.png(bytes, width: 40, height: 24).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        #expect(try DecisionMedia.rgb(.file(url)).bytes == bytes)
+    }
+    #endif
 }

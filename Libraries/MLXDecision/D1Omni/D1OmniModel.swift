@@ -94,9 +94,9 @@ final class D1OmniNetwork: Module {
             ("conv.batch_norm.", "conv.norm."),
         ]
         var result = [String: MLXArray]()
-        for (original, original_value) in weights {
+        for (original, originalValue) in weights {
             var key = original
-            var value = original_value
+            var value = originalValue
             if key.hasSuffix("num_batches_tracked") || key.hasSuffix("position_ids") { continue }
             if key.hasPrefix("audio.") {
                 for (old, new) in audioRenames {
