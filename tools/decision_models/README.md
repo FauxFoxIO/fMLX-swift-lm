@@ -47,3 +47,18 @@ The Swift checkpoint tests run when these variables name local snapshots; with
 - `MLX_DECISION_GLINER2_DECIDE`
 - `MLX_EMBEDDING_GEMMA2_BF16` (a BF16 export or the Google snapshot)
 - `MLX_EMBEDDING_GEMMA2_8BIT`
+
+## Running the tests
+
+`xcodebuild test -scheme mlx-swift-lm-Package` builds every test target, and
+`MLXLMTests` does not compile at `1f15098` (its MTP drafter mocks predate the
+current protocols). Until that is fixed, run these targets through a local
+scheme that lists only `MLXDecisionTests` and `EmbeddingGemma2CheckpointTests`
+as testables (`.swiftpm/xcode/xcshareddata/xcschemes/` is not tracked), for
+example:
+
+```sh
+TEST_RUNNER_MLX_DECISION_D1_OMNI_FP16=<snapshot> \
+xcodebuild test -scheme DecisionModelTests -destination 'platform=macOS' \
+    -skipPackagePluginValidation
+```
