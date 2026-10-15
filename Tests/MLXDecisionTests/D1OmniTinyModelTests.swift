@@ -296,4 +296,24 @@ struct D1OmniTinyModelTests {
         _ = try await runtime.decide([audio], tokenBudget: 65536, artifact: artifact)
         #expect(runtime.loadedModalities == [.text, .image, .audio])
     }
+
+    @Test("A lower maximum length cuts states and rejects media that leave no room")
+    func maximumLength() async throws {
+        let runtime = D1OmniRuntime(
+            network: try Self.network(), tokenizer: FakeD1Tokenizer(), special: fakeD1Special,
+            source: Self.source, maximumLength: 128)
+        #expect(runtime.maximumLength == 128)
+        let artifact = DecisionArtifact(identifier: "tiny", revision: "fixture")
+        let question = DecisionQuestion(id: "q", instructions: "Holds?", kind: .yesNo())
+        let long = DecisionRequest(
+            state: String(repeating: "state ", count: 200), questions: [question, question])
+        let result = try await runtime.decide([long], tokenBudget: 65536, artifact: artifact)
+        #expect(result[0].inputTokens == 256)
+        let image = DecisionRequest(
+            state: nil, questions: [question],
+            images: [.rgb(bytes: Fixtures.rgb(width: 100, height: 60), width: 100, height: 60)])
+        await #expect(throws: DecisionError.self) {
+            try await runtime.decide([image], tokenBudget: 65536, artifact: artifact)
+        }
+    }
 }

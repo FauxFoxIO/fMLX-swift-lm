@@ -59,6 +59,9 @@ artifact identity and revision.
 - The trunk and decision head load with the model. The vision and audio towers
   load with the first request that needs them (or at load with `preload`), and
   `unload(_:)` releases them.
+- `maximumLength` lowers the 16,384-position row limit (media included) for
+  tighter memory budgets; states are cut on the right to fit, as the reference
+  cuts them.
 - `DecisionPrecision.float32` upcasts a float16 export. Quantized exports load
   the layers that ship `.scales` as quantized layers.
 

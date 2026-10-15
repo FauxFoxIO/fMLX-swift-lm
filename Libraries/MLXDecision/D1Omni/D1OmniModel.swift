@@ -184,6 +184,8 @@ public final class D1OmniModel: DecisionModel {
     public let modalities: Set<DecisionModality> = [.text, .image, .audio]
     /// Padded positions per forward batch, media prefixes included.
     public let tokenBudget: Int
+    /// Positions one question row may read, media included.
+    public let maximumLength: Int
 
     private let state: SerialAccessContainer<D1OmniRuntime>
 
@@ -192,6 +194,7 @@ public final class D1OmniModel: DecisionModel {
         tokenBudget: Int
     ) {
         configuration = runtime.network.configuration
+        maximumLength = runtime.maximumLength
         self.artifact = artifact
         weightBytes = bytes
         self.tokenBudget = tokenBudget
@@ -220,14 +223,17 @@ public final class D1OmniModel: DecisionModel {
 public enum D1OmniLoader {
     /// Loads a local `d1_omni` snapshot: an MLX export or the original PyTorch checkpoint.
     /// The trunk loads now; the image and audio towers load with their first request unless
-    /// `preload` names them.
+    /// `preload` names them. `maximumLength` lowers the checkpoint's 16,384-position row limit
+    /// (media included); states are cut to fit, as the reference cuts them.
     public static func load(
         from directory: URL, artifact: DecisionArtifact, precision: DecisionPrecision = .checkpoint,
-        tokenBudget: Int = 65536, preload: Set<DecisionModality> = []
+        tokenBudget: Int = 65536, maximumLength: Int? = nil, preload: Set<DecisionModality> = []
     ) async throws -> D1OmniModel {
-        guard !artifact.identifier.isEmpty, !artifact.revision.isEmpty, tokenBudget >= 64 else {
+        guard !artifact.identifier.isEmpty, !artifact.revision.isEmpty, tokenBudget >= 64,
+            (maximumLength ?? 128) >= 128
+        else {
             throw DecisionError.invalidConfiguration(
-                "provide an artifact identity and a positive budget")
+                "provide an artifact identity, a positive budget, and a length of at least 128")
         }
         let configuration = try JSONDecoder().decode(
             D1OmniConfiguration.self,
@@ -241,7 +247,8 @@ public enum D1OmniLoader {
         let network = D1OmniNetwork(configuration)
         try source.load(.text, into: network)
         let runtime = D1OmniRuntime(
-            network: network, tokenizer: tokenizer, special: special, source: source)
+            network: network, tokenizer: tokenizer, special: special, source: source,
+            maximumLength: maximumLength)
         if preload.contains(.image) { _ = try runtime.visionTower() }
         if preload.contains(.audio) { _ = try runtime.audioEncoder() }
         return D1OmniModel(
@@ -255,17 +262,21 @@ final class D1OmniRuntime {
     let tokenizer: any DecisionTokenizer
     let special: D1OmniSpecialTokens
     let source: D1OmniWeightSource
+    /// Positions one row may read, media included.
+    let maximumLength: Int
     private var vision: D1OmniVision?
     private var audio: D1OmniAudio?
 
     init(
         network: D1OmniNetwork, tokenizer: any DecisionTokenizer, special: D1OmniSpecialTokens,
-        source: D1OmniWeightSource
+        source: D1OmniWeightSource, maximumLength: Int? = nil
     ) {
         self.network = network
         self.tokenizer = tokenizer
         self.special = special
         self.source = source
+        self.maximumLength = min(
+            network.configuration.maxLength, maximumLength ?? network.configuration.maxLength)
     }
 
     func visionTower() throws -> D1OmniVision {
@@ -319,7 +330,7 @@ final class D1OmniRuntime {
                 throw DecisionError.invalidInput("a request carries images or audio, not both")
             }
             var prefix: MLXArray?
-            var maxLength = configuration.maxLength
+            var maxLength = maximumLength
             var mode = D1OmniMediaMode.text
             var state = request.state ?? ""
             if !request.images.isEmpty {
@@ -339,10 +350,10 @@ final class D1OmniRuntime {
             }
             if let prefix { eval(prefix) }
             let media = prefix?.dim(0) ?? 0
-            maxLength = min(maxLength, configuration.maxLength - media)
+            maxLength = min(maxLength, maximumLength - media)
             guard maxLength >= 64 else {
                 throw DecisionError.contextOverflow(
-                    "the media take \(media) of the \(configuration.maxLength) positions; send fewer images"
+                    "the media take \(media) of the \(maximumLength) positions; send fewer images"
                 )
             }
             var rows = [Pending]()
