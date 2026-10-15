@@ -38,6 +38,10 @@ result.distributions[1].top          // "billing"
 result.distributions[0].probabilities  // [P(yes), P(no)]
 ```
 
+States are text. For JSON, `DecisionJSON(...).serialized` writes exactly what
+Python's `json.dumps(state, ensure_ascii=False)` writes, the form d1-omni was
+trained on.
+
 Loaders read a local snapshot and never download. The installer supplies the
 artifact identity and revision.
 

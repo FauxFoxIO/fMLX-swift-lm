@@ -77,4 +77,43 @@ struct DecisionTypesTests {
         let clip = D1OmniMelFrontend.clip([1, 2])
         #expect(clip.count == 8000 && clip[0] == 1 && clip[2] == 0)
     }
+
+    @Test("JSON states serialize as Python's json.dumps(ensure_ascii=False)")
+    func jsonStates() {
+        typealias M = DecisionJSON.Member
+        let page = DecisionJSON.object([
+            M("page", .string("Release notes")), M("selection", .string("Ship the canvas build")),
+            M("speaker", .string("user")),
+        ])
+        #expect(
+            page.serialized
+                == #"{"page": "Release notes", "selection": "Ship the canvas build", "speaker": "user"}"#
+        )
+        let mixed = DecisionJSON.object([
+            M("n", .integer(1)), M("f", .number(1)), M("e", .number(1e-05)),
+            M("big", .number(1e16)),
+            M("neg", .number(-0.5)), M("t", .bool(true)), M("x", .null),
+            M("list", .array([.integer(1), .string("two"), .array([.number(3.25)])])),
+            M("nested", .object([M("a", .object([]))])), M("empty", .array([])),
+        ])
+        #expect(
+            mixed.serialized
+                == #"{"n": 1, "f": 1.0, "e": 1e-05, "big": 1e+16, "neg": -0.5, "t": true, "x": null, "list": [1, "two", [3.25]], "nested": {"a": {}}, "empty": []}"#
+        )
+        let escaped = DecisionJSON.object([
+            M(
+                "esc",
+                .string("quote \" back \\ nl \n tab \t cr \r bell \u{07} uni é 🎉 \u{2028} slash /"))
+        ])
+        #expect(
+            escaped.serialized
+                == "{\"esc\": \"quote \\\" back \\\\ nl \\n tab \\t cr \\r bell \\u0007 uni é 🎉 \u{2028} slash /\"}"
+        )
+        #expect(DecisionJSON.string("plain string").serialized == #""plain string""#)
+        #expect(
+            DecisionJSON.array([
+                .number(1.5e300), .number(0.1), .number(100), .number(123_456_789_012_345_678),
+                .number(-0.0),
+            ]).serialized == "[1.5e+300, 0.1, 100.0, 1.2345678901234568e+17, -0.0]")
+    }
 }
