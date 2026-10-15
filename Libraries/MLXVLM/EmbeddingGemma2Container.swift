@@ -24,10 +24,17 @@ public final class EmbeddingGemma2Container: Sendable {
         dimension: EmbeddingGemma2Dimension = .d768,
         imageSoftTokenBudget: Int = 280
     ) async throws -> EmbeddingGemma2Result {
-        try await state.read { runtime in
-            try await runtime.embed(
-                content, purpose: purpose, dimension: dimension,
-                imageSoftTokenBudget: imageSoftTokenBudget)
+        do {
+            return try await state.read { runtime in
+                try await runtime.embed(
+                    content, purpose: purpose, dimension: dimension,
+                    imageSoftTokenBudget: imageSoftTokenBudget)
+            }
+        } catch let error as EmbeddingGemma2Embedding.Error {
+            // The shared processors use the actor's errors; keep this API's error type.
+            throw EmbeddingGemma2Error.invalidInput(error.localizedDescription)
+        } catch is DecodingError {
+            throw EmbeddingGemma2Error.invalidConfiguration("unsupported processor_config.json")
         }
     }
 
