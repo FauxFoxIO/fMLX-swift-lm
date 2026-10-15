@@ -5,6 +5,10 @@ import Testing
 
 @testable import MLXDecision
 
+#if canImport(AVFoundation)
+import AVFoundation
+#endif
+
 struct DecisionTypesTests {
     @Test("Questions validate option counts and unique outcomes")
     func validation() throws {
@@ -116,4 +120,33 @@ struct DecisionTypesTests {
                 .number(-0.0),
             ]).serialized == "[1.5e+300, 0.1, 100.0, 1.2345678901234568e+17, -0.0]")
     }
+
+    #if canImport(AVFoundation)
+    @Test("Audio files decode to 16 kHz mono and stop at the clip limit")
+    func audioFiles() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("decision-\(UUID().uuidString).caf")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)!
+        let frames = AVAudioFrameCount(44_100 * 3)
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
+        buffer.frameLength = frames
+        for channel in 0 ..< 2 {
+            for i in 0 ..< Int(frames) {
+                buffer.floatChannelData![channel][i] = Float(sin(Double(i) * 0.05)) * 0.5
+            }
+        }
+        do {
+            var settings = format.settings
+            settings[AVLinearPCMIsNonInterleaved] = false
+            let file = try AVAudioFile(forWriting: url, settings: settings)
+            try file.write(from: buffer)
+        }
+        let full = try await DecisionMedia.waveform(.file(url), maximumSeconds: 30)
+        #expect(abs(full.count - 48_000) <= 64)
+        #expect(full.map(abs).max()! > 0.4 && full.map(abs).max()! < 0.6)
+        let cut = try await DecisionMedia.waveform(.file(url), maximumSeconds: 1)
+        #expect(cut.count == 16_000)
+    }
+    #endif
 }
