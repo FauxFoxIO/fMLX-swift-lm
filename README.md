@@ -22,6 +22,7 @@ For some example applications and tools that use MLX Swift LM, check out [MLX Sw
 
 - [FMLXText: model-specific tokenizer and native runtime pairing](docs/checkpoint-text.md)
 - [Bonsai PTQ1 and DFlash2 native artifacts](docs/bonsai-dflash.md)
+- [Native EmbeddingGemma 2](docs/embeddinggemma2.md)
 
 Developers can use these examples in their own programs -- just import the swift package!
 
@@ -31,6 +32,7 @@ Developers can use these examples in their own programs -- just import the swift
 - [MLXLLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxllm): Large language model example implementations
 - [MLXVLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxvlm): Vision language model example implementations
 - [MLXEmbedders](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxembedders): Popular encoders and embedding models example implementations
+- [MLXDecision](Libraries/MLXDecision/README.md): Decision models (Liquid d1-omni-600M, Fastino GLiNER2.5-Decide) that answer typed questions with a probability per outcome in one forward pass.
 - [MLXGuidedGeneration](Libraries/MLXGuidedGeneration/README.md): Grammar-constrained generation (JSON Schema or EBNF) for any MLX model.
 - [MLXFoundationModels](Libraries/MLXFoundationModels/README.md): Bridge MLX models into Apple's `FoundationModels.LanguageModel` for use with `LanguageModelSession`. (Requires the macOS/iOS/visionOS 27.0 SDK.)
 
