@@ -240,7 +240,8 @@ enum LFM2VLImageProcessing {
             for row in 0 ..< layout.rows {
                 for column in 0 ..< layout.columns {
                     images.append(
-                        big[(row * tile) ..< ((row + 1) * tile),
+                        big[
+                            (row * tile) ..< ((row + 1) * tile),
                             (column * tile) ..< ((column + 1) * tile)])
                 }
             }
@@ -421,7 +422,8 @@ enum LFM2VLImageProcessing {
             accumulator = accumulator + take(source, index, axis: axis) * weight.reshaped(shape)
         }
         // Negative sums clamp to 0 either way; clamping first keeps the shift arithmetic-free.
-        let shifted = rightShift(maximum(accumulator, MLXArray(Int32(0))), MLXArray(Int32(taps.bits)))
+        let shifted = rightShift(
+            maximum(accumulator, MLXArray(Int32(0))), MLXArray(Int32(taps.bits)))
         return minimum(shifted, MLXArray(Int32(255))).asType(.uint8)
     }
 

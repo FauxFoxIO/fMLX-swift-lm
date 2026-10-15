@@ -263,7 +263,8 @@ private enum Vision {
             let length = x.dim(1)
             var mask: MLXArray?
             if validPatches.contains(where: { $0 < length }) {
-                mask = (MLXArray(Int32(0) ..< Int32(length))[.newAxis]
+                mask =
+                    (MLXArray(Int32(0) ..< Int32(length))[.newAxis]
                     .< MLXArray(validPatches.map(Int32.init))[0..., .newAxis])[
                         0..., .newAxis, .newAxis, 0...]
             }

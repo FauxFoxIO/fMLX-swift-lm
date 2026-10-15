@@ -57,7 +57,9 @@ private enum Fixture {
             "image_processor_type": "Lfm2VlImageProcessor",
         ]
         settings.merge(overrides) { $1 }
-        let json: [String: Any] = ["image_processor": settings, "processor_class": "Lfm2VlProcessor"]
+        let json: [String: Any] = [
+            "image_processor": settings, "processor_class": "Lfm2VlProcessor",
+        ]
         return try JSONDecoder().decode(
             LFM2VLProcessorConfiguration.self, from: JSONSerialization.data(withJSONObject: json))
     }
@@ -219,7 +221,8 @@ struct D1ThreeBCheckpointTests {
     func imageDecisions() throws {
         let directory = URL(fileURLWithPath: Self.snapshot!)
         let configData = try Data(contentsOf: directory.appendingPathComponent("config.json"))
-        let model = LFM2VL(try JSONDecoder.json5().decode(LFM2VLConfiguration.self, from: configData))
+        let model = LFM2VL(
+            try JSONDecoder.json5().decode(LFM2VLConfiguration.self, from: configData))
         let base = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
         try loadWeights(
             modelDirectory: directory, model: model, quantization: base.quantization,
