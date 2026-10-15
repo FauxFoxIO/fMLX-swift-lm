@@ -747,6 +747,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         processor?.prompt(input.text.tokens)
+        prefill.prefix?(mainCacheStorage.processedTokenCount)
         let prompt = input.text.tokens.asArray(Int.self)
         let reserved = prefill.chunking == .remainder ? prefill.resolvedStepSize() : 1
         var targetEmittedHidden = true

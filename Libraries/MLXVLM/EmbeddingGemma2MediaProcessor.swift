@@ -41,7 +41,9 @@ enum EmbeddingGemma2MediaProcessor {
                 EmbeddingGemma2ImageProcessor.pixels(
                     image, height: size.height, width: size.width))
         }
-        guard !pixels.isEmpty else { throw EmbeddingGemma2Error.invalidInput("Video has no frames") }
+        guard !pixels.isEmpty else {
+            throw EmbeddingGemma2Error.invalidInput("Video has no frames")
+        }
         let result = pixels.count == 1 ? pixels[0] : concatenated(pixels, axis: 0)
         try checkedEval(result)
         return result

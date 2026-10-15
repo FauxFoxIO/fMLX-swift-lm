@@ -435,10 +435,11 @@ struct Qwen35MTPRegistrationTests {
             configuration: Data(qwen35StandaloneMTPConfigJSON().utf8),
             modelType: "qwen3_5_mtp")
         #expect(standalone is MLXLLM.Qwen35MTPDraftModel)
-        #expect(standalone.maximumBlockSize == 2)
+        // The fork drafts up to three tokens and samples stochastically.
+        #expect(standalone.maximumBlockSize == 4)
         #expect(standalone.requiresPromptPrefill)
         #expect(!standalone.requiresSharedTargetKV)
-        #expect(standalone.requiresGreedySampling)
+        #expect(!standalone.requiresGreedySampling)
 
         let standaloneVLM = try await MTPDrafterTypeRegistry.visionLanguage.createModel(
             configuration: Data(qwen35StandaloneMTPConfigJSON().utf8),

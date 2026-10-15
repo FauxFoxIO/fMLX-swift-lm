@@ -232,7 +232,10 @@ final class EmbeddingGemma2CheckpointInventory: Sendable {
     }
 
     private static func modality(_ name: String) throws -> EmbeddingGemma2Modality {
-        let text = ["language_model.", "embed_tokens.", "embedding_projection.", "ple.", "layers.", "norm."]
+        let text = [
+            "language_model.", "embed_tokens.", "embedding_projection.", "ple.", "layers.",
+            "norm.",
+        ]
         if text.contains(where: name.hasPrefix) { return .text }
         if name.hasPrefix("vision_tower.") || name.hasPrefix("embed_vision.") { return .vision }
         if name.hasPrefix("audio_tower.") || name.hasPrefix("embed_audio.") { return .audio }

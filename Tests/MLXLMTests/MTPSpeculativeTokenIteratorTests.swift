@@ -680,7 +680,7 @@ func testQwenStyleMTPRequiresGreedySampling() throws {
     #expect(drafter.draftBlockCallCount == 0)
     #expect(
         iter.passthroughReason
-            == "Qwen MTP currently requires temperature == 0; generating without speculation")
+            == "drafter requires temperature == 0; generating without speculation")
 }
 
 // MARK: - sharedKV span across partial acceptance
