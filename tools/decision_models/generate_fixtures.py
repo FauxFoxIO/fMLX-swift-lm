@@ -14,6 +14,9 @@ Subcommands:
   d1               Real-checkpoint d1-omni references through mlx-vlm.
   gliner           Real-checkpoint GLiNER2.5-Decide references through gliner2.
   embeddinggemma   Real-checkpoint EmbeddingGemma 2 references through mlx-vlm.
+  lfm2vl           LFM2-VL image layouts, crops, markup, and a tiny random
+                   Lfm2VlForConditionalGeneration through Transformers (the
+                   d1-3B image path). Writes `Tests/LFM2VLTests/Resources`.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import argparse
 import importlib
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -796,6 +800,151 @@ def embeddinggemma(args) -> None:
         "audio_samples": 20800, "cases": cases})
 
 
+# ---------------------------------------------------------------------------
+# LFM2-VL (d1-3B's backbone): Transformers' image processor, markup, and model.
+
+LFM2VL_IMAGE_SIZES = [
+    (5, 4), (17, 33), (300, 200), (512, 512), (640, 512), (700, 1100), (1100, 700),
+    (1024, 1024), (1280, 1024), (2000, 300), (300, 2000), (1500, 1499), (3000, 900),
+]
+LFM2VL_RATIO_LIMITS = [(2, 10), (1, 1), (1, 6), (2, 4), (4, 4), (3, 12), (2, 16), (1, 30)]
+LFM2VL_TOKENS = {"<image>": 10, "<|image_start|>": 11, "<|image_end|>": 12, "<|img_thumbnail|>": 13}
+for _r in range(1, 11):
+    for _c in range(1, 11):
+        LFM2VL_TOKENS[f"<|img_row_{_r}_col_{_c}|>"] = 100 + 10 * (_r - 1) + (_c - 1)
+TINY_LFM2VL_CONFIG = {
+    "model_type": "lfm2_vl",
+    "downsample_factor": 2,
+    "image_token_id": 10,
+    "projector_bias": True,
+    "projector_hidden_act": "gelu",
+    "projector_hidden_size": 48,
+    "projector_use_layernorm": False,
+    "tie_word_embeddings": True,
+    "text_config": {
+        "model_type": "lfm2", "vocab_size": 256, "hidden_size": 64, "intermediate_size": 96,
+        "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 2,
+        "layer_types": ["conv", "full_attention", "conv", "full_attention"],
+        "block_auto_adjust_ff_dim": False, "conv_L_cache": 3, "conv_bias": False,
+        "norm_eps": 1e-5, "rope_parameters": {"rope_theta": 1000000.0, "rope_type": "default"},
+        "tie_word_embeddings": True,
+    },
+    "vision_config": {
+        "model_type": "siglip2_vision_model", "hidden_size": 32, "intermediate_size": 64,
+        "num_hidden_layers": 2, "num_attention_heads": 2, "num_channels": 3, "num_patches": 64,
+        "patch_size": 16, "hidden_act": "gelu_pytorch_tanh", "layer_norm_eps": 1e-6,
+        "vision_use_head": False,
+    },
+}
+# The image settings of LiquidAI/d1-3B (processor_config.json at 051bcc4).
+D1_3B_IMAGE_PROCESSOR = {
+    "do_image_splitting": True, "downsample_factor": 2, "encoder_patch_size": 16,
+    "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5], "max_image_tokens": 256,
+    "max_num_patches": 1024, "max_pixels_tolerance": 2.0, "max_tiles": 10, "min_image_tokens": 64,
+    "min_tiles": 2, "resample": 3, "tile_size": 512, "use_thumbnail": True,
+    "return_row_col_info": True,
+}
+
+
+def lfm2vl(args) -> None:
+    import types
+
+    import torch
+    from PIL import Image
+    from safetensors.torch import save_file
+    from transformers import Lfm2VlConfig, Lfm2VlForConditionalGeneration
+    from transformers.models.lfm2_vl.image_processing_lfm2_vl import Lfm2VlImageProcessor
+    from transformers.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
+
+    out = Path(args.output)
+
+    def processor(**overrides):
+        return Lfm2VlImageProcessor(**{**D1_3B_IMAGE_PROCESSOR, **overrides})
+
+    def markup(image_processor, outputs, index):
+        stub = types.SimpleNamespace(
+            image_processor=image_processor, image_token="<image>",
+            image_start_token="<|image_start|>", image_end_token="<|image_end|>",
+            image_thumbnail_token="<|img_thumbnail|>")
+        stub._build_image_tokens = types.MethodType(Lfm2VlProcessor._build_image_tokens, stub)
+        stub._compute_tokens_per_tile = types.MethodType(Lfm2VlProcessor._compute_tokens_per_tile, stub)
+        stub._compute_tokens_for_image = types.MethodType(Lfm2VlProcessor._compute_tokens_for_image, stub)
+        stub._get_image_num_tokens = types.MethodType(Lfm2VlProcessor._get_image_num_tokens, stub)
+        return Lfm2VlProcessor.replace_image_token(
+            stub, outputs, image_idx=index, use_image_special_tokens=True)
+
+    def crops_of(outputs):
+        pixels = outputs["pixel_values"]
+        masks = outputs["pixel_attention_mask"]
+        shapes = outputs["spatial_shapes"].tolist()
+        result = []
+        for i, (h, w) in enumerate(shapes):
+            n = int(masks[i].sum())
+            values = torch.round(pixels[i, :n] * 127.5 + 127.5).to(torch.int64)
+            result.append({"rows": h, "columns": w, "patches": n, "checksum": checksum(values.numpy())})
+        return result
+
+    ratios = []
+    for low, high in LFM2VL_RATIO_LIMITS:
+        ratios.append({"min_tiles": low, "max_tiles": high,
+                       "ratios": [list(r) for r in processor()._target_ratios(low, high)]})
+
+    layouts = []
+    for resample in (3, 2, 1):
+        image_processor = processor(resample=resample)
+        for width, height in LFM2VL_IMAGE_SIZES:
+            image = Image.fromarray(synthetic_rgb(width, height))
+            outputs = image_processor([image], return_tensors="pt")
+            layouts.append({
+                "width": width, "height": height, "resample": resample,
+                "rows": int(outputs["image_rows"][0]), "columns": int(outputs["image_cols"][0]),
+                "size": [int(x) for x in outputs["image_sizes"][0]], "crops": crops_of(outputs),
+                "markup": markup(image_processor, outputs, 0),
+            })
+    unsplit = processor(do_image_splitting=False)
+    for width, height in [(1100, 700), (3000, 900)]:
+        outputs = unsplit([Image.fromarray(synthetic_rgb(width, height))], return_tensors="pt")
+        layouts.append({
+            "width": width, "height": height, "resample": 3, "do_image_splitting": False,
+            "rows": int(outputs["image_rows"][0]), "columns": int(outputs["image_cols"][0]),
+            "size": [int(x) for x in outputs["image_sizes"][0]], "crops": crops_of(outputs),
+            "markup": markup(unsplit, outputs, 0),
+        })
+
+    # A tiny random model over a prompt with a single-crop image and a tiled one.
+    torch.manual_seed(0)
+    config = Lfm2VlConfig(**TINY_LFM2VL_CONFIG)
+    model = Lfm2VlForConditionalGeneration(config).eval()
+    randomize(model, torch, seed=11)
+    tiny = out / "tiny-lfm2-vl"
+    tiny.mkdir(parents=True, exist_ok=True)
+    state = {k: v.contiguous() for k, v in model.state_dict().items() if k != "lm_head.weight"}
+    save_file(state, str(tiny / "model.safetensors"), metadata={"format": "pt"})
+    write_json(tiny / "config.json", TINY_LFM2VL_CONFIG)
+
+    sizes = [(300, 200), (1100, 700)]
+    image_processor = processor()
+    images = [Image.fromarray(synthetic_rgb(w, h)) for w, h in sizes]
+    outputs = image_processor(images, return_tensors="pt")
+    words = re.compile(r"<\|[a-z0-9_]+\|>|<image>")
+    ids = [1, 40, 41, 42]
+    for index in range(len(images)):
+        ids += [LFM2VL_TOKENS[t] for t in words.findall(markup(image_processor, outputs, index))]
+        ids += [43 + index, 50]
+    ids += [60, 61, 62]
+    with torch.no_grad():
+        logits = model(
+            input_ids=torch.tensor([ids]), pixel_values=outputs["pixel_values"],
+            pixel_attention_mask=outputs["pixel_attention_mask"],
+            spatial_shapes=outputs["spatial_shapes"]).logits[0]
+    write_json(out / "lfm2-vl.json", {
+        "transformers": __import__("transformers").__version__,
+        "tokens": LFM2VL_TOKENS, "ratios": ratios, "layouts": layouts,
+        "tiny": {"images": [list(s) for s in sizes], "input_ids": ids,
+                 "last": logits[-1].tolist(), "logits": summary(logits.numpy())},
+    })
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -808,8 +957,11 @@ def main() -> None:
         p.add_argument("--model-id", required=True)
         p.add_argument("--revision", required=True)
         p.add_argument("--output", required=True)
+    v = sub.add_parser("lfm2vl")
+    v.add_argument("--output", required=True)
     args = parser.parse_args()
-    {"synthetic": synthetic, "d1": d1, "gliner": gliner, "embeddinggemma": embeddinggemma}[args.command](args)
+    {"synthetic": synthetic, "d1": d1, "gliner": gliner, "embeddinggemma": embeddinggemma,
+     "lfm2vl": lfm2vl}[args.command](args)
 
 
 if __name__ == "__main__":

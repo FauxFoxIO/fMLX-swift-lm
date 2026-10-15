@@ -174,6 +174,17 @@ let package = Package(
             resources: [.copy("Resources")]
         ),
         .testTarget(
+            name: "LFM2VLTests",
+            dependencies: [
+                "MLXVLM",
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/LFM2VLTests",
+            resources: [.copy("Resources")]
+        ),
+        .testTarget(
             name: "EmbeddingGemma2CheckpointTests",
             dependencies: [
                 "MLXVLM",

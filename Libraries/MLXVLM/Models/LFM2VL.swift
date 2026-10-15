@@ -694,7 +694,16 @@ public struct LFM2VLProcessor: UserInputProcessor {
     public func prepare(
         tokens: [Int], images: [UserInput.Image], processing: UserInput.Processing? = nil
     ) throws -> LMInput {
-        let imageToken = tokenizer.convertTokenToId("<image>")
+        try Self.prepare(
+            tokens: tokens, images: images, processing: processing, configuration: config,
+            id: { tokenizer.convertTokenToId($0) })
+    }
+
+    static func prepare(
+        tokens: [Int], images: [UserInput.Image], processing: UserInput.Processing?,
+        configuration: LFM2VLProcessorConfiguration, id: (String) -> Int?
+    ) throws -> LMInput {
+        let imageToken = id("<image>")
         let placeholders = imageToken.map { token in tokens.filter { $0 == token }.count } ?? 0
         guard placeholders == images.count else {
             throw VLMError.processing(
@@ -709,12 +718,12 @@ public struct LFM2VLProcessor: UserInputProcessor {
         for image in images {
             let pixels = try LFM2VLImageProcessing.pixels(image, processing: processing)
             let layout = try LFM2VLImageProcessing.layout(
-                width: pixels.dim(1), height: pixels.dim(0), configuration: config)
-            crops += LFM2VLImageProcessing.crops(pixels, layout: layout, configuration: config)
+                width: pixels.dim(1), height: pixels.dim(0), configuration: configuration)
+            crops += LFM2VLImageProcessing.crops(
+                pixels, layout: layout, configuration: configuration)
             expansions.append(
                 try LFM2VLImageProcessing.imageTokens(
-                    layout: layout, configuration: config,
-                    id: { tokenizer.convertTokenToId($0) }))
+                    layout: layout, configuration: configuration, id: id))
         }
 
         var expanded = [Int]()
