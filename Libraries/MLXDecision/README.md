@@ -56,6 +56,9 @@ artifact identity and revision.
   0.5 s. Every 80 ms becomes one prefix position.
 - Text answers are divided by the per-type temperatures in `config.json`.
   Image and audio answers are the model's softmax as trained.
+- The trunk and decision head load with the model. The vision and audio towers
+  load with the first request that needs them (or at load with `preload`), and
+  `unload(_:)` releases them.
 - `DecisionPrecision.float32` upcasts a float16 export. Quantized exports load
   the layers that ship `.scales` as quantized layers.
 

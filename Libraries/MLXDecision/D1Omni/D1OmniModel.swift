@@ -11,16 +11,13 @@ final class D1OmniNetwork: Module {
 
     @ModuleInfo var encoder: D1OmniTrunk
     @ModuleInfo var head: D1OmniDecisionHead
-    @ModuleInfo var vision: D1OmniVision
-    @ModuleInfo var audio: D1OmniAudio
 
+    /// The trunk and decision head. The vision and audio towers load separately, on demand.
     init(_ configuration: D1OmniConfiguration) {
         self.configuration = configuration
         _encoder.wrappedValue = D1OmniTrunk(configuration.text)
         _head.wrappedValue = D1OmniDecisionHead(
             width: configuration.text.hiddenSize, layers: configuration.headLayers)
-        _vision.wrappedValue = D1OmniVision(configuration)
-        _audio.wrappedValue = D1OmniAudio(configuration)
     }
 
     var dtype: DType { encoder.embeddingNorm.weight.dtype }
@@ -139,6 +136,45 @@ final class D1OmniNetwork: Module {
     }
 }
 
+/// The parts of a d1-omni checkpoint, each loaded into its own module.
+enum D1OmniPart: CaseIterable {
+    case text, vision, audio
+
+    var prefix: String {
+        switch self {
+        case .text: ""
+        case .vision: "vision."
+        case .audio: "audio."
+        }
+    }
+
+    /// This part's tensors from sanitized checkpoint weights, named relative to its module.
+    func weights(_ sanitized: [String: MLXArray]) -> [String: MLXArray] {
+        var result = [String: MLXArray]()
+        for (key, value) in sanitized {
+            let owner: D1OmniPart =
+                key.hasPrefix("vision.") ? .vision : key.hasPrefix("audio.") ? .audio : .text
+            if owner == self { result[String(key.dropFirst(prefix.count))] = value }
+        }
+        return result
+    }
+}
+
+/// Reads a part of the checkpoint when a request first needs it.
+struct D1OmniWeightSource: Sendable {
+    let files: [URL]
+    let quantization: D1OmniConfiguration.Quantization?
+    let precision: DecisionPrecision
+
+    func load(_ part: D1OmniPart, into module: Module) throws {
+        // Safetensors arrays load lazily, so tensors of other parts are never read.
+        let weights = part.weights(D1OmniNetwork.sanitize(try DecisionWeights.load(files)))
+        try DecisionWeights.apply(
+            weights, to: module, groupSize: quantization?.groupSize, bits: quantization?.bits,
+            mode: quantization?.mode, precision: precision)
+    }
+}
+
 /// A loaded d1-omni decision model. Text, image, and audio requests share the trunk weights.
 public final class D1OmniModel: DecisionModel {
     public let artifact: DecisionArtifact
@@ -169,13 +205,25 @@ public final class D1OmniModel: DecisionModel {
             try await runtime.decide(requests, tokenBudget: budget, artifact: artifact)
         }
     }
+
+    /// Releases the image or audio tower; the next request that needs it reads it again.
+    /// The text trunk stays loaded for the model's lifetime.
+    public func unload(_ modalities: Set<DecisionModality>) async {
+        await state.read { $0.unload(modalities) }
+    }
+
+    public var loadedModalities: Set<DecisionModality> {
+        get async { await state.read { $0.loadedModalities } }
+    }
 }
 
 public enum D1OmniLoader {
     /// Loads a local `d1_omni` snapshot: an MLX export or the original PyTorch checkpoint.
+    /// The trunk loads now; the image and audio towers load with their first request unless
+    /// `preload` names them.
     public static func load(
         from directory: URL, artifact: DecisionArtifact, precision: DecisionPrecision = .checkpoint,
-        tokenBudget: Int = 65536
+        tokenBudget: Int = 65536, preload: Set<DecisionModality> = []
     ) async throws -> D1OmniModel {
         guard !artifact.identifier.isEmpty, !artifact.revision.isEmpty, tokenBudget >= 64 else {
             throw DecisionError.invalidConfiguration(
@@ -188,15 +236,17 @@ public enum D1OmniLoader {
         let tokenizer = try await NativeDecisionTokenizer.load(from: directory)
         let special = try D1OmniSpecialTokens(tokenizer: tokenizer, bos: configuration.bosTokenID)
         let files = try DecisionWeights.files(in: directory)
+        let source = D1OmniWeightSource(
+            files: files, quantization: configuration.quantization, precision: precision)
         let network = D1OmniNetwork(configuration)
-        let weights = D1OmniNetwork.sanitize(try DecisionWeights.load(files))
-        try DecisionWeights.apply(
-            weights, to: network, groupSize: configuration.quantization?.groupSize,
-            bits: configuration.quantization?.bits, mode: configuration.quantization?.mode,
-            precision: precision)
+        try source.load(.text, into: network)
+        let runtime = D1OmniRuntime(
+            network: network, tokenizer: tokenizer, special: special, source: source)
+        if preload.contains(.image) { _ = try runtime.visionTower() }
+        if preload.contains(.audio) { _ = try runtime.audioEncoder() }
         return D1OmniModel(
-            D1OmniRuntime(network: network, tokenizer: tokenizer, special: special),
-            artifact: artifact, bytes: DecisionWeights.byteCount(files), tokenBudget: tokenBudget)
+            runtime, artifact: artifact, bytes: DecisionWeights.byteCount(files),
+            tokenBudget: tokenBudget)
     }
 }
 
@@ -204,11 +254,46 @@ final class D1OmniRuntime {
     let network: D1OmniNetwork
     let tokenizer: any DecisionTokenizer
     let special: D1OmniSpecialTokens
+    let source: D1OmniWeightSource
+    private var vision: D1OmniVision?
+    private var audio: D1OmniAudio?
 
-    init(network: D1OmniNetwork, tokenizer: any DecisionTokenizer, special: D1OmniSpecialTokens) {
+    init(
+        network: D1OmniNetwork, tokenizer: any DecisionTokenizer, special: D1OmniSpecialTokens,
+        source: D1OmniWeightSource
+    ) {
         self.network = network
         self.tokenizer = tokenizer
         self.special = special
+        self.source = source
+    }
+
+    func visionTower() throws -> D1OmniVision {
+        if let vision { return vision }
+        let tower = D1OmniVision(network.configuration)
+        try source.load(.vision, into: tower)
+        vision = tower
+        return tower
+    }
+
+    func audioEncoder() throws -> D1OmniAudio {
+        if let audio { return audio }
+        let encoder = D1OmniAudio(network.configuration)
+        try source.load(.audio, into: encoder)
+        audio = encoder
+        return encoder
+    }
+
+    func unload(_ modalities: Set<DecisionModality>) {
+        if modalities.contains(.image) { vision = nil }
+        if modalities.contains(.audio) { audio = nil }
+    }
+
+    var loadedModalities: Set<DecisionModality> {
+        var result: Set<DecisionModality> = [.text]
+        if vision != nil { result.insert(.image) }
+        if audio != nil { result.insert(.audio) }
+        return result
     }
 
     private struct Pending {
@@ -241,13 +326,13 @@ final class D1OmniRuntime {
                 let prepared = try request.images.map {
                     try D1OmniImageProcessor.prepare(DecisionMedia.rgb($0))
                 }
-                prefix = network.vision(prepared)
+                prefix = try visionTower()(prepared)
                 maxLength = configuration.imageTextLength
                 mode = .image
             } else if let audio = request.audio {
                 let samples = try await DecisionMedia.waveform(
                     audio, maximumSeconds: D1OmniMelFrontend.maximumSeconds)
-                prefix = network.audio(samples)
+                prefix = try audioEncoder()(samples)
                 maxLength = configuration.audioTextLength
                 mode = .audio
                 state = request.state ?? "{}"

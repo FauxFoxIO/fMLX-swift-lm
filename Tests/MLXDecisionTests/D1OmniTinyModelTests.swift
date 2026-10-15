@@ -10,18 +10,30 @@ import Testing
 /// A random tiny d1-omni in the PyTorch checkpoint layout, checked against the PyTorch reference.
 @Suite(.serialized)
 struct D1OmniTinyModelTests {
-    static func network() throws -> D1OmniNetwork {
-        let directory = Fixtures.directory.appendingPathComponent("tiny-d1-omni")
+    static let directory = Fixtures.directory.appendingPathComponent("tiny-d1-omni")
+
+    static func configuration() throws -> D1OmniConfiguration {
         let configuration = try JSONDecoder().decode(
             D1OmniConfiguration.self,
             from: Data(contentsOf: directory.appendingPathComponent("config.json")))
         try configuration.validate()
-        let network = D1OmniNetwork(configuration)
-        let weights = D1OmniNetwork.sanitize(
-            try DecisionWeights.load([directory.appendingPathComponent("model.safetensors")]))
-        try DecisionWeights.apply(
-            weights, to: network, groupSize: nil, bits: nil, mode: nil, precision: .checkpoint)
+        return configuration
+    }
+
+    static let source = D1OmniWeightSource(
+        files: [directory.appendingPathComponent("model.safetensors")], quantization: nil,
+        precision: .checkpoint)
+
+    static func network() throws -> D1OmniNetwork {
+        let network = D1OmniNetwork(try configuration())
+        try source.load(.text, into: network)
         return network
+    }
+
+    static func runtime() throws -> D1OmniRuntime {
+        D1OmniRuntime(
+            network: try network(), tokenizer: FakeD1Tokenizer(), special: fakeD1Special,
+            source: source)
     }
 
     static func reference() throws -> [String: Any] {
@@ -60,6 +72,8 @@ struct D1OmniTinyModelTests {
     @Test("Image prefixes and logits match the reference, tiled and whole")
     func imagePrefix() throws {
         let network = try Self.network()
+        let vision = D1OmniVision(try Self.configuration())
+        try Self.source.load(.vision, into: vision)
         let reference = try Self.reference()
         let text = reference["text"] as! [String: Any]
         let entries = Array((text["rows"] as! [[String: Any]]).prefix(2))
@@ -70,7 +84,7 @@ struct D1OmniTinyModelTests {
                 DecisionRGBImage(
                     bytes: Fixtures.rgb(width: width, height: height), width: width, height: height)
             )
-            let prefix = network.vision([image])
+            let prefix = vision([image])
             #expect(prefix.shape == entry["prefix_shape"] as! [Int])
             expectSummary(prefix, entry["prefix"] as! [String: Any], tolerance: 2e-3)
             let logits = network.logits(Self.rows(entries, prefix: prefix))
@@ -83,6 +97,8 @@ struct D1OmniTinyModelTests {
     @Test("Log-mel features, encoder frames, and audio logits match the reference")
     func audioPrefix() throws {
         let network = try Self.network()
+        let audio = D1OmniAudio(try Self.configuration())
+        try Self.source.load(.audio, into: audio)
         let reference = try Self.reference()
         let text = reference["text"] as! [String: Any]
         let entries = Array((text["rows"] as! [[String: Any]]).suffix(2))
@@ -95,9 +111,9 @@ struct D1OmniTinyModelTests {
             let melShape = entry["mel_shape"] as! [Int]
             #expect(mel.shape == [melShape[1], melShape[0]])
             expectSummary(mel.transposed(), entry["mel"] as! [String: Any], tolerance: 2e-3)
-            let encoded = network.audio.encoder(mel[.newAxis], valid: frames)
+            let encoded = audio.encoder(mel[.newAxis], valid: frames)
             #expect(encoded.dim(1) == entry["encoded_length"] as! Int)
-            let prefix = network.audio(pcm.map { Float($0) / 32768 })
+            let prefix = audio(pcm.map { Float($0) / 32768 })
             #expect(prefix.shape == entry["prefix_shape"] as! [Int])
             expectSummary(prefix, entry["prefix"] as! [String: Any], tolerance: 2e-3)
             let logits = network.logits(Self.rows(entries, prefix: prefix))
@@ -109,8 +125,7 @@ struct D1OmniTinyModelTests {
 
     @Test("Requests run end to end: prompts, media, calibration, and yes/no order")
     func endToEnd() async throws {
-        let runtime = D1OmniRuntime(
-            network: try Self.network(), tokenizer: FakeD1Tokenizer(), special: fakeD1Special)
+        let runtime = try Self.runtime()
         let artifact = DecisionArtifact(identifier: "tiny", revision: "fixture")
         for entry in try Self.reference()["end_to_end"] as! [[String: Any]] {
             let questions = (entry["questions"] as! [[String: Any]]).map(decisionQuestion)
@@ -144,8 +159,7 @@ struct D1OmniTinyModelTests {
 
     @Test("Several requests batch together and keep their order")
     func batching() async throws {
-        let runtime = D1OmniRuntime(
-            network: try Self.network(), tokenizer: FakeD1Tokenizer(), special: fakeD1Special)
+        let runtime = try Self.runtime()
         let artifact = DecisionArtifact(identifier: "tiny", revision: "fixture")
         let question = DecisionQuestion(
             id: "team", instructions: "Which team?",
@@ -195,8 +209,9 @@ struct D1OmniTinyModelTests {
         let configuration = try JSONDecoder().decode(
             D1OmniConfiguration.self,
             from: Data(contentsOf: directory.appendingPathComponent("config.json")))
-        let weights = D1OmniNetwork.sanitize(
-            try DecisionWeights.load([directory.appendingPathComponent("model.safetensors")]))
+        let weights = D1OmniPart.text.weights(
+            D1OmniNetwork.sanitize(
+                try DecisionWeights.load([directory.appendingPathComponent("model.safetensors")])))
         let reference = try Self.network()
         let text = try Self.reference()["text"] as! [String: Any]
         let rows = Self.rows(text["rows"] as! [[String: Any]], prefix: nil)
@@ -221,7 +236,7 @@ struct D1OmniTinyModelTests {
         try DecisionWeights.apply(
             quantized, to: network, groupSize: 64, bits: 8, mode: "affine", precision: .checkpoint)
         #expect(network.encoder.layers[0].feedForward.w1 is QuantizedLinear)
-        #expect(!(network.vision.projector.linear1 is QuantizedLinear))
+        #expect(!(network.head.typeEmbedding is QuantizedEmbedding))
         let plain = D1OmniNetwork(configuration)
         try DecisionWeights.apply(
             dequantized, to: plain, groupSize: nil, bits: nil, mode: nil, precision: .checkpoint)
@@ -258,5 +273,27 @@ struct D1OmniTinyModelTests {
                 quantized, to: D1OmniNetwork(configuration), groupSize: nil, bits: nil, mode: nil,
                 precision: .checkpoint)
         }
+    }
+
+    @Test("Image and audio towers load with their first request and unload on demand")
+    func lazyTowers() async throws {
+        let runtime = try Self.runtime()
+        #expect(runtime.loadedModalities == [.text])
+        let artifact = DecisionArtifact(identifier: "tiny", revision: "fixture")
+        let question = DecisionQuestion(id: "q", instructions: "Holds?", kind: .yesNo())
+        let image = DecisionRequest(
+            state: nil, questions: [question],
+            images: [.rgb(bytes: Fixtures.rgb(width: 64, height: 64), width: 64, height: 64)])
+        let first = try await runtime.decide([image], tokenBudget: 65536, artifact: artifact)
+        #expect(runtime.loadedModalities == [.text, .image])
+        runtime.unload([.image, .text])
+        #expect(runtime.loadedModalities == [.text])
+        let again = try await runtime.decide([image], tokenBudget: 65536, artifact: artifact)
+        #expect(first[0].distributions[0].probabilities == again[0].distributions[0].probabilities)
+        let audio = DecisionRequest(
+            state: nil, questions: [question],
+            audio: .pcm16(samples: Fixtures.pcm(count: 9000), sampleRate: 16000))
+        _ = try await runtime.decide([audio], tokenBudget: 65536, artifact: artifact)
+        #expect(runtime.loadedModalities == [.text, .image, .audio])
     }
 }
