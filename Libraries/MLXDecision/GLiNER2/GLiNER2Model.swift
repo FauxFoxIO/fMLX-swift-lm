@@ -38,6 +38,16 @@ public struct GLiNER2Classification: Sendable, Hashable {
     public let scores: [Double]
     public let logits: [Double]
     public let multiLabel: Bool
+
+    public init(
+        task: String, labels: [String], scores: [Double], logits: [Double], multiLabel: Bool
+    ) {
+        self.task = task
+        self.labels = labels
+        self.scores = scores
+        self.logits = logits
+        self.multiLabel = multiLabel
+    }
 }
 
 final class GLiNER2Network: Module {

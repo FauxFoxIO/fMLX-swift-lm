@@ -143,6 +143,13 @@ public struct DecisionResult: Sendable {
     /// Every position the encoder read, media included.
     public let inputTokens: Int
     public let artifact: DecisionArtifact
+
+    public init(distributions: [DecisionDistribution], inputTokens: Int, artifact: DecisionArtifact)
+    {
+        self.distributions = distributions
+        self.inputTokens = inputTokens
+        self.artifact = artifact
+    }
 }
 
 /// The checkpoint identity is supplied by the installer; loaders do not download files.
