@@ -1,6 +1,8 @@
 // Copyright © 2026 Faux Fox, Inc.
 
+import CoreImage
 import Foundation
+import ImageIO
 import MLX
 import MLXLMCommon
 import MLXNN
@@ -136,6 +138,34 @@ struct LFM2VLImageProcessingTests {
         #expect(throws: DecodingError.self) {
             try Fixture.configuration(["min_tiles": 5, "max_tiles": 2])
         }
+    }
+
+    @Test("Core Image and file inputs keep their stored 8-bit samples")
+    func renderedPixels() throws {
+        let (width, height) = (97, 61)
+        let expected = Fixture.rgb(width: width, height: height)
+        let bytes = expected.asArray(UInt8.self)
+        let provider = CGDataProvider(data: Data(bytes) as CFData)!
+        let cgImage = CGImage(
+            width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 24,
+            bytesPerRow: width * 3, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+
+        let fromCI = try LFM2VLImageProcessing.pixels(
+            .ciImage(CIImage(cgImage: cgImage)), processing: nil)
+        #expect(fromCI.shape == [height, width, 3])
+        #expect(fromCI.asArray(UInt8.self) == bytes)
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lfm2vl-\(UUID().uuidString).png")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let destination = CGImageDestinationCreateWithURL(
+            url as CFURL, "public.png" as CFString, 1, nil)!
+        CGImageDestinationAddImage(destination, cgImage, nil)
+        #expect(CGImageDestinationFinalize(destination))
+        let fromFile = try LFM2VLImageProcessing.pixels(.url(url), processing: nil)
+        #expect(fromFile.asArray(UInt8.self) == bytes)
     }
 
     @Test("Placeholders must match the images")
