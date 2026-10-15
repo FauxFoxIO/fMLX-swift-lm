@@ -119,9 +119,20 @@ footprint 2.96 GB with BF16 and 5.55 GB with FP32; MLX allocation peaks were
 1.94 GB and 3.66 GB respectively. These are isolated fixture measurements,
 not application-wide or sustained-corpus resource guarantees.
 
-Independent tokenizer/prompt and media processor parity, Apple file decoding
-and resampling, intermediate activations, quantized variants, exactly 8,192-token
-inference, and the official PyTorch FP32 reference remain unverified. Apple
+On October 15, 2026, `Tests/EmbeddingGemma2CheckpointTests` checked the container end
+to end against Transformers 5.20 `EmbeddingGemma2Model` in float32 on CPU
+(`google/embeddinggemma-2` at `914f7f89`), including its tokenizer, prompts, and
+image and audio processors. Six cases cover a query, a document, code, an image, an
+audio clip, and interleaved text, image, and audio. Token counts match exactly in
+every case. The `mlx-community/embeddinggemma-2-bf16` export run in FP32 reaches
+minimum cosine 0.99999999999 and maximum component error 3.6e-7; in BF16, 0.99993 and
+0.0015; `mlx-community/embeddinggemma-2-8bit`, 0.99977 and 0.0030. The 256-dimension
+prefix matches after renormalization. The Google snapshot loads directly and gives the
+same BF16 results. `tools/decision_models/generate_fixtures.py embeddinggemma` writes
+the reference.
+
+Apple file decoding and resampling, intermediate activations, video against the
+reference, 4-bit variants, and exactly 8,192-token inference remain unverified. Apple
 media decoding and FP32 DSP can differ from Python decoding and NumPy double
 intermediates. The focused check used no newly installed Python packages.
 Codex assisted implementation and these validation checks.

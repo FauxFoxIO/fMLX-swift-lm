@@ -27,13 +27,17 @@ python -I generate_fixtures.py d1 --model <snapshot of LiquidAI/d1-omni-600M-MLX
 python -I generate_fixtures.py gliner --model <snapshot of fastino/GLiNER2.5-Decide> \
     --model-id fastino/GLiNER2.5-Decide --revision <snapshot sha> \
     --output Tests/MLXDecisionTests/Resources/gliner2.5-decide.json
+python -I generate_fixtures.py embeddinggemma --model <snapshot of google/embeddinggemma-2> \
+    --model-id google/embeddinggemma-2 --revision 914f7f89142e33e77833254d9c9b90c3cef7303b \
+    --output Tests/EmbeddingGemma2CheckpointTests/Resources/embeddinggemma-2.json
 ```
 
 `synthetic` builds a tiny random d1-omni and DeBERTa-v2 encoder, runs them
 through the PyTorch references, and records prompt and schema encodings made
 with fake tokenizers that the Swift tests reimplement. The other commands run
-the published checkpoints through MLX-VLM (d1-omni) and the `gliner2` package
-(GLiNER2.5-Decide).
+the published checkpoints through MLX-VLM (d1-omni), the `gliner2` package
+(GLiNER2.5-Decide), and Transformers in float32 (EmbeddingGemma 2, including its
+processor).
 
 The Swift checkpoint tests run when these variables name local snapshots; with
 `xcodebuild`, prefix each with `TEST_RUNNER_`:
@@ -41,3 +45,5 @@ The Swift checkpoint tests run when these variables name local snapshots; with
 - `MLX_DECISION_D1_OMNI_FP16`
 - `MLX_DECISION_D1_OMNI_8BIT`
 - `MLX_DECISION_GLINER2_DECIDE`
+- `MLX_EMBEDDING_GEMMA2_BF16` (a BF16 export or the Google snapshot)
+- `MLX_EMBEDDING_GEMMA2_8BIT`

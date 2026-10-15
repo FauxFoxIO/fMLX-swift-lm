@@ -173,6 +173,15 @@ let package = Package(
             path: "Tests/MLXDecisionTests",
             resources: [.copy("Resources")]
         ),
+        .testTarget(
+            name: "EmbeddingGemma2CheckpointTests",
+            dependencies: [
+                "MLXVLM",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Tests/EmbeddingGemma2CheckpointTests",
+            resources: [.copy("Resources")]
+        ),
         .target(
             name: "MLXRerankers",
             dependencies: [

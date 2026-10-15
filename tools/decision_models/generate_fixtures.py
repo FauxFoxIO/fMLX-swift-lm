@@ -741,22 +741,59 @@ def gliner(args) -> None:
     write_json(Path(args.output), out)
 
 
-def embeddinggemma(args) -> None:
-    import mlx.core as mx
-    from mlx_vlm import load
+EMBEDDING_GEMMA2_CASES = [
+    ("query", [("text", "how do I rotate an API key")]),
+    ("document", [("text", "Rotate keys from the account settings page, then update every client.")]),
+    ("document", [("text", 'func greet(name: String) -> String { "Hello, \\(name)" }')]),
+    ("document", [("image",)]),
+    ("document", [("audio",)]),
+    ("document", [("text", "Mars: "), ("image",), ("text", "\nObservation: "), ("audio",)]),
+]
 
-    model, processor = load(args.model)
+
+def embeddinggemma(args) -> None:
+    """Transformers' EmbeddingGemma 2 in float32: processor, tokenizer, model, mean pool."""
+    import torch
+    from PIL import Image
+    from transformers import AutoModel, AutoProcessor
+
+    torch.set_grad_enabled(False)
+    processor = AutoProcessor.from_pretrained(args.model)
+    model = AutoModel.from_pretrained(args.model, dtype=torch.float32).eval()
+    image = Image.fromarray(synthetic_rgb(320, 240), "RGB")
+    pcm = synthetic_pcm(20800).astype(np.float32) / 32768.0
+    prompts = {"query": "task: search result | query: ", "document": "title: none | text: "}
     cases = []
-    for purpose, text in [
-        ("query", "how do I rotate an API key"),
-        ("document", "Rotate keys from the account settings page, then update every client."),
-        ("document", "func greet(name: String) -> String { \"Hello, \\(name)\" }"),
-    ]:
-        values = model.encode_text(processor, text, purpose=purpose) if hasattr(model, "encode_text") else None
-        if values is None:
-            raise SystemExit("mlx-vlm EmbeddingGemma 2 lacks encode_text; update the generator")
-        cases.append({"purpose": purpose, "text": text, "values": np.array(values.astype(mx.float32)).ravel().tolist()})
-    write_json(Path(args.output), {"model": args.model_id, "revision": args.revision, "cases": cases})
+    for purpose, content in EMBEDDING_GEMMA2_CASES:
+        text = prompts[purpose]
+        images, audio = [], []
+        for item in content:
+            if item[0] == "text":
+                text += item[1]
+            elif item[0] == "image":
+                text += processor.image_token
+                images.append(image)
+            else:
+                text += processor.audio_token
+                audio.append(pcm)
+        kwargs = {}
+        if images:
+            kwargs["images"] = [images]
+        if audio:
+            kwargs["audio"] = audio
+        inputs = processor(text=[text], return_tensors="pt", **kwargs)
+        hidden = model(**inputs).last_hidden_state
+        mask = inputs["attention_mask"][..., None].to(hidden.dtype)
+        pooled = (hidden * mask).sum(1) / mask.sum(1)
+        values = torch.nn.functional.normalize(pooled, dim=-1)[0]
+        cases.append({
+            "purpose": purpose, "content": [list(item) for item in content],
+            "token_count": int(inputs["input_ids"].shape[1]),
+            "input_ids": inputs["input_ids"][0].tolist(),
+            "values": values.tolist()})
+    write_json(Path(args.output), {
+        "model": args.model_id, "revision": args.revision, "image": [320, 240],
+        "audio_samples": 20800, "cases": cases})
 
 
 def main() -> None:
