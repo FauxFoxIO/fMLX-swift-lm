@@ -67,7 +67,10 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/FauxFoxIO/swift-tokenizers.git", branch: "main"),
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.32.3")),
+        // FauxFox fork: MLX core 0.32.4 with the JACCL (RDMA over Thunderbolt) backend.
+        .package(
+            url: "https://github.com/FauxFoxIO/mlx-swift",
+            revision: "c7af75d32abcbe892885ab8e09a05c67c97e6dd1"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
