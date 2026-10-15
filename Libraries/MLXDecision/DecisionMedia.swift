@@ -1,6 +1,7 @@
 // Copyright © 2026 Faux Fox, Inc.
 
 import Foundation
+import MLX
 
 #if canImport(CoreGraphics) && canImport(ImageIO)
 import CoreGraphics
@@ -11,21 +12,25 @@ import ImageIO
 @preconcurrency import AVFoundation
 #endif
 
-/// Packed 8-bit RGB, row-major.
-struct DecisionRGBImage: Sendable, Equatable {
-    let bytes: [UInt8]
-    let width: Int
-    let height: Int
+/// An 8-bit RGB image as an MLX array [height, width, 3].
+struct DecisionRGBImage {
+    let pixels: MLXArray
+    var width: Int { pixels.dim(1) }
+    var height: Int { pixels.dim(0) }
+
+    init(pixels: MLXArray) {
+        self.pixels = pixels
+    }
+
+    /// Packed RGB, row-major.
+    init(bytes: [UInt8], width: Int, height: Int) {
+        pixels = MLXArray(bytes, [height, width, 3])
+    }
+
+    var bytes: [UInt8] { pixels.asArray(UInt8.self) }
 
     func crop(x: Int, y: Int, width: Int, height: Int) -> DecisionRGBImage {
-        var result = [UInt8](repeating: 0, count: width * height * 3)
-        for row in 0 ..< height {
-            let source = ((y + row) * self.width + x) * 3
-            result.replaceSubrange(
-                row * width * 3 ..< (row + 1) * width * 3,
-                with: bytes[source ..< source + width * 3])
-        }
-        return DecisionRGBImage(bytes: result, width: width, height: height)
+        DecisionRGBImage(pixels: pixels[y ..< (y + height), x ..< (x + width)])
     }
 }
 
@@ -112,13 +117,7 @@ enum DecisionMedia {
             return true
         }
         guard rendered else { throw DecisionError.invalidInput("cannot render the image as RGB") }
-        var bytes = [UInt8](repeating: 0, count: width * height * 3)
-        for pixel in 0 ..< width * height {
-            bytes[pixel * 3] = rgba[pixel * 4]
-            bytes[pixel * 3 + 1] = rgba[pixel * 4 + 1]
-            bytes[pixel * 3 + 2] = rgba[pixel * 4 + 2]
-        }
-        return DecisionRGBImage(bytes: bytes, width: width, height: height)
+        return DecisionRGBImage(pixels: MLXArray(rgba, [height, width, 4])[0..., 0..., ..<3])
     }
     #endif
 

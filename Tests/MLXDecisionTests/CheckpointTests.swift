@@ -65,6 +65,8 @@ func checkD1Omni(snapshot: URL, fixture: String, tolerance: Double) async throws
     for entry in reference["images"] as! [[String: Any]] {
         let (width, height) = (entry["width"] as! Int, entry["height"] as! Int)
         let questions = (entry["questions"] as! [[String: Any]]).map(decisionQuestion)
+        let clock = ContinuousClock()
+        let start = clock.now
         let result = try await model.decide(
             DecisionRequest(
                 state: nil, questions: questions,
@@ -73,6 +75,7 @@ func checkD1Omni(snapshot: URL, fixture: String, tolerance: Double) async throws
                         bytes: Fixtures.rgb(width: width, height: height), width: width,
                         height: height)
                 ]))
+        print("\(fixture) \(width)x\(height) image decision: \(clock.now - start)")
         #expect(result.inputTokens == entry["input_tokens"] as! Int)
         for (distribution, expected) in zip(
             result.distributions, entry["probabilities"] as! [[Double]])
@@ -82,6 +85,9 @@ func checkD1Omni(snapshot: URL, fixture: String, tolerance: Double) async throws
     }
     for entry in reference["audio"] as! [[String: Any]] {
         let questions = (entry["questions"] as! [[String: Any]]).map(decisionQuestion)
+        let clock = ContinuousClock()
+        let start = clock.now
+        defer { print("\(fixture) audio decision: \(clock.now - start)") }
         let result = try await model.decide(
             DecisionRequest(
                 state: nil, questions: questions,

@@ -100,39 +100,24 @@ enum D1OmniImageProcessor {
     static func patches(_ crop: DecisionRGBImage) -> D1OmniPreparedCrop {
         let rows = crop.height / patch
         let columns = crop.width / patch
-        let size = 3 * patch * patch
-        var values = [Float](repeating: 0, count: rows * columns * size)
-        crop.bytes.withUnsafeBufferPointer { source in
-            values.withUnsafeMutableBufferPointer { target in
-                for row in 0 ..< rows {
-                    for column in 0 ..< columns {
-                        let base = (row * columns + column) * size
-                        for y in 0 ..< patch {
-                            let sourceRow = ((row * patch + y) * crop.width + column * patch) * 3
-                            let targetRow = base + y * patch * 3
-                            for i in 0 ..< patch * 3 {
-                                target[targetRow + i] =
-                                    (Float(source[sourceRow + i]) - 127.5) / 127.5
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return D1OmniPreparedCrop(
-            patches: MLXArray(values, [rows * columns, size]), height: rows, width: columns)
+        let normalized = (crop.pixels.asType(.float32) - 127.5) / 127.5
+        let patches = normalized.reshaped(rows, patch, columns, patch, 3)
+            .transposed(0, 2, 1, 3, 4)
+            .reshaped(rows * columns, 3 * patch * patch)
+        return D1OmniPreparedCrop(patches: patches, height: rows, width: columns)
     }
 
-    /// torchvision `resize(uint8, BILINEAR, antialias=True)`: width pass, then height pass.
+    /// torchvision `resize(uint8, BILINEAR, antialias=True)`: width pass, then height pass,
+    /// in the same int32 fixed point, so results are byte-exact.
     static func resize(_ image: DecisionRGBImage, height: Int, width: Int) -> DecisionRGBImage {
-        var current = image
-        if current.width != width {
-            current = resizeAxis(current, output: width, horizontal: true)
+        var pixels = image.pixels
+        if image.width != width {
+            pixels = resizeAxis(pixels, axis: 1, output: width)
         }
-        if current.height != height {
-            current = resizeAxis(current, output: height, horizontal: false)
+        if image.height != height {
+            pixels = resizeAxis(pixels, axis: 0, output: height)
         }
-        return current
+        return DecisionRGBImage(pixels: pixels)
     }
 
     struct Taps {
@@ -185,42 +170,17 @@ enum D1OmniImageProcessor {
         return Taps(index: index, weights: fixed, count: count, bits: bits)
     }
 
-    private static func resizeAxis(_ image: DecisionRGBImage, output: Int, horizontal: Bool)
-        -> DecisionRGBImage
-    {
-        let input = horizontal ? image.width : image.height
-        let taps = taps(input: input, output: output)
-        let width = horizontal ? output : image.width
-        let height = horizontal ? image.height : output
-        var result = [UInt8](repeating: 0, count: width * height * 3)
-        let round = Int64(1) << (taps.bits - 1)
-        image.bytes.withUnsafeBufferPointer { source in
-            result.withUnsafeMutableBufferPointer { target in
-                for y in 0 ..< height {
-                    for x in 0 ..< width {
-                        let o = horizontal ? x : y
-                        var accumulator = (round, round, round)
-                        for k in 0 ..< taps.count {
-                            let i = taps.index[o * taps.count + k]
-                            let w = taps.weights[o * taps.count + k]
-                            let offset =
-                                horizontal ? (y * image.width + i) * 3 : (i * image.width + x) * 3
-                            accumulator.0 += Int64(source[offset]) * w
-                            accumulator.1 += Int64(source[offset + 1]) * w
-                            accumulator.2 += Int64(source[offset + 2]) * w
-                        }
-                        let offset = (y * width + x) * 3
-                        target[offset] = clamp(accumulator.0 >> Int64(taps.bits))
-                        target[offset + 1] = clamp(accumulator.1 >> Int64(taps.bits))
-                        target[offset + 2] = clamp(accumulator.2 >> Int64(taps.bits))
-                    }
-                }
-            }
+    private static func resizeAxis(_ pixels: MLXArray, axis: Int, output: Int) -> MLXArray {
+        let taps = taps(input: pixels.dim(axis), output: output)
+        let source = pixels.asType(.int32)
+        let shape = axis == 1 ? [1, output, 1] : [output, 1, 1]
+        var accumulator = MLXArray(Int32(1 << (taps.bits - 1)))
+        for k in 0 ..< taps.count {
+            let index = MLXArray((0 ..< output).map { Int32(taps.index[$0 * taps.count + k]) })
+            let weight = MLXArray((0 ..< output).map { Int32(taps.weights[$0 * taps.count + k]) })
+            accumulator = accumulator + take(source, index, axis: axis) * weight.reshaped(shape)
         }
-        return DecisionRGBImage(bytes: result, width: width, height: height)
-    }
-
-    private static func clamp(_ value: Int64) -> UInt8 {
-        UInt8(max(0, min(255, value)))
+        return clip(rightShift(accumulator, MLXArray(Int32(taps.bits))), min: 0, max: 255)
+            .asType(.uint8)
     }
 }
