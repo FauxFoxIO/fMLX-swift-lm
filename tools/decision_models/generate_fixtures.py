@@ -602,6 +602,11 @@ D1_TEXT_CASES = [
 ]
 
 
+def yes_first(questions, probabilities):
+    """MLX-VLM reads a noul as [false, true]; the fixtures use [yes, no] like the Swift API."""
+    return [p[::-1] if q["type"] == "noul" else p for q, p in zip(questions, probabilities)]
+
+
 def d1(args) -> None:
     import mlx.core as mx
     from PIL import Image
@@ -614,11 +619,22 @@ def d1(args) -> None:
     for state, questions in D1_TEXT_CASES:
         parsed = [as_question(q) for q in questions.values()]
         [(probs, read)] = model.probabilities(tok, [(state, parsed)])
+        probs = yes_first(list(questions.values()), probs)
         encoded = [encode(tok, state, q, model.config.max_length) for q in parsed]
         results["text"].append({
             "state": state, "questions": [normalized_question(n, q) for n, q in questions.items()],
             "probabilities": probs, "input_tokens": read,
             "ids": [ids for ids, _ in encoded], "markers": [m for _, m in encoded]})
+    if model.config.text_config.hidden_size and not getattr(model.config, "quantization", None):
+        # The same export upcast to float32 isolates port differences from float16 rounding.
+        float32_model, _ = load(args.model)
+        float32_model.set_dtype(mx.float32)
+        results["text_float32"] = []
+        for state, questions in D1_TEXT_CASES:
+            parsed = [as_question(q) for q in questions.values()]
+            [(probs, _)] = float32_model.probabilities(tok, [(state, parsed)])
+            results["text_float32"].append(yes_first(list(questions.values()), probs))
+        del float32_model
     image_questions = {
         "count": {"type": "choice", "instructions": "How many shapes are there?",
                   "criteria": {"one": "One", "two": "Two", "more": "Three or more"}},
@@ -628,6 +644,7 @@ def d1(args) -> None:
         image = Image.fromarray(synthetic_rgb(width, height), "RGB")
         parsed = [as_question(q) for q in image_questions.values()]
         [(probs, read)] = model.probabilities(tok, [(None, parsed, [image])])
+        probs = yes_first(list(image_questions.values()), probs)
         prefix = model.vision([image])
         results["images"].append({
             "width": width, "height": height,
@@ -644,6 +661,7 @@ def d1(args) -> None:
         pcm = synthetic_pcm(count)
         parsed = [as_question(q) for q in audio_questions.values()]
         [(probs, read)] = model.probabilities(tok, [(None, parsed, None, pcm)])
+        probs = yes_first(list(audio_questions.values()), probs)
         prefix = model.audio(pcm)[0]
         results["audio"].append({
             "samples": count, "questions": [normalized_question(n, q) for n, q in audio_questions.items()],

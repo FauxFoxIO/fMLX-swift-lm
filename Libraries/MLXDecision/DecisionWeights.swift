@@ -53,7 +53,8 @@ enum DecisionWeights {
     static func byteCount(_ urls: [URL]) -> Int64 {
         urls.reduce(0) { total, url in
             let size =
-                (try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber
+                (try? FileManager.default.attributesOfItem(
+                    atPath: url.resolvingSymlinksInPath().path)[.size]) as? NSNumber
             return total + (size?.int64Value ?? 0)
         }
     }
