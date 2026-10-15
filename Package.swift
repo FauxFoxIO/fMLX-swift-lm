@@ -31,6 +31,9 @@ let package = Package(
             name: "MLXRerankers",
             targets: ["MLXRerankers"]),
         .library(
+            name: "MLXDecision",
+            targets: ["MLXDecision"]),
+        .library(
             name: "MLXHuggingFace",
             targets: ["MLXHuggingFace"]),
         .library(
@@ -148,6 +151,27 @@ let package = Package(
             exclude: [
                 "README.md"
             ]
+        ),
+        .target(
+            name: "MLXDecision",
+            dependencies: [
+                "MLXLMCommon",
+                .product(name: "Tokenizers", package: "swift-tokenizers"),
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Libraries/MLXDecision",
+            exclude: ["README.md"]
+        ),
+        .testTarget(
+            name: "MLXDecisionTests",
+            dependencies: [
+                "MLXDecision",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/MLXDecisionTests",
+            resources: [.copy("Resources")]
         ),
         .target(
             name: "MLXRerankers",

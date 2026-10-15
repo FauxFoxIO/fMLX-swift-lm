@@ -1,0 +1,2385 @@
+{
+ "cases": [
+  {
+   "text": "My subscription renewed after the service was already down. Can I get that charge refunded?",
+   "tasks": [
+    {
+     "task": "intent",
+     "labels": [
+      "order_status",
+      "refund_request",
+      "other"
+     ]
+    }
+   ],
+   "normalized": "My subscription renewed after the service was already down. Can I get that charge refunded?",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "intent",
+     "(",
+     "[L]",
+     "order_status",
+     "[L]",
+     "refund_request",
+     "[L]",
+     "other",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "my",
+    "subscription",
+    "renewed",
+    "after",
+    "the",
+    "service",
+    "was",
+    "already",
+    "down",
+    ".",
+    "can",
+    "i",
+    "get",
+    "that",
+    "charge",
+    "refunded",
+    "?"
+   ],
+   "input_ids": [
+    691,
+    1002,
+    320,
+    352,
+    691,
+    1006,
+    280,
+    223,
+    250,
+    1006,
+    335,
+    161,
+    192,
+    357,
+    1006,
+    302,
+    124,
+    693,
+    693,
+    1001,
+    292,
+    359,
+    200,
+    209,
+    287,
+    631,
+    280,
+    124,
+    659,
+    390,
+    616,
+    700,
+    290,
+    670,
+    370,
+    703,
+    640,
+    821,
+    684,
+    323,
+    279,
+    315,
+    335,
+    123,
+    737
+   ],
+   "text_word_first_positions": [
+    20,
+    21,
+    24,
+    26,
+    28,
+    29,
+    31,
+    32,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    42,
+    44
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     5,
+     9,
+     14
+    ]
+   ]
+  },
+  {
+   "text": "My subscription renewed after the service was already down. Can I get that charge refunded?",
+   "tasks": [
+    {
+     "task": "answer",
+     "labels": [
+      "yes",
+      "no"
+     ],
+     "prompt": "Did it work?"
+    }
+   ],
+   "normalized": "My subscription renewed after the service was already down. Can I get that charge refunded?",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "answer: Did it work?",
+     "(",
+     "[L]",
+     "yes",
+     "[L]",
+     "no",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "my",
+    "subscription",
+    "renewed",
+    "after",
+    "the",
+    "service",
+    "was",
+    "already",
+    "down",
+    ".",
+    "can",
+    "i",
+    "get",
+    "that",
+    "charge",
+    "refunded",
+    "?"
+   ],
+   "input_ids": [
+    691,
+    1002,
+    390,
+    513,
+    562,
+    269,
+    373,
+    73,
+    691,
+    1006,
+    716,
+    1006,
+    264,
+    693,
+    693,
+    1001,
+    292,
+    359,
+    200,
+    209,
+    287,
+    631,
+    280,
+    124,
+    659,
+    390,
+    616,
+    700,
+    290,
+    670,
+    370,
+    703,
+    640,
+    821,
+    684,
+    323,
+    279,
+    315,
+    335,
+    123,
+    737
+   ],
+   "text_word_first_positions": [
+    16,
+    17,
+    20,
+    22,
+    24,
+    25,
+    27,
+    28,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    38,
+    40
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     9,
+     11
+    ]
+   ]
+  },
+  {
+   "text": "My subscription renewed after the service was already down. Can I get that charge refunded?",
+   "tasks": [
+    {
+     "task": "intent",
+     "labels": [
+      "card_pin_change",
+      "card_lost"
+     ],
+     "label_descriptions": {
+      "card_pin_change": "New PIN wanted",
+      "card_lost": "Card missing"
+     }
+    }
+   ],
+   "normalized": "My subscription renewed after the service was already down. Can I get that charge refunded?",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "intent [DESCRIPTION] card_pin_change: New PIN wanted [DESCRIPTION] card_lost: Card missing",
+     "(",
+     "[L]",
+     "card_pin_change",
+     "[L]",
+     "card_lost",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "my",
+    "subscription",
+    "renewed",
+    "after",
+    "the",
+    "service",
+    "was",
+    "already",
+    "down",
+    ".",
+    "can",
+    "i",
+    "get",
+    "that",
+    "charge",
+    "refunded",
+    "?"
+   ],
+   "input_ids": [
+    691,
+    1002,
+    320,
+    352,
+    788,
+    780,
+    789,
+    103,
+    256,
+    184,
+    103,
+    861,
+    646,
+    402,
+    360,
+    311,
+    788,
+    780,
+    789,
+    103,
+    256,
+    214,
+    242,
+    192,
+    379,
+    644,
+    691,
+    1006,
+    256,
+    184,
+    103,
+    629,
+    1006,
+    256,
+    214,
+    126,
+    693,
+    693,
+    1001,
+    292,
+    359,
+    200,
+    209,
+    287,
+    631,
+    280,
+    124,
+    659,
+    390,
+    616,
+    700,
+    290,
+    670,
+    370,
+    703,
+    640,
+    821,
+    684,
+    323,
+    279,
+    315,
+    335,
+    123,
+    737
+   ],
+   "text_word_first_positions": [
+    39,
+    40,
+    43,
+    45,
+    47,
+    48,
+    50,
+    51,
+    53,
+    54,
+    55,
+    56,
+    57,
+    58,
+    59,
+    61,
+    63
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     27,
+     32
+    ]
+   ]
+  },
+  {
+   "text": "My subscription renewed after the service was already down. Can I get that charge refunded?",
+   "tasks": [
+    {
+     "task": "intent",
+     "labels": [
+      "a",
+      "b"
+     ]
+    },
+    {
+     "task": "urgency",
+     "labels": [
+      "low",
+      "normal",
+      "high"
+     ]
+    },
+    {
+     "task": "route",
+     "labels": [
+      "support",
+      "billing"
+     ],
+     "prompt": "Who owns it?"
+    }
+   ],
+   "normalized": "My subscription renewed after the service was already down. Can I get that charge refunded?",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "intent",
+     "(",
+     "[L]",
+     "a",
+     "[L]",
+     "b",
+     ")",
+     ")"
+    ],
+    [
+     "(",
+     "[P]",
+     "urgency",
+     "(",
+     "[L]",
+     "low",
+     "[L]",
+     "normal",
+     "[L]",
+     "high",
+     ")",
+     ")"
+    ],
+    [
+     "(",
+     "[P]",
+     "route: Who owns it?",
+     "(",
+     "[L]",
+     "support",
+     "[L]",
+     "billing",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "my",
+    "subscription",
+    "renewed",
+    "after",
+    "the",
+    "service",
+    "was",
+    "already",
+    "down",
+    ".",
+    "can",
+    "i",
+    "get",
+    "that",
+    "charge",
+    "refunded",
+    "?"
+   ],
+   "input_ids": [
+    691,
+    1002,
+    320,
+    352,
+    691,
+    1006,
+    805,
+    1006,
+    807,
+    693,
+    693,
+    1000,
+    691,
+    1002,
+    304,
+    681,
+    691,
+    1006,
+    736,
+    1006,
+    365,
+    323,
+    1006,
+    266,
+    693,
+    693,
+    1000,
+    691,
+    1002,
+    420,
+    227,
+    641,
+    405,
+    521,
+    691,
+    1006,
+    400,
+    697,
+    1006,
+    294,
+    644,
+    693,
+    693,
+    1001,
+    292,
+    359,
+    200,
+    209,
+    287,
+    631,
+    280,
+    124,
+    659,
+    390,
+    616,
+    700,
+    290,
+    670,
+    370,
+    703,
+    640,
+    821,
+    684,
+    323,
+    279,
+    315,
+    335,
+    123,
+    737
+   ],
+   "text_word_first_positions": [
+    44,
+    45,
+    48,
+    50,
+    52,
+    53,
+    55,
+    56,
+    58,
+    59,
+    60,
+    61,
+    62,
+    63,
+    64,
+    66,
+    68
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     5,
+     7
+    ],
+    [
+     13,
+     17,
+     19,
+     22
+    ],
+    [
+     28,
+     35,
+     38
+    ]
+   ]
+  },
+  {
+   "text": "Battery dies before lunch, but the keyboard is great",
+   "tasks": [
+    {
+     "task": "intent",
+     "labels": [
+      "order_status",
+      "refund_request",
+      "other"
+     ]
+    }
+   ],
+   "normalized": "Battery dies before lunch, but the keyboard is great.",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "intent",
+     "(",
+     "[L]",
+     "order_status",
+     "[L]",
+     "refund_request",
+     "[L]",
+     "other",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "battery",
+    "dies",
+    "before",
+    "lunch",
+    ",",
+    "but",
+    "the",
+    "keyboard",
+    "is",
+    "great",
+    "."
+   ],
+   "input_ids": [
+    691,
+    1002,
+    320,
+    352,
+    691,
+    1006,
+    280,
+    223,
+    250,
+    1006,
+    335,
+    161,
+    192,
+    357,
+    1006,
+    302,
+    124,
+    693,
+    693,
+    1001,
+    342,
+    702,
+    305,
+    273,
+    326,
+    313,
+    114,
+    699,
+    722,
+    659,
+    302,
+    157,
+    266,
+    248,
+    126,
+    703
+   ],
+   "text_word_first_positions": [
+    20,
+    22,
+    23,
+    25,
+    27,
+    28,
+    29,
+    30,
+    32,
+    33,
+    35
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     5,
+     9,
+     14
+    ]
+   ]
+  },
+  {
+   "text": "Battery dies before lunch, but the keyboard is great",
+   "tasks": [
+    {
+     "task": "answer",
+     "labels": [
+      "yes",
+      "no"
+     ],
+     "prompt": "Did it work?"
+    }
+   ],
+   "normalized": "Battery dies before lunch, but the keyboard is great.",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "answer: Did it work?",
+     "(",
+     "[L]",
+     "yes",
+     "[L]",
+     "no",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "battery",
+    "dies",
+    "before",
+    "lunch",
+    ",",
+    "but",
+    "the",
+    "keyboard",
+    "is",
+    "great",
+    "."
+   ],
+   "input_ids": [
+    691,
+    1002,
+    390,
+    513,
+    562,
+    269,
+    373,
+    73,
+    691,
+    1006,
+    716,
+    1006,
+    264,
+    693,
+    693,
+    1001,
+    342,
+    702,
+    305,
+    273,
+    326,
+    313,
+    114,
+    699,
+    722,
+    659,
+    302,
+    157,
+    266,
+    248,
+    126,
+    703
+   ],
+   "text_word_first_positions": [
+    16,
+    18,
+    19,
+    21,
+    23,
+    24,
+    25,
+    26,
+    28,
+    29,
+    31
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     9,
+     11
+    ]
+   ]
+  },
+  {
+   "text": "Battery dies before lunch, but the keyboard is great",
+   "tasks": [
+    {
+     "task": "intent",
+     "labels": [
+      "card_pin_change",
+      "card_lost"
+     ],
+     "label_descriptions": {
+      "card_pin_change": "New PIN wanted",
+      "card_lost": "Card missing"
+     }
+    }
+   ],
+   "normalized": "Battery dies before lunch, but the keyboard is great.",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "intent [DESCRIPTION] card_pin_change: New PIN wanted [DESCRIPTION] card_lost: Card missing",
+     "(",
+     "[L]",
+     "card_pin_change",
+     "[L]",
+     "card_lost",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "battery",
+    "dies",
+    "before",
+    "lunch",
+    ",",
+    "but",
+    "the",
+    "keyboard",
+    "is",
+    "great",
+    "."
+   ],
+   "input_ids": [
+    691,
+    1002,
+    320,
+    352,
+    788,
+    780,
+    789,
+    103,
+    256,
+    184,
+    103,
+    861,
+    646,
+    402,
+    360,
+    311,
+    788,
+    780,
+    789,
+    103,
+    256,
+    214,
+    242,
+    192,
+    379,
+    644,
+    691,
+    1006,
+    256,
+    184,
+    103,
+    629,
+    1006,
+    256,
+    214,
+    126,
+    693,
+    693,
+    1001,
+    342,
+    702,
+    305,
+    273,
+    326,
+    313,
+    114,
+    699,
+    722,
+    659,
+    302,
+    157,
+    266,
+    248,
+    126,
+    703
+   ],
+   "text_word_first_positions": [
+    39,
+    41,
+    42,
+    44,
+    46,
+    47,
+    48,
+    49,
+    51,
+    52,
+    54
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     27,
+     32
+    ]
+   ]
+  },
+  {
+   "text": "Battery dies before lunch, but the keyboard is great",
+   "tasks": [
+    {
+     "task": "intent",
+     "labels": [
+      "a",
+      "b"
+     ]
+    },
+    {
+     "task": "urgency",
+     "labels": [
+      "low",
+      "normal",
+      "high"
+     ]
+    },
+    {
+     "task": "route",
+     "labels": [
+      "support",
+      "billing"
+     ],
+     "prompt": "Who owns it?"
+    }
+   ],
+   "normalized": "Battery dies before lunch, but the keyboard is great.",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "intent",
+     "(",
+     "[L]",
+     "a",
+     "[L]",
+     "b",
+     ")",
+     ")"
+    ],
+    [
+     "(",
+     "[P]",
+     "urgency",
+     "(",
+     "[L]",
+     "low",
+     "[L]",
+     "normal",
+     "[L]",
+     "high",
+     ")",
+     ")"
+    ],
+    [
+     "(",
+     "[P]",
+     "route: Who owns it?",
+     "(",
+     "[L]",
+     "support",
+     "[L]",
+     "billing",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "battery",
+    "dies",
+    "before",
+    "lunch",
+    ",",
+    "but",
+    "the",
+    "keyboard",
+    "is",
+    "great",
+    "."
+   ],
+   "input_ids": [
+    691,
+    1002,
+    320,
+    352,
+    691,
+    1006,
+    805,
+    1006,
+    807,
+    693,
+    693,
+    1000,
+    691,
+    1002,
+    304,
+    681,
+    691,
+    1006,
+    736,
+    1006,
+    365,
+    323,
+    1006,
+    266,
+    693,
+    693,
+    1000,
+    691,
+    1002,
+    420,
+    227,
+    641,
+    405,
+    521,
+    691,
+    1006,
+    400,
+    697,
+    1006,
+    294,
+    644,
+    693,
+    693,
+    1001,
+    342,
+    702,
+    305,
+    273,
+    326,
+    313,
+    114,
+    699,
+    722,
+    659,
+    302,
+    157,
+    266,
+    248,
+    126,
+    703
+   ],
+   "text_word_first_positions": [
+    44,
+    46,
+    47,
+    49,
+    51,
+    52,
+    53,
+    54,
+    56,
+    57,
+    59
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     5,
+     7
+    ],
+    [
+     13,
+     17,
+     19,
+     22
+    ],
+    [
+     28,
+     35,
+     38
+    ]
+   ]
+  },
+  {
+   "text": "Email me at someone@example.com or see https://example.com/path?x=1 — thanks @team!",
+   "tasks": [
+    {
+     "task": "intent",
+     "labels": [
+      "order_status",
+      "refund_request",
+      "other"
+     ]
+    }
+   ],
+   "normalized": "Email me at someone@example.com or see https://example.com/path?x=1 — thanks @team!",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "intent",
+     "(",
+     "[L]",
+     "order_status",
+     "[L]",
+     "refund_request",
+     "[L]",
+     "other",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "email",
+    "me",
+    "at",
+    "someone@example.com",
+    "or",
+    "see",
+    "https://example.com/path?x=1",
+    "—",
+    "thanks",
+    "@team",
+    "!"
+   ],
+   "input_ids": [
+    691,
+    1002,
+    320,
+    352,
+    691,
+    1006,
+    280,
+    223,
+    250,
+    1006,
+    335,
+    161,
+    192,
+    357,
+    1006,
+    302,
+    124,
+    693,
+    693,
+    1001,
+    253,
+    118,
+    232,
+    253,
+    315,
+    900,
+    178,
+    825,
+    658,
+    275,
+    648,
+    391,
+    570,
+    178,
+    825,
+    846,
+    180,
+    692,
+    835,
+    293,
+    347,
+    176,
+    119,
+    677
+   ],
+   "text_word_first_positions": [
+    20,
+    22,
+    23,
+    24,
+    29,
+    30,
+    31,
+    38,
+    39,
+    41,
+    43
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     5,
+     9,
+     14
+    ]
+   ]
+  },
+  {
+   "text": "Email me at someone@example.com or see https://example.com/path?x=1 — thanks @team!",
+   "tasks": [
+    {
+     "task": "answer",
+     "labels": [
+      "yes",
+      "no"
+     ],
+     "prompt": "Did it work?"
+    }
+   ],
+   "normalized": "Email me at someone@example.com or see https://example.com/path?x=1 — thanks @team!",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "answer: Did it work?",
+     "(",
+     "[L]",
+     "yes",
+     "[L]",
+     "no",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "email",
+    "me",
+    "at",
+    "someone@example.com",
+    "or",
+    "see",
+    "https://example.com/path?x=1",
+    "—",
+    "thanks",
+    "@team",
+    "!"
+   ],
+   "input_ids": [
+    691,
+    1002,
+    390,
+    513,
+    562,
+    269,
+    373,
+    73,
+    691,
+    1006,
+    716,
+    1006,
+    264,
+    693,
+    693,
+    1001,
+    253,
+    118,
+    232,
+    253,
+    315,
+    900,
+    178,
+    825,
+    658,
+    275,
+    648,
+    391,
+    570,
+    178,
+    825,
+    846,
+    180,
+    692,
+    835,
+    293,
+    347,
+    176,
+    119,
+    677
+   ],
+   "text_word_first_positions": [
+    16,
+    18,
+    19,
+    20,
+    25,
+    26,
+    27,
+    34,
+    35,
+    37,
+    39
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     9,
+     11
+    ]
+   ]
+  },
+  {
+   "text": "Email me at someone@example.com or see https://example.com/path?x=1 — thanks @team!",
+   "tasks": [
+    {
+     "task": "intent",
+     "labels": [
+      "card_pin_change",
+      "card_lost"
+     ],
+     "label_descriptions": {
+      "card_pin_change": "New PIN wanted",
+      "card_lost": "Card missing"
+     }
+    }
+   ],
+   "normalized": "Email me at someone@example.com or see https://example.com/path?x=1 — thanks @team!",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "intent [DESCRIPTION] card_pin_change: New PIN wanted [DESCRIPTION] card_lost: Card missing",
+     "(",
+     "[L]",
+     "card_pin_change",
+     "[L]",
+     "card_lost",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "email",
+    "me",
+    "at",
+    "someone@example.com",
+    "or",
+    "see",
+    "https://example.com/path?x=1",
+    "—",
+    "thanks",
+    "@team",
+    "!"
+   ],
+   "input_ids": [
+    691,
+    1002,
+    320,
+    352,
+    788,
+    780,
+    789,
+    103,
+    256,
+    184,
+    103,
+    861,
+    646,
+    402,
+    360,
+    311,
+    788,
+    780,
+    789,
+    103,
+    256,
+    214,
+    242,
+    192,
+    379,
+    644,
+    691,
+    1006,
+    256,
+    184,
+    103,
+    629,
+    1006,
+    256,
+    214,
+    126,
+    693,
+    693,
+    1001,
+    253,
+    118,
+    232,
+    253,
+    315,
+    900,
+    178,
+    825,
+    658,
+    275,
+    648,
+    391,
+    570,
+    178,
+    825,
+    846,
+    180,
+    692,
+    835,
+    293,
+    347,
+    176,
+    119,
+    677
+   ],
+   "text_word_first_positions": [
+    39,
+    41,
+    42,
+    43,
+    48,
+    49,
+    50,
+    57,
+    58,
+    60,
+    62
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     27,
+     32
+    ]
+   ]
+  },
+  {
+   "text": "Email me at someone@example.com or see https://example.com/path?x=1 — thanks @team!",
+   "tasks": [
+    {
+     "task": "intent",
+     "labels": [
+      "a",
+      "b"
+     ]
+    },
+    {
+     "task": "urgency",
+     "labels": [
+      "low",
+      "normal",
+      "high"
+     ]
+    },
+    {
+     "task": "route",
+     "labels": [
+      "support",
+      "billing"
+     ],
+     "prompt": "Who owns it?"
+    }
+   ],
+   "normalized": "Email me at someone@example.com or see https://example.com/path?x=1 — thanks @team!",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "intent",
+     "(",
+     "[L]",
+     "a",
+     "[L]",
+     "b",
+     ")",
+     ")"
+    ],
+    [
+     "(",
+     "[P]",
+     "urgency",
+     "(",
+     "[L]",
+     "low",
+     "[L]",
+     "normal",
+     "[L]",
+     "high",
+     ")",
+     ")"
+    ],
+    [
+     "(",
+     "[P]",
+     "route: Who owns it?",
+     "(",
+     "[L]",
+     "support",
+     "[L]",
+     "billing",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "email",
+    "me",
+    "at",
+    "someone@example.com",
+    "or",
+    "see",
+    "https://example.com/path?x=1",
+    "—",
+    "thanks",
+    "@team",
+    "!"
+   ],
+   "input_ids": [
+    691,
+    1002,
+    320,
+    352,
+    691,
+    1006,
+    805,
+    1006,
+    807,
+    693,
+    693,
+    1000,
+    691,
+    1002,
+    304,
+    681,
+    691,
+    1006,
+    736,
+    1006,
+    365,
+    323,
+    1006,
+    266,
+    693,
+    693,
+    1000,
+    691,
+    1002,
+    420,
+    227,
+    641,
+    405,
+    521,
+    691,
+    1006,
+    400,
+    697,
+    1006,
+    294,
+    644,
+    693,
+    693,
+    1001,
+    253,
+    118,
+    232,
+    253,
+    315,
+    900,
+    178,
+    825,
+    658,
+    275,
+    648,
+    391,
+    570,
+    178,
+    825,
+    846,
+    180,
+    692,
+    835,
+    293,
+    347,
+    176,
+    119,
+    677
+   ],
+   "text_word_first_positions": [
+    44,
+    46,
+    47,
+    48,
+    53,
+    54,
+    55,
+    62,
+    63,
+    65,
+    67
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     5,
+     7
+    ],
+    [
+     13,
+     17,
+     19,
+     22
+    ],
+    [
+     28,
+     35,
+     38
+    ]
+   ]
+  },
+  {
+   "text": "",
+   "tasks": [
+    {
+     "task": "intent",
+     "labels": [
+      "order_status",
+      "refund_request",
+      "other"
+     ]
+    }
+   ],
+   "normalized": ".",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "intent",
+     "(",
+     "[L]",
+     "order_status",
+     "[L]",
+     "refund_request",
+     "[L]",
+     "other",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "."
+   ],
+   "input_ids": [
+    691,
+    1002,
+    320,
+    352,
+    691,
+    1006,
+    280,
+    223,
+    250,
+    1006,
+    335,
+    161,
+    192,
+    357,
+    1006,
+    302,
+    124,
+    693,
+    693,
+    1001,
+    703
+   ],
+   "text_word_first_positions": [
+    20
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     5,
+     9,
+     14
+    ]
+   ]
+  },
+  {
+   "text": "",
+   "tasks": [
+    {
+     "task": "answer",
+     "labels": [
+      "yes",
+      "no"
+     ],
+     "prompt": "Did it work?"
+    }
+   ],
+   "normalized": ".",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "answer: Did it work?",
+     "(",
+     "[L]",
+     "yes",
+     "[L]",
+     "no",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "."
+   ],
+   "input_ids": [
+    691,
+    1002,
+    390,
+    513,
+    562,
+    269,
+    373,
+    73,
+    691,
+    1006,
+    716,
+    1006,
+    264,
+    693,
+    693,
+    1001,
+    703
+   ],
+   "text_word_first_positions": [
+    16
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     9,
+     11
+    ]
+   ]
+  },
+  {
+   "text": "",
+   "tasks": [
+    {
+     "task": "intent",
+     "labels": [
+      "card_pin_change",
+      "card_lost"
+     ],
+     "label_descriptions": {
+      "card_pin_change": "New PIN wanted",
+      "card_lost": "Card missing"
+     }
+    }
+   ],
+   "normalized": ".",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "intent [DESCRIPTION] card_pin_change: New PIN wanted [DESCRIPTION] card_lost: Card missing",
+     "(",
+     "[L]",
+     "card_pin_change",
+     "[L]",
+     "card_lost",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "."
+   ],
+   "input_ids": [
+    691,
+    1002,
+    320,
+    352,
+    788,
+    780,
+    789,
+    103,
+    256,
+    184,
+    103,
+    861,
+    646,
+    402,
+    360,
+    311,
+    788,
+    780,
+    789,
+    103,
+    256,
+    214,
+    242,
+    192,
+    379,
+    644,
+    691,
+    1006,
+    256,
+    184,
+    103,
+    629,
+    1006,
+    256,
+    214,
+    126,
+    693,
+    693,
+    1001,
+    703
+   ],
+   "text_word_first_positions": [
+    39
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     27,
+     32
+    ]
+   ]
+  },
+  {
+   "text": "",
+   "tasks": [
+    {
+     "task": "intent",
+     "labels": [
+      "a",
+      "b"
+     ]
+    },
+    {
+     "task": "urgency",
+     "labels": [
+      "low",
+      "normal",
+      "high"
+     ]
+    },
+    {
+     "task": "route",
+     "labels": [
+      "support",
+      "billing"
+     ],
+     "prompt": "Who owns it?"
+    }
+   ],
+   "normalized": ".",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "intent",
+     "(",
+     "[L]",
+     "a",
+     "[L]",
+     "b",
+     ")",
+     ")"
+    ],
+    [
+     "(",
+     "[P]",
+     "urgency",
+     "(",
+     "[L]",
+     "low",
+     "[L]",
+     "normal",
+     "[L]",
+     "high",
+     ")",
+     ")"
+    ],
+    [
+     "(",
+     "[P]",
+     "route: Who owns it?",
+     "(",
+     "[L]",
+     "support",
+     "[L]",
+     "billing",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "."
+   ],
+   "input_ids": [
+    691,
+    1002,
+    320,
+    352,
+    691,
+    1006,
+    805,
+    1006,
+    807,
+    693,
+    693,
+    1000,
+    691,
+    1002,
+    304,
+    681,
+    691,
+    1006,
+    736,
+    1006,
+    365,
+    323,
+    1006,
+    266,
+    693,
+    693,
+    1000,
+    691,
+    1002,
+    420,
+    227,
+    641,
+    405,
+    521,
+    691,
+    1006,
+    400,
+    697,
+    1006,
+    294,
+    644,
+    693,
+    693,
+    1001,
+    703
+   ],
+   "text_word_first_positions": [
+    44
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     5,
+     7
+    ],
+    [
+     13,
+     17,
+     19,
+     22
+    ],
+    [
+     28,
+     35,
+     38
+    ]
+   ]
+  },
+  {
+   "text": "Ünïcödé wörds and snake_case-words 42x",
+   "tasks": [
+    {
+     "task": "intent",
+     "labels": [
+      "order_status",
+      "refund_request",
+      "other"
+     ]
+    }
+   ],
+   "normalized": "Ünïcödé wörds and snake_case-words 42x.",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "intent",
+     "(",
+     "[L]",
+     "order_status",
+     "[L]",
+     "refund_request",
+     "[L]",
+     "other",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "ünïcödé",
+    "wörds",
+    "and",
+    "snake_case-words",
+    "42x",
+    "."
+   ],
+   "input_ids": [
+    691,
+    1002,
+    320,
+    352,
+    691,
+    1006,
+    280,
+    223,
+    250,
+    1006,
+    335,
+    161,
+    192,
+    357,
+    1006,
+    302,
+    124,
+    693,
+    693,
+    1001,
+    196,
+    255,
+    743,
+    125,
+    635,
+    294,
+    86,
+    38,
+    209,
+    445,
+    703
+   ],
+   "text_word_first_positions": [
+    20,
+    22,
+    24,
+    25,
+    29,
+    30
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     5,
+     9,
+     14
+    ]
+   ]
+  },
+  {
+   "text": "Ünïcödé wörds and snake_case-words 42x",
+   "tasks": [
+    {
+     "task": "answer",
+     "labels": [
+      "yes",
+      "no"
+     ],
+     "prompt": "Did it work?"
+    }
+   ],
+   "normalized": "Ünïcödé wörds and snake_case-words 42x.",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "answer: Did it work?",
+     "(",
+     "[L]",
+     "yes",
+     "[L]",
+     "no",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "ünïcödé",
+    "wörds",
+    "and",
+    "snake_case-words",
+    "42x",
+    "."
+   ],
+   "input_ids": [
+    691,
+    1002,
+    390,
+    513,
+    562,
+    269,
+    373,
+    73,
+    691,
+    1006,
+    716,
+    1006,
+    264,
+    693,
+    693,
+    1001,
+    196,
+    255,
+    743,
+    125,
+    635,
+    294,
+    86,
+    38,
+    209,
+    445,
+    703
+   ],
+   "text_word_first_positions": [
+    16,
+    18,
+    20,
+    21,
+    25,
+    26
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     9,
+     11
+    ]
+   ]
+  },
+  {
+   "text": "Ünïcödé wörds and snake_case-words 42x",
+   "tasks": [
+    {
+     "task": "intent",
+     "labels": [
+      "card_pin_change",
+      "card_lost"
+     ],
+     "label_descriptions": {
+      "card_pin_change": "New PIN wanted",
+      "card_lost": "Card missing"
+     }
+    }
+   ],
+   "normalized": "Ünïcödé wörds and snake_case-words 42x.",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "intent [DESCRIPTION] card_pin_change: New PIN wanted [DESCRIPTION] card_lost: Card missing",
+     "(",
+     "[L]",
+     "card_pin_change",
+     "[L]",
+     "card_lost",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "ünïcödé",
+    "wörds",
+    "and",
+    "snake_case-words",
+    "42x",
+    "."
+   ],
+   "input_ids": [
+    691,
+    1002,
+    320,
+    352,
+    788,
+    780,
+    789,
+    103,
+    256,
+    184,
+    103,
+    861,
+    646,
+    402,
+    360,
+    311,
+    788,
+    780,
+    789,
+    103,
+    256,
+    214,
+    242,
+    192,
+    379,
+    644,
+    691,
+    1006,
+    256,
+    184,
+    103,
+    629,
+    1006,
+    256,
+    214,
+    126,
+    693,
+    693,
+    1001,
+    196,
+    255,
+    743,
+    125,
+    635,
+    294,
+    86,
+    38,
+    209,
+    445,
+    703
+   ],
+   "text_word_first_positions": [
+    39,
+    41,
+    43,
+    44,
+    48,
+    49
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     27,
+     32
+    ]
+   ]
+  },
+  {
+   "text": "Ünïcödé wörds and snake_case-words 42x",
+   "tasks": [
+    {
+     "task": "intent",
+     "labels": [
+      "a",
+      "b"
+     ]
+    },
+    {
+     "task": "urgency",
+     "labels": [
+      "low",
+      "normal",
+      "high"
+     ]
+    },
+    {
+     "task": "route",
+     "labels": [
+      "support",
+      "billing"
+     ],
+     "prompt": "Who owns it?"
+    }
+   ],
+   "normalized": "Ünïcödé wörds and snake_case-words 42x.",
+   "schema_tokens": [
+    [
+     "(",
+     "[P]",
+     "intent",
+     "(",
+     "[L]",
+     "a",
+     "[L]",
+     "b",
+     ")",
+     ")"
+    ],
+    [
+     "(",
+     "[P]",
+     "urgency",
+     "(",
+     "[L]",
+     "low",
+     "[L]",
+     "normal",
+     "[L]",
+     "high",
+     ")",
+     ")"
+    ],
+    [
+     "(",
+     "[P]",
+     "route: Who owns it?",
+     "(",
+     "[L]",
+     "support",
+     "[L]",
+     "billing",
+     ")",
+     ")"
+    ]
+   ],
+   "text_tokens": [
+    "ünïcödé",
+    "wörds",
+    "and",
+    "snake_case-words",
+    "42x",
+    "."
+   ],
+   "input_ids": [
+    691,
+    1002,
+    320,
+    352,
+    691,
+    1006,
+    805,
+    1006,
+    807,
+    693,
+    693,
+    1000,
+    691,
+    1002,
+    304,
+    681,
+    691,
+    1006,
+    736,
+    1006,
+    365,
+    323,
+    1006,
+    266,
+    693,
+    693,
+    1000,
+    691,
+    1002,
+    420,
+    227,
+    641,
+    405,
+    521,
+    691,
+    1006,
+    400,
+    697,
+    1006,
+    294,
+    644,
+    693,
+    693,
+    1001,
+    196,
+    255,
+    743,
+    125,
+    635,
+    294,
+    86,
+    38,
+    209,
+    445,
+    703
+   ],
+   "text_word_first_positions": [
+    44,
+    46,
+    48,
+    49,
+    53,
+    54
+   ],
+   "schema_special_positions": [
+    [
+     1,
+     5,
+     7
+    ],
+    [
+     13,
+     17,
+     19,
+     22
+    ],
+    [
+     28,
+     35,
+     38
+    ]
+   ]
+  }
+ ]
+}
