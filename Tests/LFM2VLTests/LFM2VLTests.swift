@@ -206,3 +206,73 @@ struct LFM2VLModelTests {
         #expect(abs(total - (summary["sum"] as! Double)) < 1e-4 * (summary["abs_sum"] as! Double))
     }
 }
+
+/// d1-3B's MLX export against MLX-VLM fed the Transformers image processor's crops.
+/// Runs when `MLX_LFM2VL_D1_3B_8BIT` names a local LiquidAI/d1-3B-MLX-8bit snapshot.
+@Suite("d1-3B checkpoint", .serialized)
+struct D1ThreeBCheckpointTests {
+    static let snapshot = ProcessInfo.processInfo.environment["MLX_LFM2VL_D1_3B_8BIT"]
+
+    @Test(
+        "d1-3B MLX 8-bit image decisions match MLX-VLM",
+        .enabled(if: snapshot != nil, "set MLX_LFM2VL_D1_3B_8BIT to a local snapshot"))
+    func imageDecisions() throws {
+        let directory = URL(fileURLWithPath: Self.snapshot!)
+        let configData = try Data(contentsOf: directory.appendingPathComponent("config.json"))
+        let model = LFM2VL(try JSONDecoder.json5().decode(LFM2VLConfiguration.self, from: configData))
+        let base = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
+        try loadWeights(
+            modelDirectory: directory, model: model, quantization: base.quantization,
+            perLayerQuantization: base.perLayerQuantization)
+        let processorData = try Data(
+            contentsOf: directory.appendingPathComponent("processor_config.json"))
+        let configuration = try JSONDecoder.json5().decode(
+            LFM2VLProcessorConfiguration.self, from: processorData)
+        #expect(configuration.resample == .bicubic)
+
+        let url = Fixture.directory.appendingPathComponent("d1-3b-mlx-8bit.json")
+        let reference =
+            try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+        let tokens = reference["tokens"] as! [String: Int]
+        let cases = reference["cases"] as! [[String: Any]]
+        #expect(cases.count == 6)
+        for entry in cases {
+            let size = entry["image"] as! [Int]
+            let label = "\(size[0])x\(size[1]) \(entry["question"]!)"
+            let input = try LFM2VLProcessor.prepare(
+                tokens: entry["input_ids"] as! [Int],
+                images: [.array(Fixture.rgb(width: size[0], height: size[1]))],
+                processing: nil, configuration: configuration, id: { tokens[$0] })
+            #expect(
+                input.text.tokens.asArray(Int.self) == entry["expanded_ids"] as! [Int], "\(label)")
+
+            guard
+                case .logits(let output) = try model.prepare(
+                    input, cache: try model.newCache(parameters: nil), state: nil,
+                    prefill: PrefillParameters())
+            else {
+                Issue.record("LFM2-VL returned tokens instead of logits")
+                continue
+            }
+            let last = output.logits[0, -1].asType(.float32)
+            let logz = last - logSumExp(last, axis: -1, keepDims: true)
+            let ids = entry["logz_ids"] as! [Int]
+            let actual = logz[MLXArray(ids.map(Int32.init))].asArray(Float.self).map(Double.init)
+            let expected = entry["logz"] as! [Double]
+            let worst = zip(actual, expected).map { abs($0 - $1) }.max() ?? .infinity
+            #expect(worst < 0.05, "\(label): worst log-probability error \(worst)")
+
+            // d1's readout: softmax over each option's best alias.
+            let values = Dictionary(uniqueKeysWithValues: zip(ids, actual))
+            let best = (entry["readout"] as! [[Int]]).map { group in
+                group.map { values[$0]! }.max()!
+            }
+            let peak = best.max()!
+            let exps = best.map { Foundation.exp($0 - peak) }
+            let probabilities = exps.map { $0 / exps.reduce(0, +) }
+            let reference = entry["probabilities"] as! [Double]
+            let error = zip(probabilities, reference).map { abs($0 - $1) }.max() ?? .infinity
+            #expect(error < 1e-2, "\(label): \(probabilities) vs \(reference)")
+        }
+    }
+}

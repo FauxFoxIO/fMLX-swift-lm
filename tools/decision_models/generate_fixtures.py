@@ -17,6 +17,9 @@ Subcommands:
   lfm2vl           LFM2-VL image layouts, crops, markup, and a tiny random
                    Lfm2VlForConditionalGeneration through Transformers (the
                    d1-3B image path). Writes `Tests/LFM2VLTests/Resources`.
+  d1-3b            d1-3B MLX checkpoint image decisions through mlx-vlm, fed
+                   the Transformers image processor's crops (as the PyTorch
+                   reference reads them).
 """
 
 from __future__ import annotations
@@ -945,13 +948,84 @@ def lfm2vl(args) -> None:
     })
 
 
+def d1_3b(args) -> None:
+    import mlx.core as mx
+    from mlx_vlm import load
+    from mlx_vlm.models.d1.prompt import (
+        as_question, image_markup, prefix_text, readout, readout_ids, suffix_text)
+    from PIL import Image
+    from transformers.models.lfm2_vl.image_processing_lfm2_vl import Lfm2VlImageProcessor
+    from transformers.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
+    import types
+
+    model, processor = load(args.model)
+    tokenizer = processor.tokenizer
+    image_processor = Lfm2VlImageProcessor(**D1_3B_IMAGE_PROCESSOR)
+    stub = types.SimpleNamespace(
+        image_processor=image_processor, image_token="<image>",
+        image_start_token="<|image_start|>", image_end_token="<|image_end|>",
+        image_thumbnail_token="<|img_thumbnail|>")
+    for name in ("_build_image_tokens", "_compute_tokens_per_tile", "_compute_tokens_for_image",
+                 "_get_image_num_tokens"):
+        setattr(stub, name, types.MethodType(getattr(Lfm2VlProcessor, name), stub))
+
+    specials = ["<image>", "<|image_start|>", "<|image_end|>", "<|img_thumbnail|>"] + [
+        f"<|img_row_{r}_col_{c}|>" for r in range(1, 11) for c in range(1, 11)]
+    tokens = {t: tokenizer.convert_tokens_to_ids(t) for t in specials}
+    image_id = tokens["<image>"]
+    questions = {
+        "pattern": {"type": "choice", "instructions": "What does the picture mostly show?",
+                    "criteria": {"stripes": "Repeating stripes or bands", "faces": "People",
+                                 "text": "Written words"}},
+        "colorful": {"type": "noul", "instructions": "Is the picture colorful?"},
+        "busy": {"type": "score", "instructions": "How busy is the picture?",
+                 "criteria": ["Plain", "Some detail", "Very busy"]},
+    }
+    cases = []
+    for width, height in [(320, 240), (1100, 700)]:
+        picture = Image.fromarray(synthetic_rgb(width, height))
+        outputs = image_processor([picture], return_tensors="np")
+        markup = Lfm2VlProcessor.replace_image_token(
+            stub, outputs, image_idx=0, use_image_special_tokens=True)
+        mask = outputs["pixel_attention_mask"]
+        patches = int(mask.sum(1).max())
+        vision = {
+            "pixel_values": mx.array(outputs["pixel_values"][:, :patches]),
+            "pixel_attention_mask": mx.array(mask[:, :patches]),
+            "spatial_shapes": mx.array(outputs["spatial_shapes"]),
+        }
+        for name, raw in questions.items():
+            q = as_question(raw)
+            text = prefix_text(None, tokenizer.bos_token, image_markup(processor, 1)) + suffix_text(
+                tokenizer, q)
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            assert ids.count(image_id) == 1
+            expanded = []
+            for t in ids:
+                expanded += tokenizer.encode(markup, add_special_tokens=False) if t == image_id else [t]
+            embeds = model.get_input_embeddings(mx.array([expanded]), **vision).inputs_embeds
+            hidden = model.language_model.model(mx.array([expanded]), input_embeddings=embeds)
+            logz = model._logz(hidden[:, -1])[0]
+            groups = readout_ids(tokenizer, q)
+            top = [int(i) for i in np.argsort(-logz)[:32]]
+            scored = sorted({*top, *(i for g in groups for i in g)})
+            cases.append({
+                "image": [width, height], "question": name, "type": q["type"],
+                "input_ids": ids, "expanded_ids": expanded, "readout": groups,
+                "probabilities": [float(p) for p in readout(tokenizer, q, logz)],
+                "logz_ids": scored, "logz": [float(logz[i]) for i in scored],
+            })
+    write_json(Path(args.output), {
+        "model": args.model_id, "revision": args.revision, "tokens": tokens, "cases": cases})
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     s = sub.add_parser("synthetic")
     s.add_argument("--d1-source", required=True)
     s.add_argument("--output", required=True)
-    for name in ("d1", "gliner", "embeddinggemma"):
+    for name in ("d1", "gliner", "embeddinggemma", "d1-3b"):
         p = sub.add_parser(name)
         p.add_argument("--model", required=True, help="local snapshot directory")
         p.add_argument("--model-id", required=True)
@@ -961,7 +1035,7 @@ def main() -> None:
     v.add_argument("--output", required=True)
     args = parser.parse_args()
     {"synthetic": synthetic, "d1": d1, "gliner": gliner, "embeddinggemma": embeddinggemma,
-     "lfm2vl": lfm2vl}[args.command](args)
+     "lfm2vl": lfm2vl, "d1-3b": d1_3b}[args.command](args)
 
 
 if __name__ == "__main__":

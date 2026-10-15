@@ -27,10 +27,20 @@ python -I generate_fixtures.py d1 --model <snapshot of LiquidAI/d1-omni-600M-MLX
 python -I generate_fixtures.py gliner --model <snapshot of fastino/GLiNER2.5-Decide> \
     --model-id fastino/GLiNER2.5-Decide --revision <snapshot sha> \
     --output Tests/MLXDecisionTests/Resources/gliner2.5-decide.json
+python -I generate_fixtures.py lfm2vl --output Tests/LFM2VLTests/Resources
+python -I generate_fixtures.py d1-3b --model <snapshot of LiquidAI/d1-3B-MLX-8bit> \
+    --model-id LiquidAI/d1-3B-MLX-8bit --revision 9409cbf3bd5067e1a9b17437b1970f6a0c299ccd \
+    --output Tests/LFM2VLTests/Resources/d1-3b-mlx-8bit.json
 python -I generate_fixtures.py embeddinggemma --model <snapshot of google/embeddinggemma-2> \
     --model-id google/embeddinggemma-2 --revision 914f7f89142e33e77833254d9c9b90c3cef7303b \
     --output Tests/EmbeddingGemma2CheckpointTests/Resources/embeddinggemma-2.json
 ```
+
+`lfm2vl` records Transformers' LFM2-VL tile ratios, layouts, crop bytes, and
+image markup, and the logits of a tiny random `Lfm2VlForConditionalGeneration`.
+`d1-3b` runs d1-3B's MLX export through MLX-VLM on the crops of Transformers'
+`Lfm2VlImageProcessor`, which the PyTorch reference uses (MLX-VLM's own
+processor resizes with PIL).
 
 `synthetic` builds a tiny random d1-omni and DeBERTa-v2 encoder, runs them
 through the PyTorch references, and records prompt and schema encodings made
@@ -47,15 +57,16 @@ The Swift checkpoint tests run when these variables name local snapshots; with
 - `MLX_DECISION_GLINER2_DECIDE`
 - `MLX_EMBEDDING_GEMMA2_BF16` (a BF16 export or the Google snapshot)
 - `MLX_EMBEDDING_GEMMA2_8BIT`
+- `MLX_LFM2VL_D1_3B_8BIT`
 
 ## Running the tests
 
 `xcodebuild test -scheme mlx-swift-lm-Package` builds every test target, and
 `MLXLMTests` does not compile at `1f15098` (its MTP drafter mocks predate the
 current protocols). Until that is fixed, run these targets through a local
-scheme that lists only `MLXDecisionTests` and `EmbeddingGemma2CheckpointTests`
-as testables (`.swiftpm/xcode/xcshareddata/xcschemes/` is not tracked), for
-example:
+scheme that lists only `MLXDecisionTests`, `LFM2VLTests`, and
+`EmbeddingGemma2CheckpointTests` as testables
+(`.swiftpm/xcode/xcshareddata/xcschemes/` is not tracked), for example:
 
 ```sh
 TEST_RUNNER_MLX_DECISION_D1_OMNI_FP16=<snapshot> \
