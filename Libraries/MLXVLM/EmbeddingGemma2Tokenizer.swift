@@ -64,6 +64,28 @@ struct EmbeddingGemma2Tokenizer: Sendable {
         }
     }
 
+    func convertTokenToId(_ token: String) -> Int? {
+        switch backend {
+        case .native(let tokenizer): tokenizer.convertTokenToId(token)
+        case .supplied(let tokenizer): tokenizer.convertTokenToId(token)
+        }
+    }
+
+    /// The `<bos>` and `<eos>` IDs that wrap every embedded sequence.
+    func sequenceBoundaries() throws -> (begin: Int, end: Int) {
+        let (bos, eos): (String?, String?) =
+            switch backend {
+            case .native(let tokenizer): (tokenizer.bosToken, tokenizer.eosToken)
+            case .supplied(let tokenizer): (tokenizer.bosToken, tokenizer.eosToken)
+            }
+        guard let begin = convertTokenToId(bos ?? "<bos>"),
+            let end = convertTokenToId(eos ?? "<eos>")
+        else {
+            throw EmbeddingGemma2Error.invalidConfiguration("tokenizer has no <bos> or <eos>")
+        }
+        return (begin, end)
+    }
+
     func convertIdToToken(_ id: Int) -> String? {
         switch backend {
         case .native(let tokenizer): tokenizer.convertIdToToken(id)

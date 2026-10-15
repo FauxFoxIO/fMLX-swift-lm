@@ -836,7 +836,8 @@ public struct Qwen25VLProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Qwen2VLMessageGenerator().generate(from: input)
+        let messages = Qwen2VLMessageGenerator().generate(
+            from: input.removingSpecialTokenLabels(using: tokenizer))
 
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
@@ -1275,6 +1276,23 @@ public class Qwen25VL: Module, VLMModel, KVCacheDimensionProvider {
                         return (key, value)
                     })
         )
+    }
+}
+
+extension Qwen25VL: PreparedInputSplitting {
+
+    /// Opt into `ChatSession` warm-cache reuse for append-only media turns by
+    /// delegating to `QwenVL.splitPreparedInput` with this model's image and video
+    /// token ids and spatial merge size.
+    public func splitPreparedInput(_ input: LMInput, droppingFirst prefixTokenCount: Int)
+        -> LMInput?
+    {
+        QwenVL.splitPreparedInput(
+            input,
+            droppingFirst: prefixTokenCount,
+            imageTokenId: config.baseConfiguration.imageTokenId,
+            videoTokenId: config.baseConfiguration.videoTokenId,
+            mergeSize: config.visionConfiguration.spatialMergeSize)
     }
 }
 

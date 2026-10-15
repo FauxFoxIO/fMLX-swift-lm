@@ -77,6 +77,9 @@ public enum LLMTypeRegistry {
         "qwen3_5": create(Qwen35Configuration.self) { Qwen35Model($0) },
         "qwen3_5_moe": create(Qwen35Configuration.self) { Qwen35MoEModel($0) },
         "qwen3_5_text": create(Qwen35TextConfiguration.self) { Qwen35TextModel($0) },
+        "qwen3_8": create(Qwen35Configuration.self) { Qwen35Model($0) },
+        "qwen3_8_moe": create(Qwen35Configuration.self) { Qwen35MoEModel($0) },
+        "qwen3_8_text": create(Qwen35TextConfiguration.self) { Qwen35TextModel($0) },
         "prism_hadamard_qwen35": createPrismHadamardQwen35,
         "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
         "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
@@ -379,6 +382,18 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<|im_end|>"]
     )
 
+    static public let qwen3_8_27b_4bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.8-27B-4bit",
+        defaultPrompt: "Why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
+    static public let qwen3_8_27b_8bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.8-27B-8bit",
+        defaultPrompt: "Why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
     static public let openelm270m4bit = ModelConfiguration(
         id: "mlx-community/OpenELM-270M-Instruct",
         // https://huggingface.co/apple/OpenELM
@@ -572,6 +587,8 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             qwen3_5_2b_4bit,
             underdogWoof4B11,
             qwen3_6_27b_4bit,
+            qwen3_8_27b_4bit,
+            qwen3_8_27b_8bit,
             smolLM_135M_4bit,
             deepseek_r1_4bit,
             mimo_7b_sft_4bit,
@@ -673,6 +690,14 @@ public final class LLMModelFactory: GenericModelFactory {
     /// by the model itself, e.g. DeepSeek-R1
     public let conventionsRegistry: ChatConventionsRegistry
 
+    /// Returns the model's LoRA metadata from its configuration without loading weights.
+    ///
+    /// The registered model architecture is instantiated so custom `LoRAModel.loraDefaultKeys`
+    /// implementations remain authoritative. No checkpoint files are read.
+    public func loraMetadata(configurationData: Data) async throws -> LoRAModelMetadata? {
+        try await typeRegistry.loraMetadata(configurationData: configurationData)
+    }
+
     public func _load(
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
@@ -718,6 +743,11 @@ public final class LLMModelFactory: GenericModelFactory {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
 
+        // Honor `suppress_tokens` from generation_config.json (transformers'
+        // SuppressTokensLogitsProcessor): merge into the model's suppressed
+        // token IDs so the token iterators mask them during sampling.
+        mergeGenerationConfigSuppressedTokens(generationConfig, into: model)
+
         // Build a ModelConfiguration with loaded EOS token IDs and tool call format
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
@@ -748,7 +778,8 @@ public final class LLMModelFactory: GenericModelFactory {
         try await loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: baseConfig.perLayerQuantization,
-            weightFileSelection: configuration.weightFileSelection)
+            weightFileSelection: configuration.weightFileSelection,
+            excludedComponents: configuration.excludedComponents)
 
         let tokenizer = try await tokenizerTask
 

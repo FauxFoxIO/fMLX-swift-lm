@@ -1,27 +1,17 @@
 // Copyright © 2026 Faux Fox, Inc.
-// Adapted from Hugging Face Transformers' Gemma4AudioFeatureExtractor and audio_utils,
-// Copyright 2026 Google LLC and the HuggingFace Team.
-// Licensed under the Apache License, Version 2.0.
-// You may obtain a copy at https://www.apache.org/licenses/LICENSE-2.0.
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-// CONDITIONS OF ANY KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations under the License.
 
 import Foundation
-import MLX
 
 #if canImport(AVFoundation)
 @preconcurrency import AVFoundation
 #endif
 
-enum EmbeddingGemma2AudioProcessor {
-    static func process(_ input: EmbeddingGemma2Audio, maximumTokens: Int) async throws
-        -> EmbeddingGemma2PreparedAudio
-    {
-        guard maximumTokens > 0 else {
-            throw EmbeddingGemma2Error.invalidConfiguration("Audio token budget must be positive")
-        }
+/// Decodes and resamples audio to mono samples for `EmbeddingGemma2AudioProcessor`.
+/// Audio longer than the processor's 30-second window throws instead of being cut.
+enum EmbeddingGemma2Waveform {
+    static let sampleRate = 16_000
+
+    static func samples(_ input: EmbeddingGemma2Audio) async throws -> [Float] {
         try Task.checkCancellation()
         let waveform: [Float]
         switch input {
@@ -32,35 +22,24 @@ enum EmbeddingGemma2AudioProcessor {
                 throw EmbeddingGemma2Error.invalidInput(
                     "PCM requires complete frames, a positive rate, and channels")
             }
-            let expected = try resampledCount(samples.count / channels, sampleRate: sampleRate)
-            try checkBudget(sampleCount: expected, maximumTokens: maximumTokens)
+            try checkLength(try resampledCount(samples.count / channels, sampleRate: sampleRate))
             let mono = try mix(samples, channels: channels)
-            waveform = try resample(mono, sampleRate: sampleRate, maximumTokens: maximumTokens)
+            waveform = try resample(mono, sampleRate: sampleRate)
         case .file(let url):
-            waveform = try await decode(url, maximumTokens: maximumTokens)
+            waveform = try await decode(url)
         }
         try Task.checkCancellation()
-        return try features(waveform, maximumTokens: maximumTokens)
-    }
-
-    // Unfold requires 321 samples after prepending 160; only the first 320 are analyzed.
-    private static func frameCount(sampleCount: Int) -> Int {
-        sampleCount > 160 ? (sampleCount - 1) / 160 : 0
-    }
-
-    private static func tokens(frameCount: Int) -> Int {
-        let first = frameCount / 2 + frameCount % 2
-        return first / 2 + first % 2
-    }
-
-    private static func checkBudget(sampleCount: Int, maximumTokens: Int) throws {
-        guard sampleCount >= 0, sampleCount <= Int(Int32.max) - 256 else {
-            throw EmbeddingGemma2Error.invalidInput(
-                "Audio sample count exceeds the native array range")
+        try checkLength(waveform.count)
+        guard waveform.allSatisfy(\.isFinite) else {
+            throw EmbeddingGemma2Error.invalidInput("Resampled PCM samples must be finite")
         }
-        let count = tokens(frameCount: frameCount(sampleCount: sampleCount))
-        if count > maximumTokens {
-            throw EmbeddingGemma2Error.tokenLimit(count: count, limit: maximumTokens)
+        return waveform
+    }
+
+    private static func checkLength(_ sampleCount: Int) throws {
+        guard sampleCount <= EmbeddingGemma2AudioProcessor.maximumSampleCount else {
+            throw EmbeddingGemma2Error.invalidInput(
+                "Audio exceeds 30 seconds. Divide it into contiguous units.")
         }
     }
 
@@ -68,7 +47,7 @@ enum EmbeddingGemma2AudioProcessor {
         guard count >= 0, sampleRate > 0 else {
             throw EmbeddingGemma2Error.invalidInput("Invalid audio sample count or rate")
         }
-        let (scaled, overflow) = count.multipliedReportingOverflow(by: 16_000)
+        let (scaled, overflow) = count.multipliedReportingOverflow(by: Self.sampleRate)
         guard !overflow else {
             throw EmbeddingGemma2Error.invalidInput(
                 "Resampled audio length overflows the native array range")
@@ -93,18 +72,16 @@ enum EmbeddingGemma2AudioProcessor {
         return mono
     }
 
-    private static func resample(_ samples: [Float], sampleRate: Int, maximumTokens: Int) throws
-        -> [Float]
-    {
-        if sampleRate == 16_000 { return samples }
+    private static func resample(_ samples: [Float], sampleRate: Int) throws -> [Float] {
+        if sampleRate == Self.sampleRate { return samples }
         #if canImport(AVFoundation)
         guard
             let sourceFormat = AVAudioFormat(
                 commonFormat: .pcmFormatFloat32, sampleRate: Double(sampleRate), channels: 1,
                 interleaved: false),
             let targetFormat = AVAudioFormat(
-                commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false
-            ),
+                commonFormat: .pcmFormatFloat32, sampleRate: Double(Self.sampleRate), channels: 1,
+                interleaved: false),
             let converter = AVAudioConverter(from: sourceFormat, to: targetFormat),
             let input = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: 4096),
             let output = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: 4096)
@@ -142,7 +119,7 @@ enum EmbeddingGemma2AudioProcessor {
                     "Native audio sample-rate conversion failed")
             }
             let count = Int(output.frameLength)
-            try checkBudget(sampleCount: result.count + count, maximumTokens: maximumTokens)
+            try checkLength(result.count + count)
             if count > 0 {
                 result.append(
                     contentsOf: UnsafeBufferPointer(
@@ -167,7 +144,7 @@ enum EmbeddingGemma2AudioProcessor {
         #endif
     }
 
-    private static func decode(_ url: URL, maximumTokens: Int) async throws -> [Float] {
+    private static func decode(_ url: URL) async throws -> [Float] {
         guard url.isFileURL else {
             throw EmbeddingGemma2Error.invalidInput("Audio requires a local file URL")
         }
@@ -192,11 +169,11 @@ enum EmbeddingGemma2AudioProcessor {
             throw EmbeddingGemma2Error.invalidInput("Audio track duration is invalid")
         }
         // Metadata is a preflight estimate. The decoded and resampled lengths are checked again.
-        let estimate = floor(duration * 16_000)
+        let estimate = floor(duration * Double(Self.sampleRate))
         guard estimate < Double(Int.max) else {
             throw EmbeddingGemma2Error.invalidInput("Audio duration exceeds the native array range")
         }
-        try checkBudget(sampleCount: Int(estimate), maximumTokens: maximumTokens)
+        try checkLength(Int(estimate))
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
             AVSampleRateKey: format.mSampleRate,
@@ -233,7 +210,7 @@ enum EmbeddingGemma2AudioProcessor {
             let sampleCount = bytes / MemoryLayout<Float>.size
             let expected = try resampledCount(
                 mono.count + sampleCount / channels, sampleRate: sampleRate)
-            try checkBudget(sampleCount: expected, maximumTokens: maximumTokens)
+            try checkLength(expected)
             var chunk = [Float](repeating: 0, count: sampleCount)
             let status = chunk.withUnsafeMutableBytes { destination in
                 CMBlockBufferCopyDataBytes(
@@ -252,63 +229,10 @@ enum EmbeddingGemma2AudioProcessor {
         guard !mono.isEmpty else {
             throw EmbeddingGemma2Error.invalidInput("Audio file contains no PCM frames")
         }
-        return try resample(mono, sampleRate: sampleRate, maximumTokens: maximumTokens)
+        return try resample(mono, sampleRate: sampleRate)
         #else
         throw EmbeddingGemma2Error.invalidInput(
             "Native audio decoding is unavailable on this platform")
         #endif
-    }
-
-    private static func features(_ waveform: [Float], maximumTokens: Int) throws
-        -> EmbeddingGemma2PreparedAudio
-    {
-        try checkBudget(sampleCount: waveform.count, maximumTokens: maximumTokens)
-        let validFrames = frameCount(sampleCount: waveform.count)
-        guard validFrames > 0 else {
-            throw EmbeddingGemma2Error.invalidInput("Audio requires at least 161 samples at 16 kHz")
-        }
-        guard waveform.allSatisfy(\.isFinite) else {
-            throw EmbeddingGemma2Error.invalidInput("Resampled PCM samples must be finite")
-        }
-        // Preserve the extractor's default waveform padding to a multiple of 128.
-        let paddedCount = ((waveform.count + 127) / 128) * 128
-        let frames = frameCount(sampleCount: paddedCount)
-        guard frames <= Int(Int32.max) / 128 else {
-            throw EmbeddingGemma2Error.invalidInput(
-                "Audio feature tensor exceeds the native array range")
-        }
-        var padded = [Float](repeating: 0, count: paddedCount + 160)
-        padded.replaceSubrange(160 ..< 160 + waveform.count, with: waveform)
-        let window = MLXArray(
-            (0 ..< 320).map { index in
-                Float(0.5 - 0.5 * cos(2 * Double.pi * Double(index) / 320))
-            })
-        let unfolded = asStrided(MLXArray(padded), [frames, 321], strides: [160, 1])
-        let analysis = unfolded[0..., 0 ..< 320] * window
-        let spectrum = abs(MLXFFT.rfft(analysis, n: 512, axis: -1))
-        let mel = matmul(spectrum, MLXArray(melFilters(), [257, 128]))
-        let mask = MLXArray((0 ..< frames).map { $0 < validFrames }, [1, frames])
-        let logMel = log(mel + Float(0.001)).expandedDimensions(axis: 0)
-        return EmbeddingGemma2PreparedAudio(
-            features: which(mask.expandedDimensions(axis: -1), logMel, MLXArray(Float(0))),
-            validMask: mask,
-            tokenCount: tokens(frameCount: validFrames))
-    }
-
-    private static func melFilters() -> [Float] {
-        let maximumMel = 2595 * log10(1 + 8000.0 / 700)
-        let edges = (0 ..< 130).map { index in
-            700 * (pow(10, (maximumMel * Double(index) / 129) / 2595) - 1)
-        }
-        var filters = [Float](repeating: 0, count: 257 * 128)
-        for frequency in 0 ..< 257 {
-            let hertz = Double(frequency) * 8000 / 256
-            for mel in 0 ..< 128 {
-                let rising = (hertz - edges[mel]) / (edges[mel + 1] - edges[mel])
-                let falling = (edges[mel + 2] - hertz) / (edges[mel + 2] - edges[mel + 1])
-                filters[frequency * 128 + mel] = Float(max(0, min(rising, falling)))
-            }
-        }
-        return filters
     }
 }

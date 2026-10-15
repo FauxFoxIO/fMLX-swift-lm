@@ -107,6 +107,12 @@ func testGemma4AssistantDraftModelInstantiatesAndShape() {
     // We don't run inference here (would need actual weights + metal kernels).
 }
 
+@Test
+func testGemma4AssistantRejectsNonGemmaTarget() {
+    let model = Gemma4AssistantDraftModel(syntheticConfig(tieWordEmbeddings: true))
+    #expect(!model.isCompatible(with: NonGemmaTarget()))
+}
+
 // MARK: - MaskedEmbedder forward (use_ordered_embeddings)
 
 /// Independent correctness pin for the centroid-routed sparse LM head.
@@ -407,6 +413,7 @@ func testDraftBlockAcceptsGemma4UnifiedTarget() throws {
     let drafterConfig = try JSONDecoder().decode(
         Gemma4AssistantConfiguration.self, from: Data(drafterJSON.utf8))
     let drafter = Gemma4AssistantDraftModel(drafterConfig)
+    #expect(drafter.isCompatible(with: target))
 
     let lastHiddenSlice = lastHidden[0..., (-1)..., 0...]
     let proposed = drafter.draftBlock(
@@ -419,6 +426,21 @@ func testDraftBlockAcceptsGemma4UnifiedTarget() throws {
         blockSize: 3,
         sampler: ArgMaxSampler()
     )
-    eval(proposed)
-    #expect(proposed.shape == [1, 2])
+    eval(proposed.tokens, proposed.logits)
+    #expect(proposed.tokens.shape == [1, 2])
+    #expect(proposed.logits.shape == [1, 2, 32])
+}
+
+private final class NonGemmaTarget: Module, LanguageModel, KVCacheDimensionProvider {
+    var kvHeads: [Int] { [] }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state _: LMOutput.State?, prefill _: PrefillParameters
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        MLXArray.zeros([1, 1, 1])
+    }
 }

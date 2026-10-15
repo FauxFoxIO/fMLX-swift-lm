@@ -541,6 +541,10 @@ public final class DFlash2DraftModel: Module, IncrementalMTPDrafterModel,
         configuration.hiddenLayers * configuration.kvHeads * configuration.headDim * 4
     }
 
+    public func isCompatible(with target: any LanguageModel) -> Bool {
+        target is Qwen35Model || target is Qwen35TextModel
+    }
+
     @ModuleInfo var fc: Linear
     @ModuleInfo(key: "hidden_norm") var hiddenNorm: RMSNorm
     @ModuleInfo var layers: [DFlash2DecoderLayer]

@@ -43,6 +43,10 @@ public struct MTPDraft {
 /// instance. Drafters that need their own per-stream state additionally
 /// conform to ``StatefulMTPDrafterModel``.
 public protocol MTPDrafterModel: BaseLanguageModel {
+    /// Whether the drafter can consume hidden states and model-owned values
+    /// from this target architecture.
+    func isCompatible(with target: any LanguageModel) -> Bool
+
     /// Largest total verification block the drafter can produce efficiently.
     /// `nil` means the caller may choose any block size.
     var maximumBlockSize: Int? { get }
@@ -55,6 +59,10 @@ public protocol MTPDrafterModel: BaseLanguageModel {
     /// Whether the drafter must be prefilled over the shifted prompt before
     /// its first proposal. Qwen's private decoder cache requires this.
     var requiresPromptPrefill: Bool { get }
+
+    /// Whether this drafter supports only greedy decoding. Stochastic decoding
+    /// otherwise uses probability-ratio acceptance against the proposal logits.
+    var requiresGreedySampling: Bool { get }
 
     /// Target decoder layers whose outputs are concatenated for draft conditioning.
     /// `nil` requests the target's ordinary final hidden representation.
@@ -105,6 +113,7 @@ extension MTPDrafterModel {
     public var maximumBlockSize: Int? { nil }
     public var requiresSharedTargetKV: Bool { true }
     public var requiresPromptPrefill: Bool { false }
+    public var requiresGreedySampling: Bool { false }
     public var targetHiddenLayerIDs: [Int]? { nil }
 }
 

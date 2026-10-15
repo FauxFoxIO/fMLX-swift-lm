@@ -215,6 +215,18 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         telemetry.roundCount > 0 ? telemetry : nil
     }
 
+    public var evictedTokenCount: Int {
+        KVCacheTree.leaves(in: mainCache).map(\.cache.evictedTokenCount).max() ?? 0
+    }
+
+    public var reasoningTokenCount: Int? {
+        (processor as? any GenerationReasoningTokenCounting)?.generationReasoningTokenCount
+    }
+
+    public mutating func recordEmittedToken(_ token: Int) {
+        processor?.didEmit(token: token)
+    }
+
     public mutating func discardGeneratedToken() {
         telemetry.discardGeneratedToken()
     }
@@ -283,6 +295,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             blockSize >= 2,
             "MTPSpeculativeTokenIterator requires blockSize >= 2 (1 bonus + K-1 drafted)")
         precondition(roundDiagnosticCapacity >= 0, "roundDiagnosticCapacity must not be negative")
+        guard drafter.isCompatible(with: mainModel) else {
+            throw ModelFactoryError.invalidConfiguration(
+                "MTP drafter \(type(of: drafter)) is incompatible with target "
+                    + "\(type(of: mainModel))")
+        }
 
         let kvCachePlan = try parameters.kvCachePlan()
         let mainCache = try kvCachePlan.validated(
@@ -306,8 +323,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         self.sampler = parameters.sampler()
         try components.validate(parameters: parameters)
-        self.processor = components.logitProcessor(parameters: parameters)
-        if scheduledPrefix != nil, processor != nil {
+        // Includes the model's suppressed tokens; `makeDraftSampler` applies it to drafts too.
+        self.processor = components.logitProcessor(parameters: parameters, model: mainModel)
+        if scheduledPrefix != nil, components.logitProcessor(parameters: parameters) != nil {
             throw KVCacheError(
                 message: "Scheduled MTP prefix restore does not support stateful logit processors")
         }
@@ -369,6 +387,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
         self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - prefillStart
 
+        if drafter.requiresGreedySampling, parameters.temperature != 0 {
+            switchToPassthrough(
+                reason: "drafter requires temperature == 0; generating without speculation")
+        }
     }
 
     private func makeDraftSampler() -> any LogitSampler {
@@ -548,6 +570,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// `LMOutput.state`.
     mutating func prepare(input: LMInput, prefill: PrefillParameters = .init()) throws {
         processor?.prompt(input.text.tokens)
+        prefill.prefix?(mainCacheStorage.processedTokenCount)
         let inputLength = input.text.cacheSequenceLength
 
         var prefillState = LMOutput.State()
@@ -1311,6 +1334,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
 extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
     mutating func finalizeGeneration() {
+        defer { processor?.finalizeGeneration() }
         // A fully consumed all-accepted round can still retain recurrent
         // checkpoints used for early-finalization rollback. Release them even
         // when no committed lookahead remains.
