@@ -251,7 +251,12 @@ private final class DeviceAuthorizationProtocol: URLProtocol, @unchecked Sendabl
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        Self.requests.record(request)
+        // URLSession hands a URLProtocol the body as a stream, not httpBody.
+        var recorded = request
+        if recorded.httpBody == nil, let stream = recorded.httpBodyStream {
+            recorded.httpBody = Self.readAll(stream)
+        }
+        Self.requests.record(recorded)
         let response = HTTPURLResponse(
             url: request.url!, statusCode: 200,
             httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"]
@@ -262,6 +267,19 @@ private final class DeviceAuthorizationProtocol: URLProtocol, @unchecked Sendabl
     }
 
     override func stopLoading() {}
+
+    private static func readAll(_ stream: InputStream) -> Data {
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while stream.hasBytesAvailable {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            guard count > 0 else { break }
+            data.append(buffer, count: count)
+        }
+        return data
+    }
 }
 
 private final class RequestRecorder: @unchecked Sendable {

@@ -630,7 +630,8 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     let rotating = try #require(restored.first as? RotatingKVCache)
 
     #expect(rotating.capacityOrigin == .modelNative)
-    #expect(rotating.metaState == ["0", "32", "256", "1", "1", "modelNative"])
+    // Legacy metadata has no wrapped flag; it is inferred from the restored arrays.
+    #expect(rotating.metaState == ["0", "32", "256", "1", "1", "modelNative", "false"])
 }
 
 @Test func testPromptCacheRoundTripPreservesEmptyCaches() throws {

@@ -61,15 +61,12 @@ The Swift checkpoint tests run when these variables name local snapshots; with
 
 ## Running the tests
 
-`xcodebuild test -scheme mlx-swift-lm-Package` builds every test target, and
-`MLXLMTests` does not compile at `1f15098` (its MTP drafter mocks predate the
-current protocols). Until that is fixed, run these targets through a local
-scheme that lists only `MLXDecisionTests`, `LFM2VLTests`, and
-`EmbeddingGemma2CheckpointTests` as testables
-(`.swiftpm/xcode/xcshareddata/xcschemes/` is not tracked), for example:
+Run them with the package scheme. `-only-testing` limits the run to these
+targets, though `xcodebuild` still builds every test target:
 
 ```sh
 TEST_RUNNER_MLX_DECISION_D1_OMNI_FP16=<snapshot> \
-xcodebuild test -scheme DecisionModelTests -destination 'platform=macOS' \
-    -skipPackagePluginValidation
+xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS' \
+    -skipPackagePluginValidation -only-testing:MLXDecisionTests \
+    -only-testing:LFM2VLTests -only-testing:EmbeddingGemma2CheckpointTests
 ```
