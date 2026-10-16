@@ -150,6 +150,24 @@ public func withPreparedCache<Result>(
     return try body()
 }
 
+/// The arrays to evaluate with each decode token so cache updates do not
+/// form a lazy chain across steps.
+///
+/// These are the buffers behind `state`. The built-in caches whose `state`
+/// slices to the current offset return their buffers directly, which skips
+/// building two slice nodes per layer every token. Other caches return
+/// `state`.
+package func decodeEvaluationArrays(_ cache: KVCache) -> [MLXArray] {
+    let type = ObjectIdentifier(Swift.type(of: cache))
+    if type == ObjectIdentifier(KVCacheSimple.self)
+        || type == ObjectIdentifier(RotatingKVCache.self)
+        || type == ObjectIdentifier(QuantizedKVCache.self)
+    {
+        return cache.innerState()
+    }
+    return cache.state
+}
+
 /// Protocol for caches that support efficient quantized operations
 ///
 /// **Usage Example:**
