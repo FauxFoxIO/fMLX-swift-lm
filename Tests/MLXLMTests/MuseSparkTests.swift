@@ -32,10 +32,22 @@ struct MuseSparkParityTests {
         #expect(difference < Self.tolerance, "max |Δ logit| \(difference)")
     }
 
+    @Test("Nvfp4 experts with a global scale match mlx-lm")
+    func nvfp4GlobalScale() async throws {
+        let fixture = try ParityFixture("muse_spark_nvfp4")
+        let model = try await fixture.loadLanguageModel()
+        let experts = try #require(model as? MuseSparkModel).model.layers[1].feedForward.switchMLP
+        let gate = try #require(experts.gateProj as? QuantizedSwitchLinear)
+        #expect(gate.mode == .nvfp4)
+        #expect(gate.globalScale?.shape == [8])
+        let difference = fixture.maxAbsDifference(model(fixture.inputIDs, cache: nil))
+        #expect(difference < Self.tolerance, "max |Δ logit| \(difference)")
+    }
+
     @Test(
         "Decoding through the cache matches the prefill reference",
         arguments: [
-            "muse_spark_meta"
+            "muse_spark_meta", "muse_spark_nvfp4",
         ])
     func cachedDecode(name: String) async throws {
         let fixture = try ParityFixture(name)

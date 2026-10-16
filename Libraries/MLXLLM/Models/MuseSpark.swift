@@ -667,7 +667,15 @@ public final class MuseSparkModel: Module, LLMModel, KVCacheDimensionProvider,
     }
 
     public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
-        try MuseSparkCheckpoint.prepare(checkpoint, configuration: configuration)
+        let checkpoint = try MuseSparkCheckpoint.prepare(checkpoint, configuration: configuration)
+        let perLayer = checkpoint.perLayerQuantization
+        quantizeGlobalScaleSwitchLinears(in: self, weights: checkpoint.weights) { path in
+            if let q = perLayer?.quantization(layer: path), q.mode == .nvfp4 {
+                return q.asTuple
+            }
+            return (16, 4, .nvfp4)
+        }
+        return checkpoint
     }
 
     public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {

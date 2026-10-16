@@ -480,6 +480,9 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
     @ModuleInfo(key: "scales") var scales: MLXArray
     @ModuleInfo(key: "biases") var biases: MLXArray?
 
+    /// Per-expert float32 nvfp4 global scale, shape `[numExperts]`, or `nil`.
+    @ParameterInfo(key: "global_scale") public private(set) var globalScale: MLXArray?
+
     public let groupSize: Int
     public let bits: Int
     public let mode: QuantizationMode
@@ -496,10 +499,46 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
 
         self._scales.wrappedValue = scales
         self._biases.wrappedValue = biases
+        self._globalScale.wrappedValue = nil
 
         super.init(
             inputDims: other.inputDims, outputDims: other.outputDims, numExperts: other.numExperts,
             weight: quantizedWeight, bias: other.bias)
+
+        self.freeze()
+    }
+
+    /// Placeholder arrays for a checkpoint to replace, including a per-expert global scale.
+    ///
+    /// Use it for nvfp4 experts with a global scale: weight loading cannot add a parameter
+    /// that the quantized module does not already hold.
+    public init(
+        inputDims: Int, outputDims: Int, numExperts: Int, groupSize: Int, bits: Int,
+        mode: QuantizationMode, hasGlobalScale: Bool, bias: MLXArray? = nil
+    ) {
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+
+        let groups = inputDims / groupSize
+        let scaleType: DType = mode == .affine ? .bfloat16 : .uint8
+        self._scales.wrappedValue = MLXArray.zeros(
+            [numExperts, outputDims, groups], dtype: scaleType)
+        if mode == .affine {
+            self._biases.wrappedValue = MLXArray.zeros(
+                [numExperts, outputDims, groups], dtype: scaleType)
+        } else {
+            self._biases.wrappedValue = nil
+        }
+        if hasGlobalScale {
+            self._globalScale.wrappedValue = MLXArray.ones([numExperts], type: Float.self)
+        }
+
+        super.init(
+            inputDims: inputDims, outputDims: outputDims, numExperts: numExperts,
+            weight: MLXArray.zeros(
+                [numExperts, outputDims, inputDims * bits / 32], type: UInt32.self),
+            bias: bias)
 
         self.freeze()
     }
@@ -517,6 +556,7 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
             groupSize: self.groupSize,
             bits: self.bits,
             mode: mode,
+            globalScale: globalScale,
             sortedIndices: sortedIndices
         )
 
@@ -732,5 +772,42 @@ public struct StreamedSwitchGLU: @unchecked Sendable {
             throw StreamedSwitchGLUError.invalidExpertShape
         }
         return present.isEmpty ? nil : MLX.stacked(present)
+    }
+}
+
+// MARK: - Global-scale experts
+
+/// Quantizes each ``SwitchLinear`` whose checkpoint has a `global_scale`, before loading.
+///
+/// Nvfp4 experts with a global scale need the parameter in place before
+/// `Module.update(parameters:)`. `quantization(path)` gives the settings for a layer.
+/// Already quantized layers are skipped by later quantization passes.
+public func quantizeGlobalScaleSwitchLinears(
+    in model: Module, weights: [String: MLXArray],
+    quantization: (String) -> (groupSize: Int, bits: Int, mode: QuantizationMode)
+) {
+    let updates = model.leafModules().flattened().compactMap { path, module -> (String, Module)? in
+        guard let linear = module as? SwitchLinear, !(module is Quantized),
+            weights["\(path).global_scale"] != nil
+        else { return nil }
+        let (groupSize, bits, mode) = quantization(path)
+        return (
+            path,
+            QuantizedSwitchLinear(
+                inputDims: linear.inputDims, outputDims: linear.outputDims,
+                numExperts: linear.numExperts, groupSize: groupSize, bits: bits, mode: mode,
+                hasGlobalScale: true, bias: linear.bias)
+        )
+    }
+    guard !updates.isEmpty else { return }
+    // Update each parent: a partial update of a module array fails.
+    let modules = Dictionary(uniqueKeysWithValues: model.namedModules())
+    for (path, quantized) in updates {
+        guard let dot = path.lastIndex(of: "."), let parent = modules[String(path[..<dot])]
+        else { continue }
+        parent.update(
+            modules: ModuleChildren.unflattened([
+                (String(path[path.index(after: dot)...]), quantized)
+            ]))
     }
 }
