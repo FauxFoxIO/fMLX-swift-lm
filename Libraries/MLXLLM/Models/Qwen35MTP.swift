@@ -346,15 +346,23 @@ public final class Qwen35MTPDraftModel: Module, IncrementalMTPDrafterModel,
     }
 
     private func targetEmbeddingAndHead(_ target: any LanguageModel) -> (Embedding, Linear?) {
-        if let model = target as? Qwen35Model {
-            return (model.languageModel.model.embedTokens, model.languageModel.lmHead)
+        guard let target = target as? any MTPTargetModel else {
+            fatalError("Qwen35MTPDraftModel requires a Qwen35 target, got \(type(of: target))")
         }
-        if let model = target as? Qwen35TextModel {
-            return (model.model.embedTokens, model.lmHead)
-        }
-        fatalError(
-            "Qwen35MTPDraftModel requires a Qwen35 target, got \(type(of: target))")
+        return (target.mtpEmbedding, target.mtpOutputHead)
     }
+}
+
+extension Qwen35TextModel: MTPTargetModel {
+    public var mtpTargetArchitectureID: String { "qwen3_5:\(configuration.hiddenSize)" }
+    public var mtpEmbedding: Embedding { model.embedTokens }
+    public var mtpOutputHead: Linear? { lmHead }
+}
+
+extension Qwen35Model: MTPTargetModel {
+    public var mtpTargetArchitectureID: String { languageModel.mtpTargetArchitectureID }
+    public var mtpEmbedding: Embedding { languageModel.mtpEmbedding }
+    public var mtpOutputHead: Linear? { languageModel.mtpOutputHead }
 }
 
 extension Qwen35MTPDraftModel: ModelConversionMetadataProvider {
