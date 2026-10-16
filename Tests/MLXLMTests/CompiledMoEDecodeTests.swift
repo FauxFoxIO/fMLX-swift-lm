@@ -200,4 +200,17 @@ final class CompiledMoEDecodeTests: XCTestCase {
             XCTAssertGreaterThan(compiledSegments(model), 0, name)
         }
     }
+
+    /// Adapter, conversion and ParoQuant loads replace modules and then call
+    /// `invalidateCompiledTraces()`, which must find the decode traces.
+    func testInvalidateCompiledTracesDropsDecodeTraces() throws {
+        for (name, make) in try models() {
+            let model = try make()
+            try materialize(model, seed: 25, quantized: true)
+            _ = try run(model, compiled: true)
+            XCTAssertEqual(compiledSegments(model), 4, name)
+            model.invalidateCompiledTraces()
+            XCTAssertEqual(compiledSegments(model), 0, name)
+        }
+    }
 }
