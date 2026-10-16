@@ -870,3 +870,43 @@ enum MuseSparkCheckpoint {
             .reshaped(rows, columns)
     }
 }
+
+// MARK: - Conversion
+
+extension MuseSparkModel {
+    /// Conversion recipe for running the 816B model on two 256 GB Macs.
+    ///
+    /// Routed experts take `expertBits`; the experts of the first and last layers, which
+    /// Meta's NVFP4 build keeps in bf16, take `boundaryExpertBits` (`nil` keeps them in bf16).
+    /// Attention and latent projections take `denseBits`, the embedding and head take
+    /// `embeddingBits`. Norms, the router, its bias and the residual gates are parameters,
+    /// not layers, and keep their precision. With the defaults the model is about 367 GB.
+    public static func conversionQuantizationPredicate(
+        hiddenLayers: Int = 62,
+        expertBits: Int = 3,
+        boundaryExpertBits: Int? = 4,
+        denseBits: Int = 4,
+        embeddingBits: Int = 8,
+        groupSize: Int = 64
+    ) -> ModelConversionQuantizationPredicate {
+        let boundary: Set<Int> = [0, hiddenLayers - 1]
+        return { path, module in
+            func quantize(_ bits: Int) -> ModelConversionQuantizationDecision {
+                .quantize(.init(bits: bits, groupSize: groupSize, mode: .affine))
+            }
+            if path == "model.embed_tokens" || path == "lm_head" {
+                return quantize(embeddingBits)
+            }
+            let parts = path.split(separator: ".")
+            if parts.count == 6, parts[0] == "model", parts[1] == "layers",
+                parts[3] == "feed_forward", parts[4] == "switch_mlp", let layer = Int(parts[2])
+            {
+                if boundary.contains(layer) {
+                    return boundaryExpertBits.map(quantize) ?? .skip
+                }
+                return quantize(expertBits)
+            }
+            return module is Linear ? quantize(denseBits) : .skip
+        }
+    }
+}

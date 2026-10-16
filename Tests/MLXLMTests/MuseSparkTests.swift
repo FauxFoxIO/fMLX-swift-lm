@@ -187,3 +187,29 @@ struct MuseSparkCheckpointNameTests {
         #expect(MuseSparkCheckpoint.mapName(source) == nil)
     }
 }
+
+struct MuseSparkConversionTests {
+    @Test("The conversion predicate quantizes experts, dense layers and the head separately")
+    func predicate() {
+        let predicate = MuseSparkModel.conversionQuantizationPredicate(
+            hiddenLayers: 62, denseBits: 8)
+        let linear = Linear(64, 64, bias: false)
+        let experts = SwitchLinear(inputDims: 64, outputDims: 64, numExperts: 2, bias: false)
+        func bits(_ bits: Int) -> ModelConversionQuantizationDecision {
+            .quantize(.init(bits: bits, groupSize: 64, mode: .affine))
+        }
+        #expect(predicate("model.layers.5.feed_forward.switch_mlp.up_proj", experts) == bits(3))
+        #expect(predicate("model.layers.0.feed_forward.switch_mlp.down_proj", experts) == bits(4))
+        #expect(predicate("model.layers.61.feed_forward.switch_mlp.gate_proj", experts) == bits(4))
+        #expect(predicate("model.layers.5.self_attn.q_proj", linear) == bits(8))
+        #expect(predicate("model.layers.5.feed_forward.pooler", linear) == bits(8))
+        #expect(predicate("lm_head", linear) == bits(8))
+        #expect(
+            predicate("model.embed_tokens", Embedding(embeddingCount: 4, dimensions: 64)) == bits(8)
+        )
+        #expect(predicate("model.layers.5.pre_attn_norm", RMSNorm(dimensions: 64)) == .skip)
+
+        let bf16Boundary = MuseSparkModel.conversionQuantizationPredicate(boundaryExpertBits: nil)
+        #expect(bf16Boundary("model.layers.61.feed_forward.switch_mlp.up_proj", experts) == .skip)
+    }
+}
