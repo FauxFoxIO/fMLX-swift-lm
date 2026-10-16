@@ -489,6 +489,11 @@ final class GLMMoEDSAGate: Module {
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
         // The reference router runs in float32 (`moe_router_dtype`).
         let logits = matmul(x.asType(.float32), weight.asType(.float32).T)
+        if nGroup == 1 {
+            return sigmoidRouterTopK(
+                logits: logits, bias: eScoreCorrectionBias, k: topK, normalize: normTopkProb,
+                scalingFactor: routedScalingFactor)
+        }
         let scores = sigmoid(logits)
         var selection = scores + eScoreCorrectionBias.asType(.float32)
         if nGroup > 1 {
