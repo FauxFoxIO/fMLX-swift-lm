@@ -71,7 +71,7 @@ let package = Package(
         // FauxFox fork: MLX core 0.32.4 with the JACCL (RDMA over Thunderbolt) backend.
         .package(
             url: "https://github.com/FauxFoxIO/mlx-swift",
-            revision: "c7af75d32abcbe892885ab8e09a05c67c97e6dd1"),
+            revision: "d71f300d5b11bcf57b89de039ffd014fb130568e"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
