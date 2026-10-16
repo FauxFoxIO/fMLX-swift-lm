@@ -1232,10 +1232,11 @@ public struct TokenIterator: TokenIteratorProtocol {
             // unevaluated chain of those updates keeps every prior step's
             // intermediates alive. Python mlx-lm settles cache state the same
             // way in its generation loop.
+            let cacheArrays = cache.flatMap(decodeEvaluationArrays)
             if let deferredLogProbabilities {
-                asyncEval([token] + cache.flatMap { $0.state } + deferredLogProbabilities.arrays)
+                asyncEval([token] + cacheArrays + deferredLogProbabilities.arrays)
             } else {
-                asyncEval([token] + cache.flatMap { $0.state })
+                asyncEval([token] + cacheArrays)
             }
 
             // Periodically return freed buffers that cannot be reused (odd or

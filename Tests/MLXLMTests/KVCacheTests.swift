@@ -2596,3 +2596,27 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
         #expect(maskArray.dim(-1) == presented.0.dim(2))
     }
 }
+
+@Test
+func decodeEvaluationArraysAreTheStateBuffers() {
+    let simple = KVCacheSimple()
+    _ = simple.update(keys: MLXArray.ones([1, 1, 3, 64]), values: MLXArray.ones([1, 1, 3, 64]))
+    let rotating = RotatingKVCache(maxSize: 16)
+    _ = rotating.update(keys: MLXArray.ones([1, 1, 3, 64]), values: MLXArray.ones([1, 1, 3, 64]))
+    let quantized = QuantizedKVCache(groupSize: 32)
+    _ = quantized.updateQuantized(
+        keys: MLXArray.ones([1, 1, 3, 64]), values: MLXArray.ones([1, 1, 3, 64]))
+    for cache in [simple, rotating, quantized] as [KVCache] {
+        let raw = decodeEvaluationArrays(cache)
+        let state = cache.state
+        #expect(raw.count == state.count)
+        // `state` slices to the offset; the buffers start with the same rows.
+        for (buffer, slice) in zip(raw, state) {
+            #expect(buffer.dim(2) >= slice.dim(2))
+            #expect(arrayEqual(buffer[.ellipsis, ..<slice.dim(2), 0...], slice).item(Bool.self))
+        }
+    }
+    let mamba = MambaCache()
+    mamba[0] = MLXArray.ones([1, 3, 8])
+    #expect(decodeEvaluationArrays(mamba).count == mamba.state.count)
+}
