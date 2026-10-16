@@ -377,6 +377,14 @@ extension YourModel: ShardableModel {
 - Absorbed MLA (`GLMMoEDSAModel`): shard `q_b_proj` and the per-head `embed_q` / `unembed_out`
   by head (axis 0, with `shardInPlace(_:predicate:group:)`). Keep `q_a_proj`, the KV latent and
   the DSA indexer whole, so every rank selects the same keys.
+- A single KV head (`DeepseekV41Model`) cannot split by head. Keep the KV path, compressor and
+  indexer whole, shard the query heads, and keep whole output groups of a grouped `o_a_proj`
+  per rank (`shardInPlace` on the group axis); slice per-head `sinks` to match.
+- Kimi Delta Attention (`GLM5NextModel`): shard `q`/`k`/`v`, the decay and gate up
+  projections, `b_proj`, `A_log` and `dt_bias` by head. The depthwise conv runs over
+  `[q | k | v]`, so split its channels with `.count(3)`. The recurrent state then stays local.
+- Keep side memories that read only token IDs (DeepSeek-V4.1 Engram) whole on every rank;
+  each rank memory-maps its own tables.
 - A norm that runs per expert output (Muse's post-expert norm) is not linear, so sum the
   expert shards before it, not after the combine.
 - Follow the Python `shard()` for the LM head. Muse splits it by vocabulary and gathers the

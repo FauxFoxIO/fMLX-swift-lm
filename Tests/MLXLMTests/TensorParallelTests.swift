@@ -97,15 +97,21 @@ enum TensorParallelParityFixture: String, CaseIterable, Codable {
     case glmMoEDSA = "glm_moe_dsa"
     case museSparkMeta = "muse_spark_meta"
     case museSparkNVFP4 = "muse_spark_nvfp4_tp"
+    case deepseekV41 = "deepseek_v41"
+    case glm5Next = "glm5_next"
 
     var hasMTP: Bool { self == .glmMoEDSA }
+
+    /// Fixtures whose speculative drafter is checked with ``TensorParallelRankReport/SpeculativeReport``.
+    var hasDrafter: Bool { self == .deepseekV41 || self == .glm5Next }
 
     /// mlx-lm's two-rank sharded logits and greedy tokens, from `scripts/parity/muse_spark_tp.py`.
     ///
     /// Muse runs its branches in bf16, and a sharded layer sums bf16 partial products. On these
     /// tiny fixtures that rounding moves near-tied expert choices, so the sharded model is
-    /// compared with mlx-lm's sharded model rather than with the unsharded one. GLM runs in
-    /// float32 and is compared with the unsharded model.
+    /// compared with mlx-lm's sharded model rather than with the unsharded one. GLM, GLM-5.3-Flash
+    /// and DeepSeek-V4.1 run in float32 and are compared with the unsharded model. (mlx-lm's
+    /// DeepSeek-V4.1 has no Engram, so it cannot give a sharded reference.)
     func shardedReference() throws -> (logits: MLXArray, greedy: [Int])? {
         let url = try ParityFixture(rawValue).directory
             .appending(component: "expected_tp2.safetensors")
@@ -151,6 +157,25 @@ struct TensorParallelRankReport: Codable {
         var shardedGreedy: [Int]
         var sampled: [Int]
         var mtp: MTPReport?
+        var speculative: SpeculativeReport?
+    }
+
+    /// A sharded DSpark or GLM-5.3-Flash MTP drafter.
+    struct SpeculativeReport: Codable {
+        /// Sharded against unsharded draft logits for the same target hidden states.
+        var maxDraftLogitDifference: Float
+        var greedy: [Int]
+        var proposed: Int
+        var accepted: Int
+        var passthroughReason: String?
+        var generatorGreedy: [Int]
+        var generatorSampled: [Int]
+        /// With ``ScriptedContinuationDrafter``, so that rounds accept some drafts and the
+        /// sharded target rewinds its caches.
+        var scriptedGreedy: [Int]
+        var scriptedProposed: Int
+        var scriptedAccepted: Int
+        var scriptedGeneratorSampled: [Int]
     }
 
     struct MTPReport: Codable {
@@ -304,10 +329,126 @@ extension TensorParallelRankTests {
                 parity, target: target, referenceTarget: referenceTarget, prompt: prompt,
                 greedy: greedy, sampled: sampled, group: group)
         }
+        var speculative: TensorParallelRankReport.SpeculativeReport?
+        if fixture.hasDrafter {
+            speculative = try await runDrafter(
+                fixture, parity: parity, target: sharded, referenceTarget: reference,
+                prompt: prompt, greedy: greedy, sampled: sampled, group: group)
+        }
         return .init(
             fixture: fixture, maxLogitDifference: difference,
             unshardedLogitDifference: unshardedDifference, referenceGreedy: referenceGreedy,
-            shardedGreedy: shardedGreedy, sampled: sampledTokens, mtp: mtp)
+            shardedGreedy: shardedGreedy, sampled: sampledTokens, mtp: mtp,
+            speculative: speculative)
+    }
+
+    /// Loads the fixture's drafter sharded and not, compares their draft logits on the
+    /// reference target's hidden states, then decodes speculatively on the sharded target.
+    private func runDrafter(
+        _ fixture: TensorParallelParityFixture, parity: ParityFixture, target: any LanguageModel,
+        referenceTarget: any LanguageModel, prompt: [Int], greedy: TensorParallelGenerationRequest,
+        sampled: TensorParallelGenerationRequest, group: MLXDistributed.Group
+    ) async throws -> TensorParallelRankReport.SpeculativeReport {
+        let drafter: any MTPDrafterModel
+        let draftDifference: Float
+        switch fixture {
+        case .deepseekV41:
+            let directory = parity.directory.deletingLastPathComponent()
+                .appending(component: "deepseek_v41_dspark")
+            let loadedReference = try await DeepseekV41DSparkDraftModel.load(directory: directory)
+            let loadedSharded = try await DeepseekV41DSparkDraftModel.load(
+                directory: directory, tensorParallelGroup: group)
+            let reference = try XCTUnwrap(loadedReference)
+            let sharded = try XCTUnwrap(loadedSharded)
+            XCTAssertTrue(sharded.tensorParallelGroup === group)
+            let referenceTarget = try XCTUnwrap(referenceTarget as? DeepseekV41Model)
+            var request = LMOutput.State()
+            request[mtpEmitFlagKey] = true
+            request[mtpHiddenLayerIDsKey] = reference.targetHiddenLayerIDs
+            let hidden = try XCTUnwrap(
+                referenceTarget(LMInput.Text(tokens: parity.inputIDs), cache: nil, state: request)
+                    .state?[mtpLastHiddenStatesKey])
+            func draftLogits(_ drafter: DeepseekV41DSparkDraftModel) -> MLXArray {
+                var state = drafter.makeState(parameters: nil)
+                drafter.prepareDrafterChunk(
+                    target: referenceTarget, shiftedTokens: parity.inputIDs, targetHidden: hidden,
+                    isFinal: true, state: &state, sampler: ArgMaxSampler())
+                return drafter.draftBlock(
+                    target: referenceTarget, lastToken: MLXArray([Int32(1)]),
+                    lastHidden: hidden[0..., (-1)...], sharedKV: [:], positionDeltas: nil,
+                    queryOffset: hidden.dim(1), blockSize: 6, state: &state,
+                    sampler: ArgMaxSampler()
+                ).logits
+            }
+            draftDifference = abs(draftLogits(reference) - draftLogits(sharded)).max()
+                .item(Float.self)
+            drafter = sharded
+        case .glm5Next:
+            let loadedReference = try await GLM5NextMTPDraftModel.load(
+                directory: parity.directory)
+            let loadedSharded = try await GLM5NextMTPDraftModel.load(
+                directory: parity.directory, tensorParallelGroup: group)
+            let reference = try XCTUnwrap(loadedReference)
+            let sharded = try XCTUnwrap(loadedSharded)
+            XCTAssertTrue(sharded.tensorParallelGroup === group)
+            let referenceTarget = try XCTUnwrap(referenceTarget as? GLM5NextModel)
+            var state = LMOutput.State()
+            state[mtpEmitFlagKey] = true
+            let hidden = try XCTUnwrap(
+                referenceTarget(LMInput.Text(tokens: parity.inputIDs), cache: nil, state: state)
+                    .state?[mtpLastHiddenStatesKey])
+            let embeddings = referenceTarget.mtpEmbedding(parity.inputIDs)
+            func headLogits(_ drafter: GLM5NextMTPDraftModel) -> MLXArray {
+                referenceTarget.lmHead(
+                    drafter(inputEmbeddings: embeddings, hidden: hidden, cache: KVCacheSimple()))
+            }
+            draftDifference = abs(headLogits(reference) - headLogits(sharded)).max()
+                .item(Float.self)
+            drafter = sharded
+        default:
+            preconditionFailure("\(fixture) has no drafter")
+        }
+
+        var speculative = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })), mainModel: target,
+            drafter: drafter, parameters: greedy.generateParameters, blockSize: 3)
+        var speculativeGreedy = [Int]()
+        while let token = speculative.next() {
+            speculativeGreedy.append(token)
+        }
+        let (generatorGreedy, generatorSampled) = try generate(
+            TensorParallelGenerator(model: target, drafter: drafter, draftBlockSize: 3),
+            greedy, sampled)
+
+        // The unsharded greedy continuation, with every fourth draft wrong.
+        var baseline = try TokenIterator(
+            input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })), model: referenceTarget,
+            parameters: greedy.generateParameters)
+        var continuation = [Int]()
+        while let token = baseline.next() {
+            continuation.append(token)
+        }
+        let scripted = ScriptedContinuationDrafter(
+            promptLength: prompt.count, continuation: continuation,
+            vocabularySize: parity.logits.dim(-1))
+        var scriptedIterator = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })), mainModel: target,
+            drafter: scripted, parameters: greedy.generateParameters, blockSize: 3)
+        var scriptedGreedy = [Int]()
+        while let token = scriptedIterator.next() {
+            scriptedGreedy.append(token)
+        }
+        let (_, scriptedSampled) = try generate(
+            TensorParallelGenerator(model: target, drafter: scripted, draftBlockSize: 3),
+            greedy, sampled)
+        return .init(
+            maxDraftLogitDifference: draftDifference, greedy: speculativeGreedy,
+            proposed: speculative.proposedCount, accepted: speculative.acceptedCount,
+            passthroughReason: speculative.passthroughReason, generatorGreedy: generatorGreedy,
+            generatorSampled: generatorSampled, scriptedGreedy: scriptedGreedy,
+            scriptedProposed: scriptedIterator.proposedCount,
+            scriptedAccepted: scriptedIterator.acceptedCount,
+            scriptedGeneratorSampled: scriptedSampled)
     }
 
     private func runMTP(
@@ -581,6 +722,41 @@ final class TensorParallelTests: XCTestCase {
                     + "rank1=\(follower.maxLogitDifference) "
                     + "(unsharded \(leader.unshardedLogitDifference)) "
                     + "greedy=\(leader.shardedGreedy) sampled=\(leader.sampled)")
+
+            if leader.fixture.hasDrafter {
+                let speculative = try XCTUnwrap(leader.speculative, name)
+                let followerSpeculative = try XCTUnwrap(follower.speculative, name)
+                for report in [speculative, followerSpeculative] {
+                    XCTAssertLessThan(report.maxDraftLogitDifference, 1e-4, name)
+                    XCTAssertEqual(report.greedy, leader.referenceGreedy, name)
+                    XCTAssertEqual(report.generatorGreedy, leader.referenceGreedy, name)
+                    XCTAssertNil(report.passthroughReason, name)
+                    XCTAssertGreaterThan(report.proposed, 0, name)
+                    XCTAssertEqual(report.scriptedGreedy, leader.referenceGreedy, name)
+                    XCTAssertGreaterThan(report.scriptedAccepted, 0, name)
+                    XCTAssertLessThan(report.scriptedAccepted, report.scriptedProposed, name)
+                }
+                XCTAssertEqual(followerSpeculative.accepted, speculative.accepted, name)
+                XCTAssertEqual(
+                    followerSpeculative.scriptedAccepted, speculative.scriptedAccepted, name)
+                XCTAssertEqual(speculative.scriptedGeneratorSampled.count, 12, name)
+                XCTAssertEqual(
+                    followerSpeculative.scriptedGeneratorSampled,
+                    speculative.scriptedGeneratorSampled, name)
+                XCTAssertEqual(followerSpeculative.proposed, speculative.proposed, name)
+                XCTAssertEqual(speculative.generatorSampled.count, 12, name)
+                XCTAssertEqual(
+                    followerSpeculative.generatorSampled, speculative.generatorSampled, name)
+                print(
+                    "tensor parallel \(name) drafter: draft |logit diff| "
+                        + "rank0=\(speculative.maxDraftLogitDifference) "
+                        + "rank1=\(followerSpeculative.maxDraftLogitDifference) "
+                        + "greedy=\(speculative.greedy) "
+                        + "accepted \(speculative.accepted)/\(speculative.proposed) "
+                        + "sampled=\(speculative.generatorSampled); scripted accepted "
+                        + "\(speculative.scriptedAccepted)/\(speculative.scriptedProposed) "
+                        + "sampled=\(speculative.scriptedGeneratorSampled)")
+            }
 
             guard leader.fixture.hasMTP else { continue }
             let mtp = try XCTUnwrap(leader.mtp, name)

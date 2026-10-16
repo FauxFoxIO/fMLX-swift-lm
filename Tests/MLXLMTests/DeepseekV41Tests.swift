@@ -430,7 +430,7 @@ struct DeepseekV41DSparkTests {
 }
 
 /// Proposes the known greedy continuation, corrupting every fourth draft.
-private final class ScriptedContinuationDrafter: Module, MTPDrafterModel {
+final class ScriptedContinuationDrafter: Module, MTPDrafterModel {
     let promptLength: Int
     let continuation: [Int]
     let vocabularySize: Int
