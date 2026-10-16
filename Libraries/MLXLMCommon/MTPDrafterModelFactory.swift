@@ -109,10 +109,11 @@ public final class MTPDrafterModelFactory: GenericModelFactory {
         }
 
         try await loadWeights(
-            modelDirectory: modelDirectory, model: model,
+            modelDirectory: modelDirectory, model: model, tensorNameSelection: .all,
             perLayerQuantization: baseConfig.perLayerQuantization,
             weightFileSelection: configuration.weightFileSelection,
-            excludedComponents: configuration.excludedComponents
+            excludedComponents: configuration.excludedComponents,
+            tensorParallelGroup: configuration.tensorParallelGroup
         )
 
         let modelConfig = ModelConfiguration(

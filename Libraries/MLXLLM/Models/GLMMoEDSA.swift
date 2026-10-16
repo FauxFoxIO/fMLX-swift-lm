@@ -287,7 +287,8 @@ final class GLMMoEDSAIndexer: Module {
 }
 
 final class GLMMoEDSAAttention: Module {
-    let numHeads: Int
+    /// Heads on this rank.
+    var numHeads: Int
     let qkNopeHeadDim: Int
     let qkRopeHeadDim: Int
     let kvLoraRank: Int
@@ -520,6 +521,9 @@ final class GLMMoEDSAMoE: Module, UnaryLayer {
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "shared_experts") var sharedExperts: GLMMoEDSAMLP?
 
+    /// Set when the experts are sharded; the combined output is summed across it.
+    var shardingGroup: MLXDistributed.Group?
+
     init(_ config: GLMMoEDSAConfiguration) {
         _gate.wrappedValue = GLMMoEDSAGate(config)
         _switchMLP.wrappedValue = SwitchGLU(
@@ -539,6 +543,9 @@ final class GLMMoEDSAMoE: Module, UnaryLayer {
         y = weightedExpertSum(y, scores).asType(y.dtype)
         if let sharedExperts {
             y = y + sharedExperts(x)
+        }
+        if let shardingGroup {
+            return MLXDistributed.allSum(y, group: shardingGroup)
         }
         return y
     }
@@ -609,6 +616,7 @@ public final class GLMMoEDSAModel: Module, LLMModel {
     public let vocabularySize: Int
     public let model: GLMMoEDSAModelInner
     let configuration: GLMMoEDSAConfiguration
+    public private(set) var tensorParallelGroup: MLXDistributed.Group?
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
@@ -684,6 +692,60 @@ public final class GLMMoEDSAModel: Module, LLMModel {
 
     public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
         try prepareCheckpoint(ModelCheckpoint(weights: weights)).weights
+    }
+}
+
+// MARK: - Tensor parallelism
+
+extension GLMMoEDSADecoderLayer {
+    /// Shards attention by heads and the MLP by hidden units.
+    ///
+    /// The query and KV latents, the indexer and the router stay whole, so every rank selects
+    /// the same keys and experts. `o_proj` and the MLP each sum across `group` once.
+    func shard(group: MLXDistributed.Group) throws {
+        let size = group.size
+        guard attention.numHeads % size == 0 else {
+            throw TensorParallelError.indivisible(
+                name: "attention heads", dimension: attention.numHeads, groupSize: size)
+        }
+        try shardLinears(
+            in: attention, group: group, ["q_b_proj": .allToSharded, "o_proj": .shardedToAll])
+        // The absorbed per-head projections keep this rank's heads, which `q_b_proj` produces.
+        let byHead: ShardingPredicate = { _, _ in (0, .count(1)) }
+        try shardInPlace(attention.embedQ, predicate: byHead, group: group)
+        try shardInPlace(attention.unembedOut, predicate: byHead, group: group)
+        attention.numHeads /= size
+
+        switch mlp {
+        case let moe as GLMMoEDSAMoE:
+            // In place: the block sums routed plus shared experts once.
+            try moe.switchMLP.shard(group: group)
+            if let shared = moe.sharedExperts {
+                try shardInPlace(shared.gateProj, sharding: .allToSharded, group: group)
+                try shardInPlace(shared.upProj, sharding: .allToSharded, group: group)
+                try shardInPlace(shared.downProj, sharding: .shardedToAll, group: group)
+            }
+            moe.shardingGroup = group
+        case let dense as GLMMoEDSAMLP:
+            try shardLinears(
+                in: dense, group: group,
+                [
+                    "gate_proj": .allToSharded, "up_proj": .allToSharded,
+                    "down_proj": .shardedToAll,
+                ])
+        default:
+            throw TensorParallelError.modelNotShardable(String(describing: type(of: mlp)))
+        }
+    }
+}
+
+extension GLMMoEDSAModel: ShardableModel {
+    /// Embeddings, norms and the LM head stay whole on every rank.
+    public func shard(group: MLXDistributed.Group) throws {
+        for layer in model.layers {
+            try layer.shard(group: group)
+        }
+        tensorParallelGroup = group
     }
 }
 

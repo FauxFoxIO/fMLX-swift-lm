@@ -68,6 +68,9 @@ open class DeepSeekMTPDraftModel: Module, IncrementalMTPDrafterModel {
         super.init()
     }
 
+    /// The decoder layer, for subclasses that shard it.
+    public var mtpBlock: Module { block }
+
     private var decoderBlock: any MTPDecoderBlock {
         block as! any MTPDecoderBlock
     }

@@ -32,8 +32,9 @@ extension GLMMoEDSADecoderLayer: MTPDecoderBlock {
 ///
 /// `index_share_for_mtp_iteration` lets serving stacks reuse the first step's top-k on later
 /// drafted positions; this drafter recomputes the indexer at every step.
-public final class GLMMoEDSAMTPDraftModel: DeepSeekMTPDraftModel {
+public final class GLMMoEDSAMTPDraftModel: DeepSeekMTPDraftModel, ShardableModel {
     let configuration: GLMMoEDSAConfiguration
+    public private(set) var tensorParallelGroup: MLXDistributed.Group?
 
     public init(_ configuration: GLMMoEDSAConfiguration) {
         self.configuration = configuration
@@ -48,6 +49,16 @@ public final class GLMMoEDSAMTPDraftModel: DeepSeekMTPDraftModel {
     }
 
     private var layerPrefix: String { "model.layers.\(configuration.hiddenLayers)" }
+
+    /// Shards the MTP layer as the target shards its layers. `eh_proj` and the norms stay
+    /// whole; the embedding and output head are the target's.
+    public func shard(group: MLXDistributed.Group) throws {
+        guard let layer = mtpBlock as? GLMMoEDSADecoderLayer else {
+            throw TensorParallelError.modelNotShardable(String(describing: type(of: mtpBlock)))
+        }
+        try layer.shard(group: group)
+        tensorParallelGroup = group
+    }
 
     public override var excludedCheckpointNamespaces: [String] {
         ["model.embed_tokens", "model.norm", "lm_head"]
@@ -78,7 +89,11 @@ public final class GLMMoEDSAMTPDraftModel: DeepSeekMTPDraftModel {
 
     /// Loads the MTP head from a `glm_moe_dsa` checkpoint directory, or returns `nil` when the
     /// checkpoint has none (mlx-community conversions usually drop it).
-    public static func load(directory: URL) async throws -> GLMMoEDSAMTPDraftModel? {
+    ///
+    /// Pass the target's `tensorParallelGroup` to shard the head the same way.
+    public static func load(
+        directory: URL, tensorParallelGroup: MLXDistributed.Group? = nil
+    ) async throws -> GLMMoEDSAMTPDraftModel? {
         let data = try Data(contentsOf: directory.appending(component: "config.json"))
         let base = try JSONDecoder.json5().decode(BaseConfiguration.self, from: data)
         guard base.modelType == "glm_moe_dsa" else { return nil }
@@ -93,7 +108,8 @@ public final class GLMMoEDSAMTPDraftModel: DeepSeekMTPDraftModel {
         let drafter = GLMMoEDSAMTPDraftModel(configuration)
         try await loadWeights(
             modelDirectory: directory, model: drafter, tensorNameSelection: selection,
-            perLayerQuantization: base.perLayerQuantization)
+            perLayerQuantization: base.perLayerQuantization,
+            tensorParallelGroup: tensorParallelGroup)
         return drafter
     }
 }
