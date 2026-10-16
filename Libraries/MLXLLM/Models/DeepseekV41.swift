@@ -62,6 +62,12 @@ public struct DeepseekV41Configuration: Codable, Sendable {
     public var engramCompressedVocabSize: Int
     public var numNextnPredictLayers: Int
     public var tieWordEmbeddings: Bool
+    public var dsparkBlockSize: Int
+    public var dsparkNoiseTokenID: Int
+    public var dsparkTargetLayerIDs: [Int]
+    public var dsparkMarkovRank: Int
+    public var dsparkRoutedExperts: Int
+    public var dsparkExpertsPerTok: Int
 
     enum CodingKeys: String, CodingKey {
         case textConfig = "text_config"
@@ -111,6 +117,12 @@ public struct DeepseekV41Configuration: Codable, Sendable {
         case engramCompressedVocabSize = "engram_compressed_vocab_size"
         case numNextnPredictLayers = "num_nextn_predict_layers"
         case tieWordEmbeddings = "tie_word_embeddings"
+        case dsparkBlockSize = "dspark_block_size"
+        case dsparkNoiseTokenID = "dspark_noise_token_id"
+        case dsparkTargetLayerIDs = "dspark_target_layer_ids"
+        case dsparkMarkovRank = "dspark_markov_rank"
+        case dsparkRoutedExperts = "dspark_n_routed_experts"
+        case dsparkExpertsPerTok = "dspark_num_experts_per_tok"
     }
 
     /// Decodes the text model from the root of `config.json` or from its `text_config`.
@@ -168,6 +180,12 @@ public struct DeepseekV41Configuration: Codable, Sendable {
         engramCompressedVocabSize = try value(.engramCompressedVocabSize, 0)
         numNextnPredictLayers = try value(.numNextnPredictLayers, 0)
         tieWordEmbeddings = try value(.tieWordEmbeddings, false)
+        dsparkBlockSize = try value(.dsparkBlockSize, 0)
+        dsparkNoiseTokenID = try value(.dsparkNoiseTokenID, 0)
+        dsparkTargetLayerIDs = try value(.dsparkTargetLayerIDs, [])
+        dsparkMarkovRank = try value(.dsparkMarkovRank, 256)
+        dsparkRoutedExperts = try value(.dsparkRoutedExperts, 0)
+        dsparkExpertsPerTok = try value(.dsparkExpertsPerTok, 0)
 
         guard ["sqrtsoftplus", "sigmoid", "softmax"].contains(scoringFunc) else {
             throw DecodingError.dataCorruptedError(
@@ -232,6 +250,12 @@ public struct DeepseekV41Configuration: Codable, Sendable {
         try c.encode(engramCompressedVocabSize, forKey: .engramCompressedVocabSize)
         try c.encode(numNextnPredictLayers, forKey: .numNextnPredictLayers)
         try c.encode(tieWordEmbeddings, forKey: .tieWordEmbeddings)
+        try c.encode(dsparkBlockSize, forKey: .dsparkBlockSize)
+        try c.encode(dsparkNoiseTokenID, forKey: .dsparkNoiseTokenID)
+        try c.encode(dsparkTargetLayerIDs, forKey: .dsparkTargetLayerIDs)
+        try c.encode(dsparkMarkovRank, forKey: .dsparkMarkovRank)
+        try c.encode(dsparkRoutedExperts, forKey: .dsparkRoutedExperts)
+        try c.encode(dsparkExpertsPerTok, forKey: .dsparkExpertsPerTok)
     }
 
     /// Compression ratio of `layer`: 0 for window-only attention.
@@ -979,6 +1003,29 @@ final class DeepseekV41Attention: Module {
         return oBProj(output.reshaped(b, l, -1))
     }
 
+    /// Window KV of target positions `start...` from their `main_x` rows.
+    func windowKV(_ x: MLXArray, start: Int) -> MLXArray {
+        DeepseekV41Rounding.fp8(rope.apply(kvNorm(kvProj(x)), offset: start))
+    }
+
+    /// DSpark draft attention: each query of the block at positions `start...` attends to the
+    /// window of target KV and to the whole block.
+    func dspark(_ x: MLXArray, start: Int, window: MLXArray?) -> MLXArray {
+        let (b, l) = (x.dim(0), x.dim(1))
+        let q = rope.apply(
+            qBProj(qANorm(qAProj(x))).reshaped(b, l, numHeads, headDim), offset: start)
+        let block = windowKV(x, start: start)
+        let keys = (window.map { concatenated([$0, block], axis: 1) } ?? block)
+            .expandedDimensions(axis: 1).asType(.float32)
+        var output = MLXFast.scaledDotProductAttention(
+            queries: q.transposed(0, 2, 1, 3).asType(.float32), keys: keys, values: keys,
+            scale: pow(Float(headDim), -0.5), mask: .none, sinks: sinks.asType(.float32))
+        output = output.transposed(0, 2, 1, 3).asType(q.dtype)
+        output = rope.apply(output, offset: start, inverse: true)
+        output = oAProj(output.reshaped(b * l, oGroups, 1, -1), _groupIDs)
+        return oBProj(output.reshaped(b, l, -1))
+    }
+
     /// Adds new compressed KV and index keys to this layer's cache and shares them.
     private func compress(
         _ x: MLXArray, startPos: Int, cache: DeepseekV41Cache, shared: DeepseekV41SharedState
@@ -1172,6 +1219,21 @@ final class DeepseekV41DecoderLayer: Module {
         super.init()
     }
 
+    /// A DSpark stage: the same block with the draft attention of ``DeepseekV41Attention``.
+    func dspark(
+        _ streams: MLXArray, preMix: MLXArray, start: Int, window: MLXArray?
+    ) -> (MLXArray, MLXArray) {
+        let (attentionPre, attentionPost, attentionComb) = attentionHC(streams)
+        var h = inputLayerNorm(deepseekV41Collapse(streams, preMix))
+        h = attention.dspark(h, start: start, window: window)
+        var streams = deepseekV41Expand(
+            h, residual: streams, post: attentionPost, comb: attentionComb)
+        let (ffnPre, ffnPost, ffnComb) = ffnHC(streams)
+        h = mlp(postAttentionLayerNorm(deepseekV41Collapse(streams, attentionPre)))
+        streams = deepseekV41Expand(h, residual: streams, post: ffnPost, comb: ffnComb)
+        return (streams, ffnPre)
+    }
+
     /// Each sublayer's mixing coefficients collapse the streams for the next sublayer:
     /// attention uses the previous layer's `pre`, and the FFN uses this attention's.
     func callAsFunction(
@@ -1222,6 +1284,15 @@ public final class DeepseekV41ModelInner: Module {
 
     /// Final normalized hidden states.
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        forward(inputs, cache: cache, capturing: []).hidden
+    }
+
+    /// Final normalized hidden states, plus the stream mean at the input of each layer in
+    /// `capturing` (what the DSpark drafter reads).
+    func forward(_ inputs: MLXArray, cache: [KVCache]?, capturing: [Int]) -> (
+        hidden: MLXArray, captures: [MLXArray]
+    ) {
+        let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
         let caches: [DeepseekV41Cache] =
             cache?.map {
                 guard let cache = $0 as? DeepseekV41Cache else {
@@ -1244,15 +1315,19 @@ public final class DeepseekV41ModelInner: Module {
         oneHot[0] = 1
         var preMix = broadcast(MLXArray(oneHot), to: [b, l, hc])
         let shared = DeepseekV41SharedState()
+        var captures = [MLXArray]()
         for (i, layer) in layers.enumerated() {
             if let engram = layer.engram, let rows = engramRows[i] {
                 streams = engram(streams, rows: rows)
+            }
+            if capturing.contains(i) {
+                captures.append(streams.mean(axis: 2))
             }
             (streams, preMix) = layer(
                 streams, preMix: preMix, startPos: startPos, windowIndices: windowIndices,
                 cache: caches[i], shared: shared)
         }
-        return norm(deepseekV41Collapse(streams, preMix))
+        return (norm(deepseekV41Collapse(streams, preMix)), captures)
     }
 }
 
@@ -1283,11 +1358,36 @@ public final class DeepseekV41Model: Module, LLMModel, ModelArtifactPreparing {
         lmHead(model(inputs, cache: cache))
     }
 
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        forward(input, cache: cache, state: state, lastTokenOnly: false)
+    }
+
     public func nextTokenLogits(
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
-        let hidden = model(input.tokens, cache: cache)
-        return LMOutput(logits: lmHead(hidden[0..., (-1)..., 0...]))
+        forward(input, cache: cache, state: state, lastTokenOnly: true)
+    }
+
+    /// With ``mtpEmitFlagKey`` set, also publishes the concatenated stream means at the input
+    /// of the layers in ``mtpHiddenLayerIDsKey`` for the DSpark drafter.
+    private func forward(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?, lastTokenOnly: Bool
+    ) -> LMOutput {
+        let emit = state?[mtpEmitFlagKey] ?? false
+        let layerIDs = emit ? (state?[mtpHiddenLayerIDsKey] ?? []) : []
+        let (hidden, captures) = model.forward(input.tokens, cache: cache, capturing: layerIDs)
+        let finalOnly = emit ? (state?[mtpFinalPrefillLogitsOnlyKey] ?? false) : lastTokenOnly
+        let logits = lmHead(finalOnly ? hidden[0..., (-1)..., 0...] : hidden)
+        guard emit else { return LMOutput(logits: logits) }
+        var out = state ?? LMOutput.State()
+        out[mtpFinalPrefillLogitsOnlyKey] = nil
+        out[mtpLastHiddenStatesKey] =
+            captures.isEmpty ? hidden : concatenated(captures, axis: -1)
+        // The drafter keeps its own window, so no target K/V is shared.
+        out[mtpSharedKVSourceIndicesKey] = [:]
+        return LMOutput(logits: logits, state: out)
     }
 
     public func prepareArtifact(in modelDirectory: URL) throws {
@@ -1305,6 +1405,14 @@ public final class DeepseekV41Model: Module, LLMModel, ModelArtifactPreparing {
     public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
         try prepareCheckpoint(ModelCheckpoint(weights: weights)).weights
     }
+}
+
+extension DeepseekV41Model: MTPTargetModel {
+    public var mtpTargetArchitectureID: String {
+        "deepseek_v41:\(configuration.hiddenSize):\(configuration.vocabularySize)"
+    }
+    public var mtpEmbedding: Embedding { model.embedTokens }
+    public var mtpOutputHead: Linear? { lmHead }
 }
 
 extension DeepseekV41Model: LoRAModel {

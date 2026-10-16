@@ -1,9 +1,11 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 import Testing
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 /// DeepSeek-V4.1 against mlx-lm (plus DeepSeek's Engram) on the tiny native-format fixture
 /// written by `scripts/parity/deepseek_v41.py`. The 24-token sequence evicts window rows,
@@ -287,4 +289,174 @@ func writeSafetensors(_ url: URL, _ tensors: [(String, String, [Int], [UInt8])])
     data.append(json)
     data.append(contentsOf: body)
     try data.write(to: url)
+}
+
+/// The DSpark drafter (`mtp.*`) against the reference in `scripts/parity/deepseek_v41.py`,
+/// and speculative decoding with the deepseek_v41 target.
+struct DeepseekV41DSparkTests {
+    private struct Loaded {
+        let fixture: ParityFixture
+        let model: DeepseekV41Model
+        let drafter: DeepseekV41DSparkDraftModel
+        let expected: [String: MLXArray]
+    }
+
+    private func load() async throws -> Loaded {
+        let fixture = try ParityFixture("deepseek_v41")
+        let model = try #require(try await fixture.loadLanguageModel() as? DeepseekV41Model)
+        let drafter = try #require(
+            try await DeepseekV41DSparkDraftModel.load(directory: draftDirectory(fixture)))
+        let expected = try loadArrays(
+            url: draftDirectory(fixture).appending(component: "expected.safetensors"))
+        return Loaded(fixture: fixture, model: model, drafter: drafter, expected: expected)
+    }
+
+    /// The `mtp.*` tensors live in a sibling fixture, which keeps each under 1 MB.
+    private func draftDirectory(_ fixture: ParityFixture) -> URL {
+        fixture.directory.deletingLastPathComponent().appending(component: "deepseek_v41_dspark")
+    }
+
+    /// Draft logits after seeding the windows with the prompt in two chunks.
+    private func draft(_ loaded: Loaded, drafter: DeepseekV41DSparkDraftModel) throws -> (
+        MLXArray, MTPDraft
+    ) {
+        var request = LMOutput.State()
+        request[mtpEmitFlagKey] = true
+        request[mtpHiddenLayerIDsKey] = drafter.targetHiddenLayerIDs
+        let output = loaded.model(
+            LMInput.Text(tokens: loaded.fixture.inputIDs), cache: nil, state: request)
+        let hidden = try #require(output.state?[mtpLastHiddenStatesKey])
+        var state = drafter.makeState(parameters: nil)
+        for (range, isFinal) in [(0 ..< 10, false), (10 ..< hidden.dim(1), true)] {
+            drafter.prepareDrafterChunk(
+                target: loaded.model, shiftedTokens: loaded.fixture.inputIDs[0..., range],
+                targetHidden: hidden[0..., range], isFinal: isFinal, state: &state,
+                sampler: ArgMaxSampler())
+        }
+        let bonus = try #require(loaded.expected["bonus"])
+        let draft = drafter.draftBlock(
+            target: loaded.model, lastToken: bonus, lastHidden: hidden[0..., (-1)...],
+            sharedKV: [:], positionDeltas: nil, queryOffset: hidden.dim(1), blockSize: 6,
+            state: &state, sampler: ArgMaxSampler())
+        #expect(state.nextPosition == hidden.dim(1))
+        return (hidden, draft)
+    }
+
+    @Test("Target layer captures and DSpark draft logits match the reference")
+    func draftMatchesReference() async throws {
+        let loaded = try await load()
+        let (hidden, draft) = try draft(loaded, drafter: loaded.drafter)
+        let reference = try #require(loaded.expected["hidden"])
+        #expect(abs(hidden - reference).max().item(Float.self) < 1e-4)
+        let logits = try #require(loaded.expected["draft_logits"])
+        let difference = abs(draft.logits - logits).max().item(Float.self)
+        print("deepseek_v41 DSpark draft logits max |diff| = \(difference)")
+        #expect(difference < 1e-4)
+        #expect(
+            draft.tokens.asArray(Int32.self) == loaded.expected["draft_tokens"]!.asArray(Int32.self)
+        )
+        #expect(loaded.drafter.isCompatible(with: loaded.model))
+    }
+
+    @Test("The drafter registry loads DSpark from mtp.* tensors")
+    func registryLoadsDrafter() async throws {
+        let loaded = try await load()
+        await DeepseekV41DSparkRegistration.register()
+        let directory = draftDirectory(loaded.fixture)
+        let data = try Data(contentsOf: directory.appending(component: "config.json"))
+        let model = try await MTPDrafterTypeRegistry.shared.createModel(
+            configuration: data, modelType: "deepseek_v41")
+        try await loadWeights(modelDirectory: directory, model: model)
+        let drafter = try #require(model as? DeepseekV41DSparkDraftModel)
+        let (_, draft) = try draft(loaded, drafter: drafter)
+        let logits = try #require(loaded.expected["draft_logits"])
+        #expect(abs(draft.logits - logits).max().item(Float.self) < 1e-4)
+    }
+
+    @Test("Greedy DSpark speculative decoding reproduces greedy decoding", arguments: [2, 4, 6])
+    func speculativeMatchesGreedy(blockSize: Int) async throws {
+        let loaded = try await load()
+        let input = LMInput(tokens: loaded.fixture.inputIDs[0])
+        let parameters = GenerateParameters(maxTokens: 20, temperature: 0)
+        let expected = try greedy(loaded.model, input: input, parameters: parameters)
+
+        var speculative = try MTPSpeculativeTokenIterator(
+            input: input, mainModel: loaded.model, drafter: loaded.drafter,
+            parameters: parameters, blockSize: blockSize)
+        var tokens = [Int]()
+        while let token = speculative.next() { tokens.append(token) }
+
+        #expect(expected.count == 20)
+        #expect(tokens == expected)
+        #expect(speculative.passthroughReason == nil)
+        #expect(speculative.proposedCount > 0)
+        let state = try #require(speculative.drafterState)
+        // The windows hold every committed position, except that a final single-token step
+        // without room for a draft runs the target alone.
+        #expect(speculative.mainCache[0].offset - state.nextPosition <= 1)
+    }
+
+    @Test(
+        "Partially accepted drafts rewind the target's window, compressor and Engram state",
+        arguments: [2, 3, 6])
+    func partialAcceptanceMatchesGreedy(blockSize: Int) async throws {
+        let loaded = try await load()
+        let input = LMInput(tokens: loaded.fixture.inputIDs[0])
+        let parameters = GenerateParameters(maxTokens: 20, temperature: 0)
+        let expected = try greedy(loaded.model, input: input, parameters: parameters)
+
+        let drafter = ScriptedContinuationDrafter(
+            promptLength: input.text.tokens.size, continuation: expected,
+            vocabularySize: loaded.model.vocabularySize)
+        var speculative = try MTPSpeculativeTokenIterator(
+            input: input, mainModel: loaded.model, drafter: drafter,
+            parameters: parameters, blockSize: blockSize)
+        var tokens = [Int]()
+        while let token = speculative.next() { tokens.append(token) }
+
+        #expect(tokens == expected)
+        #expect(speculative.acceptedCount > 0)
+        #expect(speculative.acceptedCount < speculative.proposedCount)
+    }
+
+    private func greedy(
+        _ model: DeepseekV41Model, input: LMInput, parameters: GenerateParameters
+    ) throws -> [Int] {
+        var iterator = try TokenIterator(input: input, model: model, parameters: parameters)
+        var tokens = [Int]()
+        while let token = iterator.next() { tokens.append(token) }
+        return tokens
+    }
+}
+
+/// Proposes the known greedy continuation, corrupting every fourth draft.
+private final class ScriptedContinuationDrafter: Module, MTPDrafterModel {
+    let promptLength: Int
+    let continuation: [Int]
+    let vocabularySize: Int
+    let requiresSharedTargetKV = false
+
+    init(promptLength: Int, continuation: [Int], vocabularySize: Int) {
+        self.promptLength = promptLength
+        self.continuation = continuation
+        self.vocabularySize = vocabularySize
+        super.init()
+    }
+
+    func isCompatible(with target: any LanguageModel) -> Bool { true }
+
+    func draftBlock(
+        target: any LanguageModel, lastToken: MLXArray, lastHidden: MLXArray,
+        sharedKV: [String: (MLXArray, MLXArray)], positionDeltas: MLXArray?,
+        queryOffset: Int, blockSize: Int, sampler: any LogitSampler
+    ) -> MTPDraft {
+        let start = queryOffset - promptLength + 1
+        let tokens = (0 ..< (blockSize - 1)).map { i -> Int in
+            let index = start + i
+            let token = index < continuation.count ? continuation[index] : 0
+            return index % 4 == 3 ? (token + 1) % vocabularySize : token
+        }
+        let logits = MLXArray.zeros([1, tokens.count, vocabularySize])
+        return MTPDraft(tokens: MLXArray(tokens.map(Int32.init))[.newAxis], logits: logits)
+    }
 }

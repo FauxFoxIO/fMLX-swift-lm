@@ -24,6 +24,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -83,8 +84,8 @@ text = {
     "norm_topk_prob": True,
     "routed_scaling_factor": 1.5,
     "sliding_window": 4,
-    # One trailing entry for the MTP layer, as the published config has.
-    "compress_ratios": [0, 0, 2, 2, 2, 1, 1, 1, 1, 0, 0],
+    # Trailing entries for the DSpark stages, as the published config has.
+    "compress_ratios": [0, 0, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0],
     "compress_rope_theta": 160000,
     "kv_source_layer_ids": [2, 4, 5],
     "index_source_layer_ids": [2, 4, 5, 7],
@@ -103,8 +104,13 @@ text = {
     "engram_n_heads": 2,
     "engram_head_dim": 32,
     "engram_pad_token_id": 2,
-    "num_nextn_predict_layers": 1,
+    "num_nextn_predict_layers": 3,
     "dspark_block_size": 5,
+    "dspark_noise_token_id": len(VOCAB) - 1,
+    "dspark_target_layer_ids": [7, 8, 9],
+    "dspark_markov_rank": 16,
+    "dspark_n_routed_experts": 4,
+    "dspark_num_experts_per_tok": 2,
 }
 
 FP4_VALUES = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
@@ -225,8 +231,11 @@ class Engram(nn.Module):
         return out.astype(streams.dtype)
 
 
-def forward(model, engrams, ids, hashes, cache):
-    """mlx-lm's TextModel.__call__ without pipelining, with Engram before its layers."""
+def forward(model, engrams, ids, hashes, cache, captures=None):
+    """mlx-lm's TextModel.__call__ without pipelining, with Engram before its layers.
+
+    `captures` collects the stream mean at the input of each DSpark target layer.
+    """
     inner, args = model.model, model.args
     h = inner.embed_tokens(ids)
     batch, length, _ = h.shape
@@ -242,11 +251,118 @@ def forward(model, engrams, ids, hashes, cache):
         if i in engrams:
             slot = text["engram_layer_ids"].index(i)
             streams = engrams[i](streams, hashes[:, :, slot])
+        if captures is not None and i in text["dspark_target_layer_ids"]:
+            captures.append(mx.mean(streams, axis=2))
         streams, pre_mix = layer(
             streams, pre_mix, start_pos=start_pos, window_idx=window_idx, cache=layer_cache,
             shared=shared,
         )
     return model.lm_head(inner.norm(ds._collapse(streams, pre_mix)))
+
+
+# MARK: - DSpark reference (DeepSeek inference/model.py)
+
+
+def dspark_attention(attn, x, start, window):
+    """DSparkAttention for a draft block at positions `start...`: every block query sees the
+    window of target KV and the whole block."""
+    batch, length, _ = x.shape
+    rd = attn.rope_dim
+    q = attn.q_b_proj(attn.q_a_norm(attn.q_a_proj(x))).reshape(batch, length, attn.num_heads, -1)
+    q = ds._apply_rope(q, attn.rope, rope_dim=rd, offset=start)
+    kv = ds._apply_rope(attn.kv_norm(attn.kv_proj(x)), attn.rope, rope_dim=rd, offset=start)
+    keys = mx.concatenate([window, ds._fake_quant_fp8(kv, 32)], axis=1)[:, None].astype(mx.float32)
+    out = mx.fast.scaled_dot_product_attention(
+        q.transpose(0, 2, 1, 3).astype(mx.float32), keys, keys, scale=attn.head_dim**-0.5,
+        sinks=attn.sinks.astype(mx.float32),
+    )
+    out = out.transpose(0, 2, 1, 3).astype(q.dtype)
+    out = ds._apply_rope(out, attn.rope, rope_dim=rd, offset=start, inverse=True)
+    out = attn.o_a_proj(out.reshape(batch * length, attn.o_groups, 1, -1), attn._group_ids)
+    return attn.o_b_proj(out.reshape(batch, length, -1))
+
+
+class DSpark:
+    """The DSpark block drafter stored under `mtp.*`: `main_proj` of the target layers' stream
+    means seeds each stage's window KV; a block of the bonus token plus noise tokens runs
+    through the stages; the shared head plus a Markov bigram bias proposes each next token."""
+
+    def __init__(self, config, target, loaded):
+        cfg = json.loads(json.dumps(config))
+        cfg["text_config"]["n_routed_experts"] = text["dspark_n_routed_experts"]
+        cfg["text_config"]["num_experts_per_tok"] = text["dspark_num_experts_per_tok"]
+        args = ds.ModelArgs.from_dict(cfg)
+        base = text["num_hidden_layers"]
+        self.target, self.args = target, args
+        self.stages = [ds.DecoderLayer(args, base + s) for s in range(text["num_nextn_predict_layers"])]
+        own = ("main_proj", "main_norm", "norm", "markov_head", "confidence_head")
+        stage_weights = {
+            "layers." + k.split(".", 1)[1]: v
+            for k, v in loaded.items()
+            if k.split(".")[2] not in own
+        }
+        weights = ds.Model.sanitize(SimpleNamespace(args=args), stage_weights)
+        for s, stage in enumerate(self.stages):
+            prefix = f"model.layers.{s}."
+            params = {k[len(prefix):]: v for k, v in weights.items() if k.startswith(prefix)}
+
+            def predicate(path, module, params=params):
+                if f"{path}.scales" not in params:
+                    return False
+                bits = 4 if ".switch_mlp." in path else 8
+                return {"group_size": 32, "bits": bits, "mode": f"mxfp{bits}"}
+
+            nn.quantize(stage, class_predicate=predicate)
+            stage.load_weights(list(params.items()), strict=True)
+        last = len(self.stages) - 1
+        self.main_proj = nn.Linear(3 * args.hidden_size, args.hidden_size, bias=False).to_quantized(
+            group_size=32, bits=8, mode="mxfp8"
+        )
+        w, s = ds._repack(loaded["mtp.0.main_proj.weight"], loaded["mtp.0.main_proj.scale"])
+        self.main_proj.load_weights([("weight", w), ("scales", s)], strict=True)
+        self.main_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.main_norm.weight = loaded["mtp.0.main_norm.weight"]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm.weight = loaded[f"mtp.{last}.norm.weight"]
+        self.markov_embed = loaded[f"mtp.{last}.markov_head.embed.weight"]
+        self.markov_head = loaded[f"mtp.{last}.markov_head.head.weight"]
+        self.windows = [None] * len(self.stages)
+
+    def seed(self, hidden, start):
+        """Appends the KV of target positions `start...` to every stage's window."""
+        main_x = self.main_norm(self.main_proj(hidden))
+        for s, stage in enumerate(self.stages):
+            attn = stage.self_attn
+            kv = ds._apply_rope(attn.kv_norm(attn.kv_proj(main_x)), attn.rope, rope_dim=attn.rope_dim, offset=start)
+            kv = ds._fake_quant_fp8(kv, 32)
+            window = kv if self.windows[s] is None else mx.concatenate([self.windows[s], kv], axis=1)
+            self.windows[s] = window[:, -self.args.sliding_window :]
+
+    def draft(self, bonus, start):
+        """Draft logits (with the Markov bias) and greedy tokens for the block at `start`."""
+        args = self.args
+        ids = mx.array([[bonus] + [text["dspark_noise_token_id"]] * (text["dspark_block_size"] - 1)])
+        h = self.target.model.embed_tokens(ids)
+        streams = mx.broadcast_to(h[:, :, None, :], (1, ids.shape[1], args.hc_mult, args.hidden_size))
+        pre_mix = mx.zeros((1, ids.shape[1], args.hc_mult), dtype=mx.float32)
+        pre_mix[..., 0] = 1.0
+        for stage, window in zip(self.stages, self.windows):
+            attn_pre, attn_post, attn_comb = stage.attn_hc(streams)
+            x = stage.input_layernorm(ds._collapse(streams, pre_mix))
+            x = dspark_attention(stage.self_attn, x, start, window)
+            streams = ds._expand(x, streams, attn_post, attn_comb)
+            ffn_pre, ffn_post, ffn_comb = stage.ffn_hc(streams)
+            x = stage.mlp(stage.post_attention_layernorm(ds._collapse(streams, attn_pre)))
+            streams = ds._expand(x, streams, ffn_post, ffn_comb)
+            pre_mix = ffn_pre
+        logits = self.target.lm_head(self.norm(ds._collapse(streams, pre_mix))).astype(mx.float32)
+        tokens, rows = [bonus], []
+        for i in range(ids.shape[1]):
+            bias = self.markov_embed[mx.array([tokens[-1]])] @ self.markov_head.T
+            row = logits[:, i] + bias
+            rows.append(row)
+            tokens.append(mx.argmax(row, axis=-1).item())
+        return mx.stack(rows, axis=1), tokens[1:]
 
 
 # MARK: - Top-k tie guard
@@ -414,6 +530,46 @@ def write_fixture(seed, token_map, multipliers, ids, hashes):
             fp8(f"{p}.engram.wkv", matrix(d * (hc + 1), cols * text["engram_head_dim"]))
             plain(f"{p}.engram.q_weight", 1 + normal(hc, d, scale=0.3))
             plain(f"{p}.engram.k_weight", 1 + normal(hc, d, scale=0.3))
+    # DSpark stages: window-only attention, their own MoE, and the drafter heads.
+    draft_experts, rank = text["dspark_n_routed_experts"], text["dspark_markov_rank"]
+    stages = text["num_nextn_predict_layers"]
+    for s in range(stages):
+        p = f"mtp.{s}"
+        plain(f"{p}.attn_norm.weight", 1 + normal(d, scale=0.1))
+        plain(f"{p}.ffn_norm.weight", 1 + normal(d, scale=0.1))
+        for kind in ("attn", "ffn"):
+            plain(f"{p}.hc_{kind}_fn", normal(mix, hc * d, scale=(hc * d) ** -0.5))
+            plain(f"{p}.hc_{kind}_base", normal(mix, scale=0.5))
+            plain(f"{p}.hc_{kind}_scale", 1 + normal(3, scale=0.2))
+        a = f"{p}.attn"
+        plain(f"{a}.attn_sink", normal(heads))
+        fp8(f"{a}.wq_a", matrix(text["q_lora_rank"], d))
+        plain(f"{a}.q_norm.weight", 1 + normal(text["q_lora_rank"], scale=0.1))
+        fp8(f"{a}.wq_b", matrix(heads * hd, text["q_lora_rank"]))
+        fp8(f"{a}.wkv", matrix(hd, d))
+        plain(f"{a}.kv_norm.weight", 1 + normal(hd, scale=0.1))
+        fp8(f"{a}.wo_a", matrix(text["o_groups"] * text["o_lora_rank"], heads * hd // text["o_groups"]))
+        fp8(f"{a}.wo_b", matrix(d, text["o_groups"] * text["o_lora_rank"]))
+        f = f"{p}.ffn"
+        plain(f"{f}.gate.weight", normal(draft_experts, d, scale=d**-0.5))
+        plain(f"{f}.gate.bias", normal(draft_experts, scale=0.1))
+        plain(f"{f}.gate.bias_vl", normal(draft_experts, scale=5.0))
+        for e in range(draft_experts):
+            fp4(f"{f}.experts.{e}.w1", matrix(inter, d))
+            fp4(f"{f}.experts.{e}.w2", matrix(d, inter))
+            fp4(f"{f}.experts.{e}.w3", matrix(inter, d))
+        fp8(f"{f}.shared_experts.w1", matrix(inter, d))
+        fp8(f"{f}.shared_experts.w2", matrix(d, inter))
+        fp8(f"{f}.shared_experts.w3", matrix(inter, d))
+    fp8("mtp.0.main_proj", matrix(d, 3 * d))
+    plain("mtp.0.main_norm.weight", 1 + normal(d, scale=0.1))
+    last = f"mtp.{stages - 1}"
+    plain(f"{last}.norm.weight", 1 + normal(d, scale=0.1))
+    plain(f"{last}.markov_head.embed.weight", normal(len(VOCAB), rank))
+    plain(f"{last}.markov_head.head.weight", normal(len(VOCAB), rank, scale=rank**-0.5))
+    plain(f"{last}.confidence_head.proj.weight", normal(1, d + rank, scale=0.1))
+    draft = {k: native.pop(k) for k in [k for k in native if k.startswith("mtp.")]}
+
     # Tensors a text model drops.
     plain("mtp.0.attn_norm.weight", np.ones(d, np.float32))
     plain("vision.norm.weight", np.ones(8, np.float32))
@@ -440,6 +596,10 @@ def write_fixture(seed, token_map, multipliers, ids, hashes):
         "text_config": text,
     }
     (out / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
+    draft_out = ROOT / f"{NAME}_dspark"
+    draft_out.mkdir(parents=True, exist_ok=True)
+    save_file({k: v.contiguous() for k, v in draft.items()}, str(draft_out / "model.safetensors"))
+    (draft_out / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
 
     # Reference: mlx-lm loads the native file, repacks it, and runs mxfp8/mxfp4 layers.
     ds.ModelArgs.__post_init__ = lambda self: None
@@ -471,12 +631,27 @@ def write_fixture(seed, token_map, multipliers, ids, hashes):
         )
         engrams[i] = e
 
+    dspark = DSpark(config, model, mx.load(str(draft_out / "model.safetensors")))
+
+    def run_dspark():
+        captures = []
+        forward(model, engrams, x, h, model.make_cache(), captures=captures)
+        hidden = mx.concatenate(captures, axis=-1)
+        dspark.windows = [None] * len(dspark.stages)
+        # Seed in two chunks, as an incremental prompt prefill does.
+        dspark.seed(hidden[:, :10], 0)
+        dspark.seed(hidden[:, 10:], 10)
+        draft_logits, draft_tokens = dspark.draft(bonus, len(IDS))
+        return hidden, draft_logits, draft_tokens
+
     gaps = TopKGaps()
     mx.argpartition = gaps
     try:
         x = mx.array(ids.astype(np.int32))
         h = mx.array(hashes)
         logits = forward(model, engrams, x, h, model.make_cache())
+        bonus = mx.argmax(logits[0, -1]).item()
+        dspark_hidden, dspark_logits, dspark_tokens = run_dspark()
         # The reference itself must agree with chunked prefill and decode.
         cache = model.make_cache()
         rows = []
@@ -492,6 +667,7 @@ def write_fixture(seed, token_map, multipliers, ids, hashes):
     if gaps.smallest <= 1e-3:
         return False
     jitter = rounding_sensitivity(lambda: forward(model, engrams, x, h, model.make_cache()), logits)
+    jitter = max(jitter, rounding_sensitivity(lambda: run_dspark()[1], dspark_logits))
     print(f"seed {seed}: logit change from jittered FP8/FP4 rounding inputs {jitter:.2e}")
     if jitter > 1e-5:
         return False
@@ -519,16 +695,26 @@ def write_fixture(seed, token_map, multipliers, ids, hashes):
             "engram_hashes": mx.array(hashes.astype(np.int32)),
         },
     )
-    size = sum(f.stat().st_size for f in out.iterdir())
-    print(f"wrote {out} ({size} bytes)")
-    assert size < 1_000_000
+    mx.save_safetensors(
+        str(draft_out / "expected.safetensors"),
+        {
+            "input_ids": x,
+            "hidden": dspark_hidden.astype(mx.float32),
+            "bonus": mx.array([bonus], dtype=mx.int32),
+            "draft_logits": dspark_logits.astype(mx.float32),
+            "draft_tokens": mx.array([dspark_tokens], dtype=mx.int32),
+        },
+    )
+    for directory in (out, draft_out):
+        size = sum(f.stat().st_size for f in directory.iterdir())
+        print(f"wrote {directory} ({size} bytes)")
+        assert size < 1_000_000
+    print(f"bonus {bonus}, DSpark greedy draft {dspark_tokens}")
     return True
 
 
 def check_against_deepseek(inference, tokenizer, ids, hashes):
     """Compare the n-gram hashes with DeepSeek's NgramHashState, prefill and decode."""
-    from types import SimpleNamespace
-
     sys.path.insert(0, str(inference))
     import engram as reference
 

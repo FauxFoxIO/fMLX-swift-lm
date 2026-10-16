@@ -125,6 +125,18 @@ enum DeepseekV41Checkpoint {
     static func prepare(_ checkpoint: ModelCheckpoint, configuration: DeepseekV41Configuration)
         throws -> ModelCheckpoint
     {
+        try prepare(
+            checkpoint, rename: rename,
+            layerPrefixes: (0 ..< configuration.hiddenLayers).map { "model.layers.\($0)" },
+            routedExperts: configuration.nRoutedExperts, oGroups: configuration.oGroups)
+    }
+
+    /// Renames, repacks native FP8/FP4 weights, stacks the routed experts of each layer under
+    /// `layerPrefixes`, and splits `wo_a` into its groups.
+    static func prepare(
+        _ checkpoint: ModelCheckpoint, rename: (String) -> String?, layerPrefixes: [String],
+        routedExperts: Int, oGroups: Int
+    ) throws -> ModelCheckpoint {
         var checkpoint = try checkpoint.mapNames(rename)
         var weights = checkpoint.weights
         var settings = checkpoint.perLayerQuantization?.perLayerQuantization ?? [:]
@@ -141,22 +153,21 @@ enum DeepseekV41Checkpoint {
             settings[path] = .quantize(option)
         }
 
-        for layer in 0 ..< configuration.hiddenLayers {
-            let prefix = "model.layers.\(layer).mlp.experts"
+        for (layer, layerPrefix) in layerPrefixes.enumerated() {
+            let prefix = "\(layerPrefix).mlp.experts"
             for projection in ["gate_proj", "up_proj", "down_proj"] {
                 for part in ["weight", "scales", "biases"]
                 where weights["\(prefix).0.\(projection).\(part)"] != nil {
-                    let parts = (0 ..< configuration.nRoutedExperts).compactMap {
+                    let parts = (0 ..< routedExperts).compactMap {
                         weights.removeValue(forKey: "\(prefix).\($0).\(projection).\(part)")
                     }
-                    guard parts.count == configuration.nRoutedExperts else {
-                        throw DeepseekV41CheckpointError.experts(
-                            layer, parts.count, configuration.nRoutedExperts)
+                    guard parts.count == routedExperts else {
+                        throw DeepseekV41CheckpointError.experts(layer, parts.count, routedExperts)
                     }
                     weights["\(prefix).switch_mlp.\(projection).\(part)"] = stacked(parts)
                 }
                 let first = settings["\(prefix).0.\(projection)"]
-                for e in 0 ..< configuration.nRoutedExperts {
+                for e in 0 ..< routedExperts {
                     settings["\(prefix).\(e).\(projection)"] = nil
                 }
                 if let first {
@@ -165,11 +176,10 @@ enum DeepseekV41Checkpoint {
             }
 
             // wo_a is block diagonal, so split it into its groups.
-            let oA = "model.layers.\(layer).self_attn.o_a_proj"
+            let oA = "\(layerPrefix).self_attn.o_a_proj"
             for part in ["weight", "scales", "biases"] {
                 if let value = weights["\(oA).\(part)"], value.ndim == 2 {
-                    weights["\(oA).\(part)"] = value.reshaped(
-                        configuration.oGroups, -1, value.dim(-1))
+                    weights["\(oA).\(part)"] = value.reshaped(oGroups, -1, value.dim(-1))
                 }
             }
         }
