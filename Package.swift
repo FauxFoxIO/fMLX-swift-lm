@@ -15,6 +15,7 @@ let package = Package(
     products: [
         .library(name: "FMLXText", targets: ["FMLXText"]),
         .library(name: "FMLXModelManagement", targets: ["FMLXModelManagement"]),
+        .executable(name: "fmlx-tp-generate", targets: ["TensorParallelGenerate"]),
         .library(
             name: "MLXLLM",
             targets: ["MLXLLM"]),
@@ -80,6 +81,14 @@ let package = Package(
         .target(
             name: "FMLXModelManagement",
             path: "Libraries/FMLXModelManagement"
+        ),
+        // Tensor-parallel generation, one process per rank; see scripts/fmlx-launch.py.
+        .executableTarget(
+            name: "TensorParallelGenerate",
+            dependencies: [
+                "FMLXText", "MLXLLM", "MLXLMCommon", .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "tools/TensorParallelGenerate"
         ),
         .testTarget(
             name: "FMLXModelManagementTests",
