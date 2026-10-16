@@ -53,7 +53,7 @@ text = {
     "model_type": "deepseek_v41_text",
     "vocab_size": len(VOCAB),
     "hidden_size": 32,
-    "moe_intermediate_size": 32,
+    "moe_intermediate_size": 64,
     "num_hidden_layers": 10,
     "num_attention_heads": 4,
     "num_key_value_heads": 1,

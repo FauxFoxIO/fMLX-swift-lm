@@ -915,14 +915,15 @@ func deepseekV41SparseAttention(
 }
 
 final class DeepseekV41Attention: Module {
-    let numHeads: Int
+    /// Heads and output groups on this rank.
+    var numHeads: Int
     let headDim: Int
-    let oGroups: Int
+    var oGroups: Int
     let ratio: Int
     let isKVSource: Bool
     let isIndexSource: Bool
     let rope: DeepseekV41RoPE
-    let _groupIDs: MLXArray
+    var _groupIDs: MLXArray
 
     @ModuleInfo(key: "q_a_proj") var qAProj: Linear
     @ModuleInfo(key: "q_a_norm") var qANorm: RMSNorm
@@ -1174,6 +1175,9 @@ final class DeepseekV41MoE: Module, UnaryLayer {
     @ModuleInfo(key: "experts") var experts: DeepseekV41Experts
     @ModuleInfo(key: "shared_experts") var sharedExperts: DeepseekV41MLP
 
+    /// Set when the experts are sharded; the combined output is summed across it.
+    var shardingGroup: MLXDistributed.Group?
+
     init(_ config: DeepseekV41Configuration) {
         _gate.wrappedValue = DeepseekV41Router(config)
         _experts.wrappedValue = DeepseekV41Experts(config)
@@ -1188,7 +1192,10 @@ final class DeepseekV41MoE: Module, UnaryLayer {
         let routed =
             (experts.switchMLP(flat, indices).asType(.float32)
             * weights.expandedDimensions(axis: -1).asType(.float32)).sum(axis: 1)
-        let out = routed + sharedExperts(flat).asType(.float32)
+        var out = routed + sharedExperts(flat).asType(.float32)
+        if let shardingGroup {
+            out = MLXDistributed.allSum(out, group: shardingGroup)
+        }
         return out.reshaped(shape).asType(x.dtype)
     }
 }
@@ -1337,6 +1344,7 @@ public final class DeepseekV41Model: Module, LLMModel, ModelArtifactPreparing {
     let configuration: DeepseekV41Configuration
     /// Engram hash state and tables, loaded beside the checkpoint by ``prepareArtifact(in:)``.
     public let engramMemory: DeepseekV41EngramMemory
+    public private(set) var tensorParallelGroup: MLXDistributed.Group?
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
@@ -1413,6 +1421,56 @@ extension DeepseekV41Model: MTPTargetModel {
     }
     public var mtpEmbedding: Embedding { model.embedTokens }
     public var mtpOutputHead: Linear? { lmHead }
+}
+
+// MARK: - Tensor parallelism
+
+extension DeepseekV41DecoderLayer {
+    /// Shards attention by heads, in whole output groups, and the experts by hidden units.
+    ///
+    /// The single KV head, the compressor, the indexer, the router, the hyper-connections and
+    /// Engram stay whole, so every rank selects the same keys and experts. `o_b_proj` and the
+    /// MoE each sum across `group` once.
+    func shard(group: MLXDistributed.Group) throws {
+        let size = group.size
+        guard attention.numHeads % size == 0, attention.oGroups % size == 0 else {
+            throw TensorParallelError.indivisible(
+                name: "attention heads and output groups",
+                dimension: attention.oGroups, groupSize: size)
+        }
+        try shardLinears(
+            in: attention, group: group, ["q_b_proj": .allToSharded, "o_b_proj": .shardedToAll])
+        // An output group reads only its own heads, so a rank keeps whole groups.
+        try shardInPlace(attention.oAProj, predicate: { _, _ in (0, .count(1)) }, group: group)
+        attention.numHeads /= size
+        attention.oGroups /= size
+        attention._groupIDs = MLXArray(0 ..< Int32(attention.oGroups)).expandedDimensions(axis: 0)
+        let heads = attention.numHeads
+        let sinks = attention.sinks[(group.rank * heads) ..< ((group.rank + 1) * heads)]
+        attention.update(parameters: ModuleParameters(values: ["sinks": .value(sinks)]))
+
+        // In place: the block sums routed plus shared experts once.
+        let experts = mlp.experts.switchMLP
+        try experts.gateProj.shard(.allToSharded, group: group)
+        try experts.upProj.shard(.allToSharded, group: group)
+        try experts.downProj.shard(.shardedToAll, group: group)
+        let shared = mlp.sharedExperts
+        try shardInPlace(shared.gateProj, sharding: .allToSharded, group: group)
+        try shardInPlace(shared.upProj, sharding: .allToSharded, group: group)
+        try shardInPlace(shared.downProj, sharding: .shardedToAll, group: group)
+        mlp.shardingGroup = group
+    }
+}
+
+extension DeepseekV41Model: ShardableModel {
+    /// Embeddings, norms and the LM head stay whole on every rank. Every rank memory-maps its
+    /// own Engram tables, so lookups agree.
+    public func shard(group: MLXDistributed.Group) throws {
+        for layer in model.layers {
+            try layer.shard(group: group)
+        }
+        tensorParallelGroup = group
+    }
 }
 
 extension DeepseekV41Model: LoRAModel {

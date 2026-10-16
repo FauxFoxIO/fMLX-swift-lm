@@ -39,9 +39,12 @@ final class DeepseekV41MarkovHead: Module {
     }
 }
 
-public final class DeepseekV41DSparkDraftModel: Module, IncrementalMTPDrafterModel {
+public final class DeepseekV41DSparkDraftModel: Module, IncrementalMTPDrafterModel,
+    ShardableModel
+{
     let configuration: DeepseekV41Configuration
     let routedExperts: Int
+    public private(set) var tensorParallelGroup: MLXDistributed.Group?
 
     @ModuleInfo(key: "main_proj") var mainProj: Linear
     @ModuleInfo(key: "main_norm") var mainNorm: RMSNorm
@@ -204,6 +207,15 @@ public final class DeepseekV41DSparkDraftModel: Module, IncrementalMTPDrafterMod
             logProbabilities: logProbabilities.isEmpty ? nil : stacked(logProbabilities, axis: 1))
     }
 
+    /// Shards each stage as the target shards its layers. `main_proj`, the norms and the
+    /// Markov head stay whole; the embedding and output head are the target's.
+    public func shard(group: MLXDistributed.Group) throws {
+        for stage in stages {
+            try stage.shard(group: group)
+        }
+        tensorParallelGroup = group
+    }
+
     private func shared(_ target: any LanguageModel) -> (Embedding, Linear?) {
         guard let target = target as? any MTPTargetModel else {
             fatalError("DSpark requires a deepseek_v41 target, got \(type(of: target))")
@@ -253,7 +265,11 @@ public final class DeepseekV41DSparkDraftModel: Module, IncrementalMTPDrafterMod
 
     /// Loads the drafter from a `deepseek_v41` checkpoint directory, reading only `mtp.*`, or
     /// returns `nil` when the checkpoint has no DSpark stages.
-    public static func load(directory: URL) async throws -> DeepseekV41DSparkDraftModel? {
+    ///
+    /// Pass the target's `tensorParallelGroup` to shard the stages the same way.
+    public static func load(
+        directory: URL, tensorParallelGroup: MLXDistributed.Group? = nil
+    ) async throws -> DeepseekV41DSparkDraftModel? {
         let data = try Data(contentsOf: directory.appending(component: "config.json"))
         let base = try JSONDecoder.json5().decode(BaseConfiguration.self, from: data)
         guard base.modelType == "deepseek_v41" else { return nil }
@@ -269,7 +285,8 @@ public final class DeepseekV41DSparkDraftModel: Module, IncrementalMTPDrafterMod
         let drafter = DeepseekV41DSparkDraftModel(configuration)
         try await loadWeights(
             modelDirectory: directory, model: drafter, tensorNameSelection: selection,
-            perLayerQuantization: base.perLayerQuantization)
+            perLayerQuantization: base.perLayerQuantization,
+            tensorParallelGroup: tensorParallelGroup)
         return drafter
     }
 }
