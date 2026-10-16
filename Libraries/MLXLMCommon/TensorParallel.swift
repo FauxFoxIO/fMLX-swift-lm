@@ -13,8 +13,8 @@ import MLXNN
 ///
 /// The usual Megatron layout applies:
 ///
-/// - attention: `q`/`k`/`v` are ``ShardingType/allToSharded`` (each rank owns whole heads),
-///   `o` is ``ShardingType/shardedToAll``
+/// - attention: `q`/`k`/`v` are `allToSharded` (each rank owns whole heads),
+///   `o` is `shardedToAll`
 /// - dense MLP: `gate`/`up` are all-to-sharded, `down` is sharded-to-all
 /// - MoE: every expert is split the same way with ``SwitchGLU/shard(group:)``, and the
 ///   MoE block sums its output across the group once
@@ -94,7 +94,7 @@ public func shardLinears(
 extension MLXDistributed {
     /// Every rank receives rank `root`'s value of `x`.
     ///
-    /// This is a masked ``allSum(_:group:stream:)``: the other ranks contribute zeros. It is
+    /// This is a masked `allSum`: the other ranks contribute zeros. It is
     /// lazy like every collective, so it can sit inside an `asyncEval` pipeline.
     public static func broadcast(
         _ x: MLXArray, from root: Int = 0, group: Group, stream: StreamOrDevice = .cpu
@@ -191,7 +191,7 @@ extension SwitchGLU {
     /// Split every expert across `group`: `gate`/`up` by output, `down` by input.
     ///
     /// The result on each rank is a partial sum. The owning MoE block must apply
-    /// ``MLXDistributed/allSum(_:group:stream:)`` to its combined output.
+    /// `MLXDistributed.allSum` to its combined output.
     public func shard(group: MLXDistributed.Group) throws {
         try gateProj.shard(.allToSharded, group: group)
         try upProj.shard(.allToSharded, group: group)
