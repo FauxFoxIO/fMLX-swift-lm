@@ -97,3 +97,106 @@ package final class CompiledDecodeSegmentCache<Owner: Module>: CompiledTraceInva
         traces.forEach { $0.invalidate() }
     }
 }
+
+// MARK: - Attention-split decoder layers
+
+/// A decoder layer whose single-token step splits around its KV-cache write.
+///
+/// ``CompiledAttentionDecoder`` traces ``decodeProjections(_:)`` and
+/// ``decodeOutput(_:attention:)``, which may read only their arguments and
+/// the layer's weights. ``decodeAttention(_:cache:)`` runs eagerly: rope
+/// offsets move every token and the cache write cannot live in a trace.
+package protocol AttentionSplitDecoderLayer: Module {
+    /// Layer input to the pre-rope tensors the attention step needs.
+    func decodeProjections(_ x: MLXArray) -> [MLXArray]
+
+    /// Rope, cache update, and attention over the cache, before the output
+    /// projection.
+    func decodeAttention(_ projections: [MLXArray], cache: KVCache) -> MLXArray
+
+    /// Layer input and attention result to the layer output.
+    func decodeOutput(_ x: MLXArray, attention: MLXArray) -> MLXArray
+}
+
+/// A model that can switch its compiled single-token decode path off, for
+/// comparisons against the eager path.
+package protocol CompiledDecodeConfigurable: AnyObject {
+    var compiledDecodeEnabled: Bool { get set }
+}
+
+/// Compiled batch-1, single-token decode for a stack of
+/// ``AttentionSplitDecoderLayer``s.
+///
+/// Segment 0 runs the embedding and the first layer's projections; segment
+/// `i` runs layer `i - 1`'s output half and layer `i`'s projections; the last
+/// segment runs the final layer's output half and the model head. Only the
+/// attention steps between segments run eagerly, so any cache type works.
+package final class CompiledAttentionDecoder<Owner: Module>: CompiledTraceInvalidating {
+    package typealias Layers = @Sendable (Owner) -> [any AttentionSplitDecoderLayer]
+
+    private let layers: Layers
+    private let segments: CompiledDecodeSegmentCache<Owner>
+
+    /// - Parameters:
+    ///   - layerCount: the number of decoder layers
+    ///   - layers: the decoder layers, in order
+    ///   - embed: token ids to the first layer's input
+    ///   - head: the last layer's output to the model output
+    ///   - embedState: the modules `embed` reads
+    ///   - headState: the modules `head` reads
+    package init(
+        layerCount: Int,
+        layers: @escaping Layers,
+        embed: @escaping @Sendable (Owner, MLXArray) -> MLXArray,
+        head: @escaping @Sendable (Owner, MLXArray) -> MLXArray,
+        embedState: @escaping @Sendable (Owner) -> [Module],
+        headState: @escaping @Sendable (Owner) -> [Module]
+    ) {
+        self.layers = layers
+        self.segments = CompiledDecodeSegmentCache(
+            count: layerCount + 1,
+            state: { owner, index in
+                let stack = layers(owner)
+                return (index == 0 ? embedState(owner) : [stack[index - 1]])
+                    + (index < stack.count ? [stack[index]] : headState(owner))
+            },
+            body: { owner, index, arguments in
+                let stack = layers(owner)
+                let h =
+                    index == 0
+                    ? embed(owner, arguments[0])
+                    : stack[index - 1].decodeOutput(arguments[0], attention: arguments[1])
+                if index < stack.count {
+                    return [h] + stack[index].decodeProjections(h)
+                }
+                return [head(owner, h)]
+            })
+    }
+
+    package var compiledCount: Int { segments.compiledCount }
+
+    /// One decode step, or nil when `inputs` is not a single token at batch
+    /// one or the caches would need a mask; the caller then runs eagerly.
+    package func callAsFunction(
+        _ owner: Owner, inputs: MLXArray, cache: [KVCache]?
+    ) -> MLXArray? {
+        guard inputs.ndim == 2, inputs.dim(0) == 1, inputs.dim(1) == 1,
+            let cache, let first = cache.first,
+            case .none = createAttentionMask(h: inputs, cache: first)
+        else { return nil }
+        let stack = layers(owner)
+        guard cache.count == stack.count else { return nil }
+
+        var arguments = [inputs]
+        for (index, layer) in stack.enumerated() {
+            let outputs = segments(owner, at: index, arguments)
+            let attention = layer.decodeAttention(Array(outputs[1...]), cache: cache[index])
+            arguments = [outputs[0], attention]
+        }
+        return segments(owner, at: stack.count, arguments)[0]
+    }
+
+    package func invalidate() {
+        segments.invalidate()
+    }
+}
