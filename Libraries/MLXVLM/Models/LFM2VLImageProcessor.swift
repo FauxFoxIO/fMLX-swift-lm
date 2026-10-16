@@ -434,11 +434,11 @@ enum LFM2VLImageProcessing {
     static func pixels(_ image: UserInput.Image, processing: UserInput.Processing?) throws
         -> MLXArray
     {
-        if case .array(let array) = image, processing?.resize == nil {
+        if case .array(let array) = image.source, processing?.resize == nil {
             return try rgb(array)
         }
         var ciImage: CIImage
-        switch image {
+        switch image.source {
         case .url(let url):
             guard let loaded = CIImage(contentsOf: url, options: [.applyOrientationProperty: true])
             else { throw VLMError.imageProcessingFailure("cannot load \(url.lastPathComponent)") }
