@@ -1,6 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
 import Foundation
+import MLX
 import MLXNN
 
 /// File patterns required to resolve a tokenizer without downloading model weights.
@@ -212,6 +213,30 @@ extension GenericModelFactory {
         return _wrap(context)
     }
 
+    /// Load a model from a local directory and shard it across `tensorParallelGroup`,
+    /// producing a ``ContextType``. Every rank in the group must make the same call.
+    public func load(
+        from directory: URL,
+        using tokenizerLoader: any TokenizerLoader,
+        tensorParallelGroup: MLXDistributed.Group
+    ) async throws -> sending ContextType {
+        var configuration = ResolvedModelConfiguration(directory: directory)
+        configuration.tensorParallelGroup = tensorParallelGroup
+        return try await _load(configuration: configuration, tokenizerLoader: tokenizerLoader)
+    }
+
+    /// Load a model from a local directory and shard it across `tensorParallelGroup`,
+    /// producing a ``ContainerType``. Every rank in the group must make the same call.
+    public func loadContainer(
+        from directory: URL,
+        using tokenizerLoader: any TokenizerLoader,
+        tensorParallelGroup: MLXDistributed.Group
+    ) async throws -> ContainerType {
+        let context = try await load(
+            from: directory, using: tokenizerLoader, tensorParallelGroup: tensorParallelGroup)
+        return _wrap(context)
+    }
+
 }
 
 extension GenericModelFactory where ContextType == ModelContext, ContainerType == ModelContainer {
@@ -412,6 +437,34 @@ public func loadModelContainer(
 ) async throws -> sending ModelContainer {
     try await load {
         try await $0.loadContainer(from: directory, using: tokenizerLoader)
+    }
+}
+
+/// Load a model from a local directory and shard it across a tensor-parallel group.
+///
+/// Every rank in `group` must make the same call. See ``ShardableModel``.
+public func loadModel(
+    from directory: URL,
+    using tokenizerLoader: any TokenizerLoader,
+    group: MLXDistributed.Group
+) async throws -> sending ModelContext {
+    try await load {
+        try await $0.load(from: directory, using: tokenizerLoader, tensorParallelGroup: group)
+    }
+}
+
+/// Load a model from a local directory into a ``ModelContainer``, sharded across a
+/// tensor-parallel group.
+///
+/// Every rank in `group` must make the same call. See ``ShardableModel``.
+public func loadModelContainer(
+    from directory: URL,
+    using tokenizerLoader: any TokenizerLoader,
+    group: MLXDistributed.Group
+) async throws -> sending ModelContainer {
+    try await load {
+        try await $0.loadContainer(
+            from: directory, using: tokenizerLoader, tensorParallelGroup: group)
     }
 }
 

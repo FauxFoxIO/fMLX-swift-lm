@@ -1,8 +1,6 @@
 // Copyright © 2026 Faux Fox, Inc.
-// Native port of Hugging Face Transformers and MLX-VLM (Apache-2.0).
 
 import Foundation
-import MLX
 
 /// Ordered content for one EmbeddingGemma 2 embedding, independent of chat or generation.
 public enum EmbeddingGemma2Content: Sendable {
@@ -102,17 +100,4 @@ public enum EmbeddingGemma2Error: Error, LocalizedError, Sendable {
         case .nonFiniteEmbedding: return "EmbeddingGemma 2 produced a non-finite or zero embedding."
         }
     }
-}
-
-// MLX arrays remain inside the container's serialized inference domain.
-struct EmbeddingGemma2PreparedImage {
-    let patches: MLXArray  // [1, budget * 9, 768], RGB in [0, 1]
-    let positions: MLXArray  // [1, budget * 9, 2], padded with (-1, -1)
-    let tokenCount: Int  // real pooled grid cells, excluding padding
-}
-
-struct EmbeddingGemma2PreparedAudio {
-    let features: MLXArray  // [1, mel frames, 128], FP32
-    let validMask: MLXArray  // [1, mel frames], true for valid frames
-    let tokenCount: Int  // exact two stride-2 subsampling output count
 }

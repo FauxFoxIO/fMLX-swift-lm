@@ -395,6 +395,11 @@ public actor ConcurrentTextRuntime {
         guard !(model.scheduledRequiresExclusiveExecution && drafter != nil) else {
             throw ConcurrentTextRuntimeError.invalidConfiguration
         }
+        // Batch admission is decided on one rank; the other ranks of a sharded model would
+        // never run the matching forwards. Use TensorParallelGenerator instead.
+        guard tensorParallelTokenGroup(of: model) == nil else {
+            throw ConcurrentTextRuntimeError.invalidConfiguration
+        }
         model.train(false)
         try model.prepare()
         eval(model)

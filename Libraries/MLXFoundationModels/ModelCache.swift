@@ -1,0 +1,318 @@
+// Copyright © 2026 Apple Inc.
+
+#if FoundationModelsIntegration
+#if canImport(FoundationModels, _version: 2)
+
+import Foundation
+import MLX
+import MLXGuidedGeneration
+import MLXLMCommon
+
+// MARK: - Constraint Cache Kind
+
+/// Selects which xgrammar constructor a cached template was compiled
+/// with. Used by the constraint cache so a JSON-schema source and a
+/// structural-tag source can never alias even if their text collides.
+enum ConstraintKind: Sendable {
+    case json
+    case structuralTag
+}
+
+// MARK: - Tokenizer Bias Cache Entry
+
+/// Tokenizer-derived logit biases, cached per model. Both arrays are pure
+/// functions of the tokenizer, so they are identical for a model's lifetime.
+/// `@unchecked Sendable`: every field is `let` and read-only after construction
+/// (the arrays are only *added* to logits in `GuidedGenerationLoop`, never
+/// mutated), and the entry is shared across actors via `ModelCache` — the same
+/// pattern as `GrammarTokenizer`/`GrammarConstraint` in `XGrammarBridge.swift`.
+final class TokenizerBias: @unchecked Sendable {
+    let closing: MLXArray
+    let whitespace: MLXArray
+    let whitespaceTokenIDs: Set<Int>
+
+    init(closing: MLXArray, whitespace: MLXArray, whitespaceTokenIDs: Set<Int>) {
+        self.closing = closing
+        self.whitespace = whitespace
+        self.whitespaceTokenIDs = whitespaceTokenIDs
+    }
+}
+
+// MARK: - Model Cache Actor
+
+/// Thread-safe model cache using Swift actor isolation.
+/// Prevents race conditions when multiple concurrent requests try to load the model.
+/// Supports caching multiple models by their identifiers.
+actor ModelCache {
+    /// Class wrapper around `Task` so actor-reentrancy supersession guards can
+    /// use `===` identity comparison. `Task` is a value type; a wrapper lets us
+    /// detect whether `evictAll()` replaced a loading entry mid-flight.
+    private final class LoadTask {
+        let task: Task<ModelContainer, Error>
+        init(_ task: Task<ModelContainer, Error>) { self.task = task }
+    }
+
+    private final class ConstraintCompileTask {
+        let task: Task<GrammarConstraint, Error>
+        init(_ task: Task<GrammarConstraint, Error>) { self.task = task }
+    }
+
+    private var containers: [String: ModelContainer] = [:]
+    private var loadingTasks: [String: LoadTask] = [:]
+    /// In-flight loads tagged as a warmup of an already-present model, which
+    /// must NOT surface as `.downloading` (there is no user-facing download).
+    /// A subset of `loadingTasks`' keys. See `load` and `isDownloading`.
+    private var suppressedLoadIDs: Set<String> = []
+    private var grammarTokenizers: [String: GrammarTokenizer] = [:]
+    /// Reuse compiled grammars while bounding retained source keys and handles.
+    private var constraintTemplates = ConstraintTemplateCache<GrammarConstraint>(
+        maximumEntries: 256, maximumSourceBytes: 8 * 1_024 * 1_024)
+    private var compilingConstraints: [String: ConstraintCompileTask] = [:]
+    /// Cached per-model logit biases (closing + whitespace). Pure functions of
+    /// the tokenizer, so computed once per model and reused across requests.
+    private var tokenizerBiases: [String: TokenizerBias] = [:]
+    /// Most recent load error per model. Cleared on a subsequent successful
+    /// load. Surfaced through `MLXLanguageModel.availability` so callers can
+    /// distinguish "never tried" from "tried and failed".
+    private var lastErrors: [String: any Error] = [:]
+
+    private static func constraintCachePrefix(modelID: String) -> String {
+        "\(modelID.utf8.count):\(modelID):"
+    }
+
+    /// Gets the cached model container for the given model ID, loading it if necessary.
+    /// Concurrent callers for the same model will share the same loading task, preventing duplicate loads.
+    ///
+    /// The `loader` closure carries the transport types (downloader, tokenizer
+    /// loader). Keeping them out of the cache means the cache itself stays
+    /// agnostic of how a container is acquired -- first caller wins; later
+    /// callers reuse the cached container regardless of which loader they
+    /// brought along.
+    ///
+    /// The loader must honor cancellation while it is suspended: `evictAll()` and
+    /// `remove(modelID:)` cancel the registered load task, and a loader that
+    /// ignores cancellation keeps running and keeps its awaiter waiting.
+    func load(
+        modelID: String,
+        suppressDownloadingState: Bool = false,
+        loader: @Sendable @escaping () async throws -> ModelContainer
+    ) async throws -> ModelContainer {
+        if let cached = containers[modelID] {
+            return cached
+        }
+
+        if let existingLoadTask = loadingTasks[modelID] {
+            // Coalesced onto an in-flight load: the first caller's
+            // classification (downloading vs. suppressed) stands — we do not
+            // re-tag. This collision is benign because the suppress decision is
+            // conditioned on disk-presence: a warmup and a genuine download for
+            // a not-yet-present model both classify as downloading, so they
+            // agree; when the model IS present, `availability` resolves to
+            // `.available` regardless of the in-flight load.
+            return try await existingLoadTask.task.value
+        }
+
+        let loadTask = LoadTask(
+            Task<ModelContainer, Error> {
+                try await loader()
+            })
+        loadingTasks[modelID] = loadTask
+        // Tag a warmup-of-an-already-present model out of the `.downloading`
+        // signal (computed by the caller as warmup AND modelExistsOnDisk()).
+        if suppressDownloadingState {
+            suppressedLoadIDs.insert(modelID)
+        }
+
+        do {
+            let loaded = try await loadTask.task.value
+            // Supersession guard: `evict()`/`evictAll()` may have removed this
+            // load while it was suspended (actor reentrancy). If we are no longer
+            // the registered task, hand the awaiter its container but do NOT
+            // re-populate the cache — ARC frees the weights when the awaiter
+            // releases it.
+            guard loadingTasks[modelID] === loadTask else { return loaded }
+            containers[modelID] = loaded
+            loadingTasks[modelID] = nil
+            suppressedLoadIDs.remove(modelID)
+            lastErrors[modelID] = nil
+            return loaded
+        } catch {
+            // Same guard on the failure path: a superseded load must not re-add a
+            // stale lastErrors entry for a model nobody holds.
+            if loadingTasks[modelID] === loadTask {
+                loadingTasks[modelID] = nil
+                suppressedLoadIDs.remove(modelID)
+                lastErrors[modelID] = error
+            }
+            throw error
+        }
+    }
+
+    /// Whether a *genuine download* is in flight for the given model: a load
+    /// task is running and it was not tagged as a warmup of an already-present
+    /// model. Drives `availability`'s `.downloading` state, so a background
+    /// warmup of an already-downloaded model does not spuriously report
+    /// `.downloading`. (A warmup that triggers a real fetch is not tagged and
+    /// does report here.)
+    func isDownloading(modelID: String) -> Bool {
+        loadingTasks[modelID] != nil && !suppressedLoadIDs.contains(modelID)
+    }
+
+    /// The most recent load error for the given model, if a previous attempt
+    /// failed and no successful load has happened since.
+    func lastError(modelID: String) -> (any Error)? {
+        lastErrors[modelID]
+    }
+
+    /// Gets or creates a cached GrammarTokenizer for the given model.
+    func makeGrammarTokenizer(
+        modelID: String,
+        tokenizer: any Tokenizer
+    ) throws -> GrammarTokenizer {
+        if let cached = grammarTokenizers[modelID] {
+            return cached
+        }
+        let vocabulary = TokenizerVocabExtractor.extractForGrammar(from: tokenizer)
+        let grammarTokenizer = try GrammarTokenizer(
+            vocab: vocabulary.vocab,
+            vocabType: vocabulary.vocabType,
+            eosTokenId: Int32(tokenizer.eosTokenId ?? 0)
+        )
+        grammarTokenizers[modelID] = grammarTokenizer
+        return grammarTokenizer
+    }
+
+    /// Whether an `GrammarTokenizer` is already cached for the given model.
+    /// Used by `MLXLanguageModel.hasCachedGrammarTokenizer` so tests can assert
+    /// that `warmUp()` pre-created it (a genuine cache hit) rather than only
+    /// that a later guided respond happens to succeed.
+    func hasCachedGrammarTokenizer(modelID: String) -> Bool {
+        grammarTokenizers[modelID] != nil
+    }
+
+    /// Gets or creates the cached tokenizer-derived logit biases for a model.
+    func makeTokenizerBias(
+        modelID: String,
+        tokenizer: any Tokenizer
+    ) -> TokenizerBias {
+        if let cached = tokenizerBiases[modelID] {
+            return cached
+        }
+        let closing = ClosingTokenBias.compute(
+            tokenizer: tokenizer,
+            eosTokenId: tokenizer.eosTokenId
+        )
+        let (whitespace, whitespaceTokenIDs) = WhitespaceTokenBias.compute(
+            tokenizer: tokenizer
+        )
+        let bias = TokenizerBias(
+            closing: closing,
+            whitespace: whitespace,
+            whitespaceTokenIDs: whitespaceTokenIDs
+        )
+        tokenizerBiases[modelID] = bias
+        return bias
+    }
+
+    /// Gets a fresh matcher from a cached grammar, or compiles the grammar first.
+    ///
+    /// A cached template lets repeated requests skip grammar compilation.
+    /// Cold compiles run outside the actor and same-key callers share one task.
+    func makeConstraint(
+        modelID: String,
+        kind: ConstraintKind,
+        source: String,
+        fastForward: Bool,
+        compile: @Sendable @escaping () throws -> GrammarConstraint
+    ) async throws -> GrammarConstraint {
+        let cacheKey =
+            "\(Self.constraintCachePrefix(modelID: modelID))\(kind):\(fastForward):\(source)"
+        if let template = constraintTemplates.value(for: cacheKey) {
+            do {
+                return try template.freshInstance()
+            } catch GrammarError.constraintCompilationFailed {
+                constraintTemplates.removeValue(for: cacheKey)
+            }
+        }
+
+        let compilation: ConstraintCompileTask
+        let ownsCompilation: Bool
+        if let pending = compilingConstraints[cacheKey] {
+            compilation = pending
+            ownsCompilation = false
+        } else {
+            compilation = ConstraintCompileTask(
+                Task.detached(priority: Task.currentPriority, operation: compile))
+            compilingConstraints[cacheKey] = compilation
+            ownsCompilation = true
+        }
+
+        do {
+            let template = try await compilation.task.value
+            if ownsCompilation && compilingConstraints[cacheKey] === compilation {
+                compilingConstraints.removeValue(forKey: cacheKey)
+                if constraintTemplates.canRetain(cacheKey),
+                    let fresh = try? template.freshInstance()
+                {
+                    constraintTemplates.insert(template, for: cacheKey)
+                    return fresh
+                }
+                return template
+            }
+            if let fresh = try? template.freshInstance() {
+                return fresh
+            }
+            if ownsCompilation { return template }
+            return try await Task.detached(priority: Task.currentPriority, operation: compile).value
+        } catch {
+            if ownsCompilation && compilingConstraints[cacheKey] === compilation {
+                compilingConstraints.removeValue(forKey: cacheKey)
+            }
+            throw error
+        }
+    }
+
+    /// Evicts all cached state: model containers, tokenizers, constraint
+    /// templates, and per-model tokenizer biases. Cancels every registered load
+    /// task, as `remove(modelID:)` does for a single model. No GPU-stream
+    /// synchronization is required — in-flight callers retain their own
+    /// `ModelContainer` and free it via ARC on completion.
+    func evictAll() {
+        containers.removeAll()
+        for loadTask in loadingTasks.values {
+            loadTask.task.cancel()
+        }
+        loadingTasks.removeAll()
+        suppressedLoadIDs.removeAll()
+        grammarTokenizers.removeAll()
+        constraintTemplates.removeAll()
+        compilingConstraints.removeAll()
+        tokenizerBiases.removeAll()
+        lastErrors.removeAll()
+    }
+
+    /// Evicts a single model's state across every per-model cache: its container,
+    /// xgrammar tokenizer, all compiled constraint templates, tokenizer bias,
+    /// last load error, the suppressed-download tag, and any in-flight load
+    /// registration.
+    ///
+    /// Cancels an in-flight load and drops its registration. A loader that honors
+    /// cancellation stops early. The load-completion guard in `load()` is
+    /// what prevents any superseded load from re-populating after removal.
+    func remove(modelID: String) {
+        // `loadingTasks` holds a `LoadTask` box; cancel the wrapped `Task`.
+        loadingTasks[modelID]?.task.cancel()
+        loadingTasks.removeValue(forKey: modelID)
+        suppressedLoadIDs.remove(modelID)
+        containers.removeValue(forKey: modelID)
+        grammarTokenizers.removeValue(forKey: modelID)
+        let constraintPrefix = Self.constraintCachePrefix(modelID: modelID)
+        constraintTemplates.removeAll { $0.hasPrefix(constraintPrefix) }
+        compilingConstraints = compilingConstraints.filter { !$0.key.hasPrefix(constraintPrefix) }
+        tokenizerBiases.removeValue(forKey: modelID)
+        lastErrors.removeValue(forKey: modelID)
+    }
+}
+
+#endif  // canImport(FoundationModels)
+#endif  // FoundationModelsIntegration

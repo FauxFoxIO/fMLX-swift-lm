@@ -332,6 +332,68 @@ extension YourModel: LoRAModel {
 
 If you need custom keys, override `loraDefaultKeys`.
 
+## Tensor parallelism
+
+Port the Python `shard()` method as `ShardableModel` (see `LlamaModel`, `Qwen3Model`,
+`Qwen3MoEModel`). The loader calls `shard(group:)` on lazy weights, before they are read, when
+`ModelConfiguration.tensorParallelGroup` (or `loadWeights(...tensorParallelGroup:)`) has more
+than one rank.
+
+```swift
+extension YourModel: ShardableModel {
+    public func shard(group: MLXDistributed.Group) throws {
+        try validateHeadSharding(heads: config.heads, kvHeads: config.kvHeads, group: group)
+        for layer in model.layers {
+            try shardLinears(in: layer.attention, group: group, [
+                "q_proj": .allToSharded, "k_proj": .allToSharded, "v_proj": .allToSharded,
+                "o_proj": .shardedToAll,
+            ])
+            if let moe = layer.mlp as? YourMoE {
+                try moe.switchMLP.shard(group: group)   // experts split, no communication
+                try shardInPlace(moe.sharedExpert, ...) // in place, same reason
+                moe.shardingGroup = group               // the block does one allSum
+            } else {
+                try shardLinears(in: layer.mlp, group: group, [
+                    "gate_proj": .allToSharded, "up_proj": .allToSharded,
+                    "down_proj": .shardedToAll,
+                ])
+            }
+        }
+        kvHeads = kvHeads.map { $0 / group.size }
+        tensorParallelGroup = group
+    }
+}
+```
+
+- Attention must derive the head count from the projection (`reshaped(B, L, -1, headDim)`),
+  not from the configuration, because each rank holds `heads / size` heads.
+- Keep embeddings, norms, routers, and the LM head whole on every rank.
+- An MoE block sums its combined output (routed plus shared experts) with one
+  `MLXDistributed.allSum` when `shardingGroup` is set.
+- Every collective must depend on the same inputs on every rank, or ranks can run them in a
+  different order and deadlock. `MLXDistributed.broadcast` keeps this property.
+- Generate with `TensorParallelGenerator` (rank 0 leads, others follow); launch ranks with
+  `scripts/fmlx-launch.py`. `ConcurrentTextRuntime` rejects sharded models.
+- Absorbed MLA (`GLMMoEDSAModel`): shard `q_b_proj` and the per-head `embed_q` / `unembed_out`
+  by head (axis 0, with `shardInPlace(_:predicate:group:)`). Keep `q_a_proj`, the KV latent and
+  the DSA indexer whole, so every rank selects the same keys.
+- A single KV head (`DeepseekV41Model`) cannot split by head. Keep the KV path, compressor and
+  indexer whole, shard the query heads, and keep whole output groups of a grouped `o_a_proj`
+  per rank (`shardInPlace` on the group axis); slice per-head `sinks` to match.
+- Kimi Delta Attention (`GLM5NextModel`): shard `q`/`k`/`v`, the decay and gate up
+  projections, `b_proj`, `A_log` and `dt_bias` by head. The depthwise conv runs over
+  `[q | k | v]`, so split its channels with `.count(3)`. The recurrent state then stays local.
+- Keep side memories that read only token IDs (DeepSeek-V4.1 Engram) whole on every rank;
+  each rank memory-maps its own tables.
+- A norm that runs per expert output (Muse's post-expert norm) is not linear, so sum the
+  expert shards before it, not after the combine.
+- Follow the Python `shard()` for the LM head. Muse splits it by vocabulary and gathers the
+  logits (`allGather`) before the soft cap; most models keep it whole.
+- Shard an MTP drafter like the target layers (conform it to `ShardableModel` and load it
+  with the same group), then pass it to `TensorParallelGenerator(model:drafter:)`.
+  `MTPSpeculativeTokenIterator` takes rank 0's drafts, accepted count and final token every
+  round, so all ranks run the same forwards.
+
 ## Compiled decode paths
 
 `compile` traces a function once and turns every `MLXArray` the body reads, but
@@ -406,8 +468,8 @@ and already runs on the adapter and quantization paths.
 
 ```swift
 let modelContainer = try await LLMModelFactory.shared.loadContainer(
-    from: HubClient.default,
-    using: TokenizersLoader(),  // TokenizersLoader() from MLXLMTokenizers (swift-tokenizers-mlx)
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
     configuration: ModelConfiguration(id: "mlx-community/YourModel-4bit")
 )
 

@@ -17,6 +17,7 @@ private let preservedStateKey = LMOutput.Key<Int>("tests.mtp.preservedState")
 private final class MockDrafter: Module, StatefulMTPDrafterModel {
     private(set) var draftBlockCallCount = 0
     var draftedTokenValue: Int32
+    let requiresGreedySampling: Bool
     /// Per-call record of what the iterator handed `draftBlock`: the
     /// sequence-axis span of each sharedKV entry, and the query offset.
     /// Lets tests assert the state the drafter conditions on, not just the
@@ -26,10 +27,13 @@ private final class MockDrafter: Module, StatefulMTPDrafterModel {
     private(set) var receivedPositionDeltaValues: [Int?] = []
     private(set) var receivedCacheOffsets: [Int?] = []
 
-    init(draftedTokenValue: Int32 = 7) {
+    init(draftedTokenValue: Int32 = 7, requiresGreedySampling: Bool = false) {
         self.draftedTokenValue = draftedTokenValue
+        self.requiresGreedySampling = requiresGreedySampling
         super.init()
     }
+
+    func isCompatible(with target: any LanguageModel) -> Bool { true }
 
     func makeState(parameters: GenerateParameters?) -> MTPDrafterState {
         MTPDrafterState(cache: [CountingKVCache()])
@@ -78,15 +82,14 @@ private final class MockDrafter: Module, StatefulMTPDrafterModel {
         mutableCache?.offset += blockSize - 1
         let batch = lastToken.dim(0)
         let vals = Array(repeating: draftedTokenValue, count: (blockSize - 1) * batch)
-        // One-hot logits over the mock target's 20-token vocabulary.
-        let vocab = 20
-        var logits = [Float](repeating: 0, count: (blockSize - 1) * batch * vocab)
-        for row in 0 ..< (blockSize - 1) * batch {
-            logits[row * vocab + Int(draftedTokenValue)] = 100
+        let vocabularySize = 20
+        var logits = [Float](repeating: -100, count: batch * (blockSize - 1) * vocabularySize)
+        for row in 0 ..< (batch * (blockSize - 1)) {
+            logits[row * vocabularySize + Int(draftedTokenValue)] = 100
         }
         return MTPDraft(
             tokens: MLXArray(vals, [batch, blockSize - 1]),
-            logits: MLXArray(logits, [batch, blockSize - 1, vocab]))
+            logits: MLXArray(logits, [batch, blockSize - 1, vocabularySize]))
     }
 }
 
@@ -299,6 +302,36 @@ private final class NonTrimmableCountingKVCache: CountingKVCache {
         let c = NonTrimmableCountingKVCache()
         c.offset = offset
         return c
+    }
+}
+
+// MARK: - Prefill reporting
+
+private final class PrefixLog: @unchecked Sendable {
+    var positions: [Int] = []
+}
+
+@Suite("MTP prefill reporting")
+struct MTPPrefillReportingTests {
+    @Test("the main cache's prefix is reported once")
+    func reusedPrefix() throws {
+        let main = MockMainModel(nextLogitTokens: [0, 0, 7])
+        let drafter = MockDrafter(draftedTokenValue: 7)
+        let log = PrefixLog()
+        var parameters = GenerateParameters(maxTokens: 1)
+        parameters.prefill = PrefillParameters(prefix: { log.positions.append($0) })
+        let warmCache = KVCacheSimple()
+        warmCache.offset = 2
+
+        _ = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+            mainModel: main,
+            drafter: drafter,
+            mainCache: [warmCache],
+            parameters: parameters,
+            blockSize: 4)
+
+        #expect(log.positions == [2])
     }
 }
 
@@ -633,24 +666,21 @@ func testMTPVerifyLoopMutatesClassProcessorForEmittedTokensOnly() throws {
     )
 }
 
-/// A stateful drafter speculates under stochastic sampling: acceptance uses
-/// the draft and target probabilities instead of falling back to passthrough.
 @Test
-func testQwenStyleMTPSpeculatesWithStochasticSampling() throws {
-    // Prefill picks bonus 5; the verify pass agrees with draft 5 and then picks 6.
-    let main = MockMainModel(nextLogitTokens: [0, 0, 5, 5, 6])
-    let drafter = MockDrafter(draftedTokenValue: 5)
+func testQwenStyleMTPRequiresGreedySampling() throws {
+    let main = MockMainModel(nextLogitTokens: [0, 0, 5, 6])
+    let drafter = MockDrafter(draftedTokenValue: 5, requiresGreedySampling: true)
     let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
     var iter = try MTPSpeculativeTokenIterator(
         input: input, mainModel: main, drafter: drafter,
-        parameters: GenerateParameters(maxTokens: 3, temperature: 0.6), blockSize: 2)
+        parameters: GenerateParameters(maxTokens: 2, temperature: 0.6), blockSize: 2)
 
     #expect(iter.next() == 5)
-    #expect(iter.next() == 5)
     #expect(iter.next() == 6)
-    #expect(drafter.draftBlockCallCount == 1)
-    #expect(iter.acceptedCount == 1)
-    #expect(iter.passthroughReason == nil)
+    #expect(drafter.draftBlockCallCount == 0)
+    #expect(
+        iter.passthroughReason
+            == "drafter requires temperature == 0; generating without speculation")
 }
 
 // MARK: - sharedKV span across partial acceptance

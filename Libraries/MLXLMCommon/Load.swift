@@ -172,18 +172,21 @@ private final class ConcurrentLoadState: @unchecked Sendable {
         if firstError == nil { firstError = error }
     }
 
-    /// Weights merged in file order (a later file overwrites a duplicate name, matching the
-    /// serial loader) and the first file's metadata.
-    func result() throws -> (weights: [String: MLXArray], metadata: [String: String]) {
+    /// Preserve file order and tensor metadata, including later-file-wins duplicates.
+    func result() throws -> ModelCheckpoint {
         lock.lock()
         defer { lock.unlock() }
         if let firstError { throw firstError }
         var weights = [String: MLXArray]()
-        for fileWeights in perFile {
+        var weightMetadata = [String: [String: String]]()
+        for (index, fileWeights) in perFile.enumerated() {
             weights.merge(fileWeights) { _, new in new }
+            for name in fileWeights.keys {
+                weightMetadata[name] = perFileMetadata[index]
+            }
         }
         let metadata = perFileMetadata.first { !$0.isEmpty } ?? [:]
-        return (weights, metadata)
+        return ModelCheckpoint(weights: weights, metadata: metadata, weightMetadata: weightMetadata)
     }
 }
 
@@ -194,15 +197,33 @@ private final class ConcurrentLoadState: @unchecked Sendable {
 /// range's I/O inside the work item), and the results are merged in file order. A file whose
 /// header cannot be parsed is loaded whole by one work item, which is exactly the serial
 /// loader's behavior for that file.
-func loadWeightArrays(
-    urls: [URL], tensorNameSelection: WeightTensorNameSelection = .all
-) throws -> (
+func loadWeightArrays(urls: [URL]) throws -> (
     weights: [String: MLXArray], metadata: [String: String]
 ) {
+    let checkpoint = try loadModelCheckpoint(urls: urls)
+    return (checkpoint.weights, checkpoint.metadata)
+}
+
+/// Tensors under `excludedNamespaces` are never read. A file that holds only excluded tensors
+/// still supplies its metadata.
+func loadModelCheckpoint(urls: [URL], excludedNamespaces: [String] = []) throws
+    -> ModelCheckpoint
+{
+    let exclusions = CheckpointNameMapping(excludedNamespaces.map { .excludePrefix($0) })
+    return try loadModelCheckpoint(urls: urls) { exclusions.mapName($0) != nil }
+}
+
+/// Only tensors whose names pass `isRead` are read. With `materialize` false the arrays stay
+/// lazy, so a tensor-parallel rank can slice them before any bytes are read.
+func loadModelCheckpoint(
+    urls: [URL], materialize: Bool = true, isRead: @escaping @Sendable (String) -> Bool
+) throws
+    -> ModelCheckpoint
+{
     struct WorkItem {
         let file: Int
         let url: URL
-        /// tensors this item evaluates; nil evaluates the whole file
+        /// tensors this item evaluates; nil evaluates every tensor in the file that is read
         let names: [String]?
     }
 
@@ -210,10 +231,7 @@ func loadWeightArrays(
         var spansPerFile = [[SafetensorSpan]?]()
         var totalBytes: Int64 = 0
         for url in urls {
-            let spans = (try? safetensorSpansInFileOrder(url: url)).map { spans in
-                tensorNameSelection.filtersNames
-                    ? spans.filter { tensorNameSelection.contains($0.name) } : spans
-            }
+            let spans = (try? safetensorSpansInFileOrder(url: url))?.filter { isRead($0.name) }
             spansPerFile.append(spans)
             totalBytes += spans?.reduce(0) { $0 + $1.byteCount } ?? 0
         }
@@ -222,16 +240,7 @@ func loadWeightArrays(
         let groupBytes = max(minimumBytesPerLoadGroup, totalBytes / Int64(concurrency))
         var items = [WorkItem]()
         for (file, url) in urls.enumerated() {
-            if let spans = spansPerFile[file] {
-                // A parsed header proves this file has no selected tensors, so avoid opening it
-                // through MLX at all.  A header we cannot parse still falls back to loading the
-                // whole file; silently skipping it could hide a malformed selected checkpoint.
-                if spans.isEmpty {
-                    if tensorNameSelection.filtersNames { continue }
-                    items.append(WorkItem(file: file, url: url, names: nil))
-                    continue
-                }
-
+            if let spans = spansPerFile[file], !spans.isEmpty {
                 let bytes = spans.reduce(0) { $0 + $1.byteCount }
                 let groupCount = max(1, Int(bytes / groupBytes))
                 for range in contiguousLoadGroups(
@@ -241,7 +250,9 @@ func loadWeightArrays(
                         WorkItem(file: file, url: url, names: spans[range].map(\.name)))
                 }
             } else {
-                items.append(WorkItem(file: file, url: url, names: nil))
+                // An empty list reads only the metadata of a file with nothing to read.
+                let names: [String]? = spansPerFile[file] == nil ? nil : []
+                items.append(WorkItem(file: file, url: url, names: names))
             }
         }
         return items
@@ -251,23 +262,26 @@ func loadWeightArrays(
     DispatchQueue.concurrentPerform(iterations: items.count) { index in
         let item = items[index]
         do {
-            // Explicitly the CPU stream: `Load` has no GPU implementation and the arrays
-            // land in unified memory either way. The concurrency comes from evaluating
-            // disjoint groups from many threads, not from the stream itself.
-            let (all, metadata) = try loadArraysAndMetadata(url: item.url, stream: .cpu)
+            // A caller's withError does not reach this worker thread.
+            try withLoaderThreadError {
+                // Explicitly the CPU stream: `Load` has no GPU implementation and the arrays
+                // land in unified memory either way. The concurrency comes from evaluating
+                // disjoint groups from many threads, not from the stream itself.
+                let (all, metadata) = try loadArraysAndMetadata(url: item.url, stream: .cpu)
 
-            var selected = [String: MLXArray]()
-            if let names = item.names {
-                for name in names {
-                    if let array = all[name] { selected[name] = array }
+                var selected = [String: MLXArray]()
+                if let names = item.names {
+                    for name in names {
+                        if let array = all[name] { selected[name] = array }
+                    }
+                } else {
+                    selected = all.filter { isRead($0.key) }
                 }
-            } else {
-                selected = all
-            }
 
-            // force this range's I/O here, on this stream, in file-offset order
-            if !selected.isEmpty { eval(Array(selected.values)) }
-            state.merge(file: item.file, weights: selected, metadata: metadata)
+                // force this range's I/O here, on this stream, in file-offset order
+                if materialize, !selected.isEmpty { eval(Array(selected.values)) }
+                state.merge(file: item.file, weights: selected, metadata: metadata)
+            }
         } catch {
             state.record(error: error)
         }
@@ -460,7 +474,7 @@ package func containsWeightTensor(
 ///
 /// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
 /// This function loads model weight `safetensor` files in the given `modelDirectory`,
-/// calls ``BaseLanguageModel/sanitize(weights:metadata:)`` to allow per-model preprocessing,
+/// calls ``BaseLanguageModel/prepareCheckpoint(_:)`` to allow per-model preprocessing,
 /// applies optional quantization, and
 /// updates the model with the weights. Derived inference-only state is prepared after the
 /// checkpoint update and before the model is evaluated and returned to callers.
@@ -469,16 +483,25 @@ package func containsWeightTensor(
 /// exist, and otherwise by the conventional `model*.safetensors` names. A model can name extra
 /// files it needs by conforming to ``AdditionalWeightFilesProviding``, and a caller can override
 /// the choice with ``ModelConfiguration/weightFileSelection``.
+///
+/// The model loads without the `excludedComponents` it supports, see
+/// ``ModelComponentsProviding``. Its on-demand components load the first time an input
+/// needs them, unless `componentLoading` is ``ComponentLoading/immediate``. Tensors of components
+/// that do not load now and of the model's ``BaseLanguageModel/excludedCheckpointNamespaces`` are
+/// not read.
 public func loadWeights(
     modelDirectory: URL, model: BaseLanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
-    weightFileSelection: WeightFileSelection = .automatic
+    weightFileSelection: WeightFileSelection = .automatic,
+    excludedComponents: Set<ModelComponent> = [],
+    componentLoading: ComponentLoading = .onFirstUse
 ) throws {
     try loadWeights(
         modelDirectory: modelDirectory, model: model, tensorNameSelection: .all,
         quantization: quantization, perLayerQuantization: perLayerQuantization,
-        weightFileSelection: weightFileSelection)
+        weightFileSelection: weightFileSelection, excludedComponents: excludedComponents,
+        componentLoading: componentLoading)
 }
 
 /// Package-internal variant for a checkpoint component embedded beside another model.
@@ -490,8 +513,18 @@ package func loadWeights(
     tensorNameSelection: WeightTensorNameSelection,
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
-    weightFileSelection: WeightFileSelection = .automatic
+    weightFileSelection: WeightFileSelection = .automatic,
+    excludedComponents: Set<ModelComponent> = [],
+    componentLoading: ComponentLoading = .onFirstUse,
+    tensorParallelGroup: MLXDistributed.Group? = nil
 ) throws {
+    // a group of one runs the unsharded model
+    let shardingGroup = tensorParallelGroup.flatMap { $0.size > 1 ? $0 : nil }
+    let shardable = model as? any ShardableModel
+    if shardingGroup != nil, shardable == nil {
+        throw TensorParallelError.modelNotShardable(String(describing: type(of: model)))
+    }
+
     if let preparing = model as? any ModelArtifactPreparing {
         try preparing.prepareArtifact(in: modelDirectory)
     }
@@ -505,44 +538,40 @@ package func loadWeights(
         effectiveTensorNameSelection = tensorNameSelection
     }
 
-    // load the weights and collect metadata from the first safetensor file
-    var weights = [String: MLXArray]()
-    var metadata = [String: String]()
     let additionalFiles = (model as? any AdditionalWeightFilesProviding)?.additionalWeightFiles
     let weightURLs = try safetensorWeightURLs(
         in: modelDirectory,
         selection: weightFileSelection,
         additionalFiles: additionalFiles ?? [],
         tensorNameSelection: effectiveTensorNameSelection)
-    (weights, metadata) = try loadWeightArrays(
-        urls: weightURLs, tensorNameSelection: effectiveTensorNameSelection)
-
-    // per-model cleanup (models can inspect metadata to customize behavior)
-    weights = model.sanitize(weights: weights, metadata: metadata)
-
-    // quantize if needed
-    if quantization != nil || perLayerQuantization != nil {
-        quantize(model: model) { path, module in
-            if weights["\(path).scales"] != nil {
-                if let perLayerQuantization {
-                    return perLayerQuantization.quantization(layer: path)?.asTuple
-                } else {
-                    return quantization?.asTuple
-                }
-            } else {
-                return nil
-            }
-        }
+    let perLayerQuantization =
+        perLayerQuantization
+        ?? quantization.map { .init(quantization: $0, perLayerQuantization: [:]) }
+    let excludedNamespaces =
+        try prepareComponents(
+            of: model, urls: weightURLs, excluded: excludedComponents,
+            loading: componentLoading, perLayerQuantization: perLayerQuantization)
+        + model.excludedCheckpointNamespaces
+    let exclusions = CheckpointNameMapping(excludedNamespaces.map { .excludePrefix($0) })
+    var checkpoint = try loadModelCheckpoint(
+        urls: weightURLs, materialize: shardingGroup == nil
+    ) {
+        [effectiveTensorNameSelection] name in
+        exclusions.mapName(name) != nil && effectiveTensorNameSelection.contains(name)
     }
-
-    // apply the loaded weights
-    do {
-        let parameters = ModuleParameters.unflattened(weights)
-        try model.update(parameters: parameters, verify: [.all])
-    }
+    checkpoint.perLayerQuantization = perLayerQuantization
+    checkpoint = try model.prepareCheckpoint(checkpoint)
+    try applyCheckpoint(checkpoint, to: model)
     // Derived fused projections replace their source modules. Drop loader-owned
     // references first so each replaced source can be reclaimed immediately.
-    weights.removeAll(keepingCapacity: false)
+    checkpoint.weights.removeAll(keepingCapacity: false)
+
+    if let shardingGroup, let shardable {
+        // Slice the lazy weights, then read them in batches. Each full tensor is freed once
+        // its slice is copied, so a rank never holds the whole model.
+        try shardable.shard(group: shardingGroup)
+        evaluateInBatches(model.parameters().flattened().map(\.1))
+    }
 
     if let preparing = model as? any LoadedWeightsPreparing {
         try preparing.prepareLoadedWeights()
@@ -554,10 +583,27 @@ package func loadWeights(
     // Fused projections replace materialized checkpoint buffers with larger
     // concatenations. Return the retired buffers instead of retaining them in MLX's cache.
     MLX.Memory.clearCache()
+
+    if let shardingGroup {
+        // ranks finish loading at different times; meet before the first collective forward
+        MLXDistributed.barrier(group: shardingGroup)
+    }
+}
+
+/// Quantize the layers `checkpoint` has scales for, then update `module` with strict validation.
+func applyCheckpoint(_ checkpoint: ModelCheckpoint, to module: Module) throws {
+    let weights = checkpoint.weights
+    if let perLayerQuantization = checkpoint.perLayerQuantization {
+        quantize(model: module) { path, _ in
+            guard weights["\(path).scales"] != nil else { return nil }
+            return perLayerQuantization.quantization(layer: path)?.asTuple
+        }
+    }
+    try module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
 }
 
 /// Async variant of
-/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:)-6eqw7``.
+/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:excludedComponents:componentLoading:)-858j8``.
 ///
 /// Loading blocks its thread on file I/O and fans out with `DispatchQueue.concurrentPerform`.
 /// Swift concurrency's cooperative threads must never block, so this overload runs the load
@@ -567,12 +613,37 @@ public func loadWeights(
     modelDirectory: URL, model: BaseLanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
-    weightFileSelection: WeightFileSelection = .automatic
+    weightFileSelection: WeightFileSelection = .automatic,
+    excludedComponents: Set<ModelComponent> = [],
+    componentLoading: ComponentLoading = .onFirstUse
 ) async throws {
     try await loadWeights(
         modelDirectory: modelDirectory, model: model, tensorNameSelection: .all,
         quantization: quantization, perLayerQuantization: perLayerQuantization,
-        weightFileSelection: weightFileSelection)
+        weightFileSelection: weightFileSelection, excludedComponents: excludedComponents,
+        componentLoading: componentLoading)
+}
+
+/// Load model weights and shard them across a tensor-parallel group.
+///
+/// Every rank in `tensorParallelGroup` calls this with the same checkpoint. The checkpoint is
+/// loaded lazily, the model's ``ShardableModel/shard(group:)`` slices it, and only this
+/// rank's slice is read into memory. A group of size one loads the whole model.
+///
+/// Throws ``TensorParallelError/modelNotShardable(_:)`` when the group has more than one rank
+/// and the model does not conform to ``ShardableModel``.
+public func loadWeights(
+    modelDirectory: URL, model: BaseLanguageModel,
+    tensorParallelGroup: MLXDistributed.Group,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    weightFileSelection: WeightFileSelection = .automatic,
+    excludedComponents: Set<ModelComponent> = []
+) async throws {
+    try await loadWeights(
+        modelDirectory: modelDirectory, model: model, tensorNameSelection: .all,
+        perLayerQuantization: perLayerQuantization,
+        weightFileSelection: weightFileSelection, excludedComponents: excludedComponents,
+        tensorParallelGroup: tensorParallelGroup)
 }
 
 /// Async package-internal variant of the selective weight loader.
@@ -581,21 +652,43 @@ package func loadWeights(
     tensorNameSelection: WeightTensorNameSelection,
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
-    weightFileSelection: WeightFileSelection = .automatic
+    weightFileSelection: WeightFileSelection = .automatic,
+    excludedComponents: Set<ModelComponent> = [],
+    componentLoading: ComponentLoading = .onFirstUse,
+    tensorParallelGroup: MLXDistributed.Group? = nil
 ) async throws {
     let model = SendableBox(model)
     try await withCheckedThrowingContinuation {
         (continuation: CheckedContinuation<Void, any Error>) in
         DispatchQueue.global(qos: .userInitiated).async {
+            // The caller's withError does not reach this thread.
             continuation.resume(
                 with: Result {
-                    try loadWeights(
-                        modelDirectory: modelDirectory, model: model.consume(),
-                        tensorNameSelection: tensorNameSelection,
-                        quantization: quantization,
-                        perLayerQuantization: perLayerQuantization,
-                        weightFileSelection: weightFileSelection)
+                    try withLoaderThreadError {
+                        try loadWeights(
+                            modelDirectory: modelDirectory, model: model.consume(),
+                            tensorNameSelection: tensorNameSelection,
+                            quantization: quantization,
+                            perLayerQuantization: perLayerQuantization,
+                            weightFileSelection: weightFileSelection,
+                            excludedComponents: excludedComponents,
+                            componentLoading: componentLoading,
+                            tensorParallelGroup: tensorParallelGroup)
+                    }
                 })
+        }
+    }
+}
+
+/// Run `body` in an MLX error scope on the current thread. An MLX error is thrown
+/// in place of a later error it caused in `body`, such as a shape mismatch.
+func withLoaderThreadError<R>(_ body: () throws -> R) throws -> R {
+    try withError { mlxError in
+        do {
+            return try body()
+        } catch {
+            try mlxError.check()
+            throw error
         }
     }
 }

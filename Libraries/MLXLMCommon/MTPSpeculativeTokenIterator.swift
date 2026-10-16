@@ -39,6 +39,37 @@ extension ProcessingMTPLogitSampler: SpeculativeDraftSampler {
     }
 }
 
+/// Draws every token on rank 0 of a tensor-parallel group and broadcasts it, so a sharded
+/// drafter feeds the same tokens to its collectives on every rank.
+private final class BroadcastingMTPLogitSampler: LogitSampler, SpeculativeDraftSampler {
+    private let sampler: any LogitSampler
+    private let group: MLXDistributed.Group
+
+    init(sampler: any LogitSampler, group: MLXDistributed.Group) {
+        self.sampler = sampler
+        self.group = group
+    }
+
+    func sample(logits: MLXArray) -> MLXArray {
+        MLXDistributed.broadcast(sampler.sample(logits: logits), group: group)
+    }
+
+    func draftLogProbabilities(logits: MLXArray) -> MLXArray {
+        guard let sampler = sampler as? any SpeculativeDraftSampler else {
+            preconditionFailure("stochastic speculative samplers must expose draft probabilities")
+        }
+        return sampler.draftLogProbabilities(logits: logits)
+    }
+
+    func sampleDraft(logProbabilities: MLXArray) -> MLXArray {
+        guard let sampler = sampler as? any SpeculativeDraftSampler else {
+            preconditionFailure("stochastic speculative samplers must expose draft probabilities")
+        }
+        return MLXDistributed.broadcast(
+            sampler.sampleDraft(logProbabilities: logProbabilities), group: group)
+    }
+}
+
 /// A bounded per-round record for diagnosing MTP draft rejection.
 ///
 /// Enable collection with `roundDiagnosticCapacity` when constructing an
@@ -171,6 +202,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
     var processor: LogitProcessor?
     let sampler: LogitSampler
+    /// With a sharded target, every rank continues with rank 0's tokens and round decisions.
+    private let tokenBroadcastGroup: MLXDistributed.Group?
 
     // Pure greedy rows share one evaluation without advancing processor state.
     package var jointGreedyVerificationEnabled = true
@@ -213,6 +246,18 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     private var telemetry = SpeculativeDecodingTelemetry()
     public var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? {
         telemetry.roundCount > 0 ? telemetry : nil
+    }
+
+    public var evictedTokenCount: Int {
+        KVCacheTree.leaves(in: mainCache).map(\.cache.evictedTokenCount).max() ?? 0
+    }
+
+    public var reasoningTokenCount: Int? {
+        (processor as? any GenerationReasoningTokenCounting)?.generationReasoningTokenCount
+    }
+
+    public mutating func recordEmittedToken(_ token: Int) {
+        processor?.didEmit(token: token)
     }
 
     public mutating func discardGeneratedToken() {
@@ -283,6 +328,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             blockSize >= 2,
             "MTPSpeculativeTokenIterator requires blockSize >= 2 (1 bonus + K-1 drafted)")
         precondition(roundDiagnosticCapacity >= 0, "roundDiagnosticCapacity must not be negative")
+        guard drafter.isCompatible(with: mainModel) else {
+            throw ModelFactoryError.invalidConfiguration(
+                "MTP drafter \(type(of: drafter)) is incompatible with target "
+                    + "\(type(of: mainModel))")
+        }
 
         let kvCachePlan = try parameters.kvCachePlan()
         let mainCache = try kvCachePlan.validated(
@@ -291,6 +341,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         self.y = input.text
         self.mainModel = mainModel
         self.drafter = drafter
+        self.tokenBroadcastGroup = tensorParallelTokenGroup(of: mainModel)
 
         self.mainCacheStorage = KVCacheStorage(
             mainCache, plan: kvCachePlan,
@@ -306,8 +357,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         self.sampler = parameters.sampler()
         try components.validate(parameters: parameters)
-        self.processor = components.logitProcessor(parameters: parameters)
-        if scheduledPrefix != nil, processor != nil {
+        // Includes the model's suppressed tokens; `makeDraftSampler` applies it to drafts too.
+        self.processor = components.logitProcessor(parameters: parameters, model: mainModel)
+        if scheduledPrefix != nil, components.logitProcessor(parameters: parameters) != nil {
             throw KVCacheError(
                 message: "Scheduled MTP prefix restore does not support stateful logit processors")
         }
@@ -369,11 +421,26 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
         self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - prefillStart
 
+        if drafter.requiresGreedySampling, parameters.temperature != 0 {
+            switchToPassthrough(
+                reason: "drafter requires temperature == 0; generating without speculation")
+        }
     }
 
     private func makeDraftSampler() -> any LogitSampler {
-        guard let processor else { return sampler }
-        return ProcessingMTPLogitSampler(sampler: sampler, processor: processor.copy())
+        // Greedy drafts already agree: every rank reads the same summed logits.
+        var base = sampler
+        if let tokenBroadcastGroup, !(sampler is ArgMaxSampler) {
+            base = BroadcastingMTPLogitSampler(sampler: sampler, group: tokenBroadcastGroup)
+        }
+        guard let processor else { return base }
+        return ProcessingMTPLogitSampler(sampler: base, processor: processor.copy())
+    }
+
+    /// Rank 0's token on every rank of a sharded target.
+    private func broadcastToken(_ token: MLXArray) -> MLXArray {
+        guard let tokenBroadcastGroup else { return token }
+        return MLXDistributed.broadcast(token, group: tokenBroadcastGroup)
     }
 
     /// Advances target and shifted-prompt drafter caches together without retaining full prompt hidden states.
@@ -421,7 +488,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         } else {
             var logits = result.logits[0..., -1, 0...]
             logits = processor?.process(logits: logits) ?? logits
-            let token = sampler.sample(logits: logits)
+            let token = broadcastToken(sampler.sample(logits: logits))
             processor?.didSample(token: token)
             y = .init(tokens: token)
             shiftedTail = token.item(Int.self)
@@ -548,6 +615,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// `LMOutput.state`.
     mutating func prepare(input: LMInput, prefill: PrefillParameters = .init()) throws {
         processor?.prompt(input.text.tokens)
+        prefill.prefix?(mainCacheStorage.processedTokenCount)
         let inputLength = input.text.cacheSequenceLength
 
         var prefillState = LMOutput.State()
@@ -576,7 +644,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             mainCacheStorage.commitProcessedTokens(y.cacheSequenceLength)
             var logits = result.logits[0..., -1, 0...]
             logits = processor?.process(logits: logits) ?? logits
-            let token = sampler.sample(logits: logits)
+            let token = broadcastToken(sampler.sample(logits: logits))
             processor?.didSample(token: token)
             y = .init(tokens: token)
             mainState = result.state
@@ -609,7 +677,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             // override threads it.
             var logits = prefillResult.logits[0..., -1, 0...]
             logits = processor?.process(logits: logits) ?? logits
-            let token = sampler.sample(logits: logits)
+            let token = broadcastToken(sampler.sample(logits: logits))
             processor?.didSample(token: token)
             y = .init(tokens: token)
             mainState = prefillResult.state
@@ -648,7 +716,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 // we must re-pick the bonus from the new step's logits).
                 var newLogits = primed.logits[0..., -1, 0...]
                 newLogits = processor?.process(logits: newLogits) ?? newLogits
-                let newToken = sampler.sample(logits: newLogits)
+                let newToken = broadcastToken(sampler.sample(logits: newLogits))
                 processor?.didSample(token: newToken)
                 y = .init(tokens: newToken)
                 // Yield BOTH bonuses to the consumer, in sample order.
@@ -724,6 +792,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         processor?.prompt(input.text.tokens)
+        prefill.prefix?(mainCacheStorage.processedTokenCount)
         let prompt = input.text.tokens.asArray(Int.self)
         let reserved = prefill.chunking == .remainder ? prefill.resolvedStepSize() : 1
         var targetEmittedHidden = true
@@ -966,6 +1035,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             eval([mainLogits] + prepared.cache.flatMap { $0.innerState() })
         }
 
+        let roundStart = pendingTokens.count
         var accepted = 0
         var finalToken: MLXArray?
         var firstTargetToken: Int?
@@ -1080,7 +1150,22 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             preconditionFailure(
                 "parameter-derived non-greedy samplers must expose probabilities")
         }
-        let emittedFinalToken = finalToken!
+        var emittedFinalToken = finalToken!
+        if let tokenBroadcastGroup {
+            // Ranks draw their own uniforms and samples; rank 0's decision is the round's.
+            let decision = MLXDistributed.broadcast(
+                concatenated([
+                    MLXArray([Int32(accepted)]), emittedFinalToken.flattened().asType(.int32),
+                ]),
+                group: tokenBroadcastGroup)
+            accepted = decision[0].item(Int.self)
+            emittedFinalToken = decision[1 ..< 2].asType(emittedFinalToken.dtype)
+                .reshaped(emittedFinalToken.shape)
+            // The accepted tokens are drafts, which are already rank 0's.
+            pendingTokens.removeSubrange(roundStart...)
+            pendingTokens.append(contentsOf: flatDraftTokens.asArray(Int.self).prefix(accepted))
+            pendingTokens.append(emittedFinalToken.item(Int.self))
+        }
         committedPendingTokenCount = accepted
 
         proposedCount += numDraft
@@ -1234,7 +1319,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         mainCacheStorage.commitProcessedTokens(y.cacheSequenceLength)
         var logits = result.logits[0..., -1, 0...]
         logits = processor?.process(logits: logits) ?? logits
-        let token = sampler.sample(logits: logits)
+        let token = broadcastToken(sampler.sample(logits: logits))
         processor?.didSample(token: token)
         eval(token)
         let tokenInt = token.item(Int.self)
@@ -1311,6 +1396,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
 extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
     mutating func finalizeGeneration() {
+        defer { processor?.finalizeGeneration() }
         // A fully consumed all-accepted round can still retain recurrent
         // checkpoints used for early-finalization rollback. Release them even
         // when no committed lookahead remains.

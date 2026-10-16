@@ -77,6 +77,9 @@ public enum LLMTypeRegistry {
         "qwen3_5": create(Qwen35Configuration.self) { Qwen35Model($0) },
         "qwen3_5_moe": create(Qwen35Configuration.self) { Qwen35MoEModel($0) },
         "qwen3_5_text": create(Qwen35TextConfiguration.self) { Qwen35TextModel($0) },
+        "qwen3_8": create(Qwen35Configuration.self) { Qwen35Model($0) },
+        "qwen3_8_moe": create(Qwen35Configuration.self) { Qwen35MoEModel($0) },
+        "qwen3_8_text": create(Qwen35TextConfiguration.self) { Qwen35TextModel($0) },
         "prism_hadamard_qwen35": createPrismHadamardQwen35,
         "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
         "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
@@ -86,6 +89,7 @@ public enum LLMTypeRegistry {
         "internlm2": create(InternLM2Configuration.self, InternLM2Model.init),
         "deepseek_v2": create(DeepseekV2Configuration.self, DeepseekV2Model.init),
         "deepseek_v3": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
+        "deepseek_v41": create(DeepseekV41Configuration.self, DeepseekV41Model.init),
         "granite": create(GraniteConfiguration.self, GraniteModel.init),
         "helium": create(HeliumConfiguration.self, HeliumModel.init),
         "granitemoehybrid": create(
@@ -96,6 +100,8 @@ public enum LLMTypeRegistry {
         "glm4": create(GLM4Configuration.self, GLM4Model.init),
         "glm4_moe": create(GLM4MoEConfiguration.self, GLM4MoEModel.init),
         "glm4_moe_lite": create(GLM4MoELiteConfiguration.self, GLM4MoELiteModel.init),
+        "glm_moe_dsa": create(GLMMoEDSAConfiguration.self, GLMMoEDSAModel.init),
+        "glm5_next": create(GLM5NextConfiguration.self, GLM5NextModel.init),
         "acereason": create(Qwen2Configuration.self, Qwen2Model.init),
         "falcon_h1": create(FalconH1Configuration.self, FalconH1Model.init),
         "bitnet": create(BitnetConfiguration.self, BitnetModel.init),
@@ -114,6 +120,9 @@ public enum LLMTypeRegistry {
         "nanochat": create(NanoChatConfiguration.self, NanoChatModel.init),
         "nemotron_h": create(NemotronHConfiguration.self, NemotronHModel.init),
         "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
+        "muse_spark": create(MuseSparkConfiguration.self, MuseSparkModel.init),
+        "muse_spark_text": create(MuseSparkConfiguration.self, MuseSparkModel.init),
+        "muse_spark_open": create(MuseSparkConfiguration.self, MuseSparkModel.init),
         "jamba": create(JambaConfiguration.self, JambaModel.init),
         "mamba2": create(Mamba2Configuration.self, Mamba2Model.init),
         "mistral3": create(Mistral3TextConfiguration.self, Mistral3TextModel.init),
@@ -379,6 +388,18 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<|im_end|>"]
     )
 
+    static public let qwen3_8_27b_4bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.8-27B-4bit",
+        defaultPrompt: "Why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
+    static public let qwen3_8_27b_8bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.8-27B-8bit",
+        defaultPrompt: "Why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
     static public let openelm270m4bit = ModelConfiguration(
         id: "mlx-community/OpenELM-270M-Instruct",
         // https://huggingface.co/apple/OpenELM
@@ -572,6 +593,8 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             qwen3_5_2b_4bit,
             underdogWoof4B11,
             qwen3_6_27b_4bit,
+            qwen3_8_27b_4bit,
+            qwen3_8_27b_8bit,
             smolLM_135M_4bit,
             deepseek_r1_4bit,
             mimo_7b_sft_4bit,
@@ -673,6 +696,14 @@ public final class LLMModelFactory: GenericModelFactory {
     /// by the model itself, e.g. DeepSeek-R1
     public let conventionsRegistry: ChatConventionsRegistry
 
+    /// Returns the model's LoRA metadata from its configuration without loading weights.
+    ///
+    /// The registered model architecture is instantiated so custom `LoRAModel.loraDefaultKeys`
+    /// implementations remain authoritative. No checkpoint files are read.
+    public func loraMetadata(configurationData: Data) async throws -> LoRAModelMetadata? {
+        try await typeRegistry.loraMetadata(configurationData: configurationData)
+    }
+
     public func _load(
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
@@ -718,6 +749,11 @@ public final class LLMModelFactory: GenericModelFactory {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
 
+        // Honor `suppress_tokens` from generation_config.json (transformers'
+        // SuppressTokensLogitsProcessor): merge into the model's suppressed
+        // token IDs so the token iterators mask them during sampling.
+        mergeGenerationConfigSuppressedTokens(generationConfig, into: model)
+
         // Build a ModelConfiguration with loaded EOS token IDs and tool call format
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
@@ -746,9 +782,11 @@ public final class LLMModelFactory: GenericModelFactory {
             from: configuration.tokenizerDirectory)
 
         try await loadWeights(
-            modelDirectory: modelDirectory, model: model,
+            modelDirectory: modelDirectory, model: model, tensorNameSelection: .all,
             perLayerQuantization: baseConfig.perLayerQuantization,
-            weightFileSelection: configuration.weightFileSelection)
+            weightFileSelection: configuration.weightFileSelection,
+            excludedComponents: configuration.excludedComponents,
+            tensorParallelGroup: configuration.tensorParallelGroup)
 
         let tokenizer = try await tokenizerTask
 
@@ -765,7 +803,7 @@ public final class LLMModelFactory: GenericModelFactory {
             configuration.tokenizerDirectory == modelDirectory
             ? nil
             : .directory(configuration.tokenizerDirectory)
-        let modelConfig = ModelConfiguration(
+        var modelConfig = ModelConfiguration(
             directory: modelDirectory,
             tokenizerSource: tokenizerSource,
             defaultPrompt: configuration.defaultPrompt,
@@ -775,6 +813,7 @@ public final class LLMModelFactory: GenericModelFactory {
             toolCallFormat: mutableConfiguration.toolCallFormat,
             reasoningConfig: mutableConfiguration.reasoningConfig,
             messageGenerator: mutableConfiguration.messageGenerator)
+        modelConfig.tensorParallelGroup = configuration.tensorParallelGroup
 
         let processor = LLMUserInputProcessor(
             tokenizer: tokenizer, configuration: modelConfig,

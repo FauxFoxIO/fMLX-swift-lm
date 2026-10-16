@@ -15,6 +15,7 @@ let package = Package(
     products: [
         .library(name: "FMLXText", targets: ["FMLXText"]),
         .library(name: "FMLXModelManagement", targets: ["FMLXModelManagement"]),
+        .executable(name: "fmlx-tp-generate", targets: ["TensorParallelGenerate"]),
         .library(
             name: "MLXLLM",
             targets: ["MLXLLM"]),
@@ -48,6 +49,9 @@ let package = Package(
         .library(
             name: "IntegrationTestHelpers",
             targets: ["IntegrationTestHelpers"]),
+        .library(
+            name: "MLXScriptedLM",
+            targets: ["MLXScriptedLM"]),
     ],
     traits: [
         // Gates the MLXLanguageModel adapter for Apple's FoundationModels
@@ -67,10 +71,10 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/FauxFoxIO/swift-tokenizers.git", branch: "main"),
+        // FauxFox fork: MLX core 0.32.4 with the JACCL (RDMA over Thunderbolt) backend.
         .package(
-            url: "https://github.com/ml-explore/mlx-swift",
-            revision: "3a24fa39e059ea5de65cdefc09d3d351b1053f52"
-        ),
+            url: "https://github.com/FauxFoxIO/mlx-swift",
+            revision: "d71f300d5b11bcf57b89de039ffd014fb130568e"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
@@ -80,6 +84,14 @@ let package = Package(
         .target(
             name: "FMLXModelManagement",
             path: "Libraries/FMLXModelManagement"
+        ),
+        // Tensor-parallel generation, one process per rank; see scripts/fmlx-launch.py.
+        .executableTarget(
+            name: "TensorParallelGenerate",
+            dependencies: [
+                "FMLXText", "MLXLLM", "MLXLMCommon", .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "tools/TensorParallelGenerate"
         ),
         .testTarget(
             name: "FMLXModelManagementTests",
@@ -226,6 +238,14 @@ let package = Package(
             path: "Libraries/IntegrationTestHelpers",
             exclude: ["README.md"]
         ),
+
+        // Scripted tokenizers and models
+        .target(
+            name: "MLXScriptedLM",
+            dependencies: ["MLXLMCommon"],
+            path: "Libraries/MLXScriptedLM",
+            exclude: ["README.md"]
+        ),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
@@ -237,10 +257,12 @@ let package = Package(
                 "MLXVLM",
                 "MLXEmbedders",
                 "MLXRerankers",
+                "MLXScriptedLM",
             ],
             path: "Tests/MLXLMTests",
             exclude: [
-                "README.md"
+                "README.md",
+                "Resources/Parity",
             ],
             resources: [.process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov")]
         ),

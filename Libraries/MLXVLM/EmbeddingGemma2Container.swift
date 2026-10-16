@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 
 /// Standalone, serialized native embeddings. No causal model, chat session, or generation cache.
 public final class EmbeddingGemma2Container: Sendable {
@@ -12,7 +13,7 @@ public final class EmbeddingGemma2Container: Sendable {
 
     fileprivate init(_ runtime: consuming EmbeddingGemma2Runtime) {
         artifact = runtime.artifact
-        resources = runtime.weights.resources
+        resources = runtime.resources
         state = SerialAccessContainer(consume runtime)
     }
 
@@ -23,10 +24,17 @@ public final class EmbeddingGemma2Container: Sendable {
         dimension: EmbeddingGemma2Dimension = .d768,
         imageSoftTokenBudget: Int = 280
     ) async throws -> EmbeddingGemma2Result {
-        try await state.read { runtime in
-            try await runtime.embed(
-                content, purpose: purpose, dimension: dimension,
-                imageSoftTokenBudget: imageSoftTokenBudget)
+        do {
+            return try await state.read { runtime in
+                try await runtime.embed(
+                    content, purpose: purpose, dimension: dimension,
+                    imageSoftTokenBudget: imageSoftTokenBudget)
+            }
+        } catch let error as EmbeddingGemma2Embedding.Error {
+            // The shared processors use the actor's errors; keep this API's error type.
+            throw EmbeddingGemma2Error.invalidInput(error.localizedDescription)
+        } catch is DecodingError {
+            throw EmbeddingGemma2Error.invalidConfiguration("unsupported processor_config.json")
         }
     }
 
@@ -38,6 +46,7 @@ public final class EmbeddingGemma2Container: Sendable {
     }
 
     /// Releases selected encoder weights; the next matching request reloads them from disk.
+    /// Releasing `.text` releases every modality.
     public func unload(
         _ modalities: Set<EmbeddingGemma2Modality> = Set(EmbeddingGemma2Modality.allCases)
     ) async {
@@ -58,7 +67,7 @@ public enum EmbeddingGemma2Loader {
         limits: EmbeddingGemma2ResourceLimits = .init()
     ) async throws -> EmbeddingGemma2Container {
         let tokenizer = try await EmbeddingGemma2Tokenizer.load(from: directory)
-        return try loadContainer(
+        return try await loadContainer(
             from: directory, tokenizer: tokenizer, artifact: artifact,
             precision: precision, limits: limits)
     }
@@ -78,7 +87,7 @@ public enum EmbeddingGemma2Loader {
             throw EmbeddingGemma2Error.invalidConfiguration(
                 "tokenizer assets changed during loading")
         }
-        return try loadContainer(
+        return try await loadContainer(
             from: directory, tokenizer: EmbeddingGemma2Tokenizer(tokenizer),
             artifact: artifact, precision: precision, limits: limits)
     }
@@ -87,7 +96,7 @@ public enum EmbeddingGemma2Loader {
         from directory: URL, tokenizer: EmbeddingGemma2Tokenizer,
         artifact: EmbeddingGemma2Artifact, precision: EmbeddingGemma2Precision,
         limits: EmbeddingGemma2ResourceLimits
-    ) throws -> EmbeddingGemma2Container {
+    ) async throws -> EmbeddingGemma2Container {
         guard directory.isFileURL, !artifact.identifier.isEmpty, !artifact.revision.isEmpty,
             artifact.revision != "main", artifact.revision != "latest"
         else {
@@ -97,55 +106,76 @@ public enum EmbeddingGemma2Loader {
         let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
         let configuration = try JSONDecoder().decode(EmbeddingGemma2Configuration.self, from: data)
         let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
-        try configuration.validate()
-        let weights = try EmbeddingGemma2WeightStore(
-            directory: directory,
-            configuration: configuration, base: base, precision: precision, limits: limits)
+        let inventory = try EmbeddingGemma2CheckpointInventory(directory: directory, limits: limits)
         let runtime = EmbeddingGemma2Runtime(
-            configuration: configuration, tokenizer: tokenizer,
-            weights: weights, artifact: artifact)
+            directory: directory, configuration: configuration,
+            perLayerQuantization: base.perLayerQuantization, tokenizer: tokenizer,
+            inventory: inventory, artifact: artifact, precision: precision)
         try runtime.validateTokenizer()
-        try runtime.loadText()
+        _ = try await runtime.loadModel()
         return EmbeddingGemma2Container(runtime)
     }
 }
 
+/// Drives the shared `EmbeddingGemma2` encoder and its reference processors.
 private final class EmbeddingGemma2Runtime {
+    /// A media item ready to encode, and the soft tokens it will produce.
     private enum Media {
-        case image(EmbeddingGemma2PreparedImage, video: Bool)
-        case audio(EmbeddingGemma2PreparedAudio)
-        var count: Int {
-            switch self {
-            case .image(let input, _): input.tokenCount
-            case .audio(let input): input.tokenCount
-            }
-        }
+        case image(MLXArray)
+        case video(MLXArray)
+        case audio(MLXArray, tokens: Int)
     }
 
+    private enum Part {
+        case text([Int])
+        case media(Media)
+    }
+
+    let directory: URL
     let configuration: EmbeddingGemma2Configuration
+    let perLayerQuantization: BaseConfiguration.PerLayerQuantization?
     let tokenizer: EmbeddingGemma2Tokenizer
-    let weights: EmbeddingGemma2WeightStore
+    let inventory: EmbeddingGemma2CheckpointInventory
     let artifact: EmbeddingGemma2Artifact
-    private var text: EmbeddingGemma2TextComponent?
-    private var vision: EmbeddingGemma2VisionComponent?
-    private var audio: EmbeddingGemma2AudioComponent?
+    let precision: EmbeddingGemma2Precision
+    private var model: EmbeddingGemma2?
+    /// Media encoders load with the text model when the checkpoint dtype needs a cast.
+    private var loadsMediaWithText = false
+    private var imageProcessor: EmbeddingGemma2ImageProcessor?
+    private var videoProcessor: EmbeddingGemma2VideoProcessor?
+    private var audioProcessor: EmbeddingGemma2AudioProcessor?
+
+    var resources: EmbeddingGemma2Resources { inventory.resources }
 
     init(
-        configuration: EmbeddingGemma2Configuration, tokenizer: EmbeddingGemma2Tokenizer,
-        weights: EmbeddingGemma2WeightStore, artifact: EmbeddingGemma2Artifact
+        directory: URL, configuration: EmbeddingGemma2Configuration,
+        perLayerQuantization: BaseConfiguration.PerLayerQuantization?,
+        tokenizer: EmbeddingGemma2Tokenizer, inventory: EmbeddingGemma2CheckpointInventory,
+        artifact: EmbeddingGemma2Artifact, precision: EmbeddingGemma2Precision
     ) {
+        self.directory = directory
         self.configuration = configuration
+        self.perLayerQuantization = perLayerQuantization
         self.tokenizer = tokenizer
-        self.weights = weights
+        self.inventory = inventory
         self.artifact = artifact
+        self.precision = precision
+    }
+
+    private var markerTokenIDs: [Int] {
+        var ids = configuration.softTokenIDs
+        if let vision = configuration.vision {
+            ids += [vision.beginImageTokenID, vision.endImageTokenID]
+        }
+        if let audio = configuration.audio {
+            ids += [audio.beginAudioTokenID, audio.endAudioTokenID]
+        }
+        return ids
     }
 
     func validateTokenizer() throws {
-        let c = configuration
-        for id in [
-            c.imageToken, c.audioToken, c.videoToken, c.beginImage, c.endImage, c.beginAudio,
-            c.endAudio,
-        ] {
+        _ = try tokenizer.sequenceBoundaries()
+        for id in markerTokenIDs {
             guard let token = tokenizer.convertIdToToken(id),
                 try tokenizer.encode(text: token, addSpecialTokens: false) == [id]
             else {
@@ -155,56 +185,54 @@ private final class EmbeddingGemma2Runtime {
         }
     }
 
-    func loadText() throws {
-        guard text == nil else { return }
-        let component = EmbeddingGemma2TextComponent(configuration)
-        try weights.load(component, modality: .text)
-        text = component
-    }
-
-    private func loadVision() throws {
-        guard vision == nil else { return }
-        let component = EmbeddingGemma2VisionComponent(configuration)
-        try weights.load(component, modality: .vision)
-        vision = component
-    }
-
-    private func loadAudio() throws {
-        guard audio == nil else { return }
-        let component = EmbeddingGemma2AudioComponent(configuration)
-        try weights.load(component, modality: .audio)
-        audio = component
+    func loadModel() async throws -> EmbeddingGemma2 {
+        if let model { return model }
+        try inventory.verifyFiles()
+        let model = EmbeddingGemma2(configuration)
+        let casts = !inventory.stores(precision)
+        try await loadWeights(
+            modelDirectory: directory, model: model, perLayerQuantization: perLayerQuantization,
+            componentLoading: casts ? .immediate : .onFirstUse)
+        if casts {
+            let parameters = model.parameters().flattened().map { name, value in
+                (name, value.dtype == .uint32 ? value : value.asType(precision.dtype))
+            }
+            try model.update(parameters: ModuleParameters.unflattened(parameters), verify: .all)
+            try checkedEval(model)
+        }
+        model.train(false)
+        loadsMediaWithText = casts
+        self.model = model
+        return model
     }
 
     var loadedModalities: Set<EmbeddingGemma2Modality> {
-        var result = Set<EmbeddingGemma2Modality>()
-        if text != nil { result.insert(.text) }
-        if vision != nil { result.insert(.vision) }
-        if audio != nil { result.insert(.audio) }
+        guard let model else { return [] }
+        var result: Set<EmbeddingGemma2Modality> = [.text]
+        if model.loadedComponents.contains(.vision) { result.insert(.vision) }
+        if model.loadedComponents.contains(.audio) { result.insert(.audio) }
         return result
     }
 
+    /// Unloading text releases the whole model.
     func unload(_ modalities: Set<EmbeddingGemma2Modality>) {
-        if modalities.contains(.text) { text = nil }
-        if modalities.contains(.vision) { vision = nil }
-        if modalities.contains(.audio) { audio = nil }
-    }
-
-    private func tokenString(_ id: Int) throws -> String {
-        guard let value = tokenizer.convertIdToToken(id) else {
-            throw EmbeddingGemma2Error.invalidConfiguration("missing token \(id)")
+        guard let model else { return }
+        var components = Set<ModelComponent>()
+        if modalities.contains(.vision) { components.insert(.vision) }
+        if modalities.contains(.audio) { components.insert(.audio) }
+        if modalities.contains(.text)
+            || (loadsMediaWithText && !components.isDisjoint(with: model.loadedComponents))
+        {
+            self.model = nil
+        } else {
+            model.unloadMediaComponents(components)
         }
-        return value
     }
 
     private func checkedText(_ value: String) throws -> String {
-        let reserved = Set([
-            configuration.imageToken, configuration.audioToken, configuration.videoToken,
-            configuration.beginImage, configuration.endImage, configuration.beginAudio,
-            configuration.endAudio,
-            configuration.text.bosTokenId, configuration.text.eosTokenId,
-            configuration.text.padTokenId,
-        ])
+        let (begin, end) = try tokenizer.sequenceBoundaries()
+        var reserved = Set(markerTokenIDs + [begin, end])
+        if let pad = tokenizer.convertTokenToId("<pad>") { reserved.insert(pad) }
         guard
             try !tokenizer.encode(text: value, addSpecialTokens: false).contains(
                 where: reserved.contains)
@@ -215,145 +243,204 @@ private final class EmbeddingGemma2Runtime {
         return value
     }
 
+    private func images() throws -> EmbeddingGemma2ImageProcessor {
+        guard configuration.vision != nil else {
+            throw EmbeddingGemma2Error.invalidInput("this checkpoint cannot embed images")
+        }
+        let processor = try imageProcessor ?? EmbeddingGemma2ImageProcessor(directory: directory)
+        imageProcessor = processor
+        return processor
+    }
+
+    private func videos() throws -> EmbeddingGemma2VideoProcessor {
+        guard configuration.vision?.videoTokenID != nil else {
+            throw EmbeddingGemma2Error.invalidInput("this checkpoint cannot embed video")
+        }
+        let processor = try videoProcessor ?? EmbeddingGemma2VideoProcessor(directory: directory)
+        videoProcessor = processor
+        return processor
+    }
+
+    private func audio() throws -> EmbeddingGemma2AudioProcessor {
+        guard configuration.audio != nil else {
+            throw EmbeddingGemma2Error.invalidInput("this checkpoint cannot embed audio")
+        }
+        let processor = try audioProcessor ?? EmbeddingGemma2AudioProcessor(directory: directory)
+        guard processor.sampleRate == EmbeddingGemma2Waveform.sampleRate else {
+            throw EmbeddingGemma2Error.invalidConfiguration("unsupported audio sample rate")
+        }
+        audioProcessor = processor
+        return processor
+    }
+
+    /// Soft tokens of an image or video frame of these pixel dimensions.
+    private func imageTokens(_ pixels: MLXArray) throws -> Int {
+        try images().configuration.softTokenCount(height: pixels.dim(2), width: pixels.dim(3))
+    }
+
+    /// The audio tower subsamples its frames twice by two.
+    private static func audioTokens(frames: Int) -> Int {
+        let first = (frames + 1) / 2
+        return (first + 1) / 2
+    }
+
+    /// Sequence length, including `<bos>`, `<eos>` and each media block's markers.
+    private func length(_ parts: [Part]) throws -> Int {
+        try parts.reduce(2) { total, part in
+            switch part {
+            case .text(let tokens): return total + tokens.count
+            case .media(.image(let pixels)): return total + (try imageTokens(pixels)) + 2
+            case .media(.video(let pixels)):
+                return total + pixels.dim(0) * ((try imageTokens(pixels)) + 2)
+            case .media(.audio(_, let tokens)): return total + tokens + 2
+            }
+        }
+    }
+
     func embed(
         _ content: [EmbeddingGemma2Content], purpose: EmbeddingGemma2Purpose,
         dimension: EmbeddingGemma2Dimension, imageSoftTokenBudget: Int
     ) async throws -> EmbeddingGemma2Result {
         try Task.checkCancellation()
-        guard !content.isEmpty, [70, 140, 280, 560, 1120].contains(imageSoftTokenBudget) else {
+        guard !content.isEmpty,
+            EmbeddingGemma2MediaProcessor.softTokenBudgets.contains(imageSoftTokenBudget)
+        else {
             throw EmbeddingGemma2Error.invalidInput(
                 "provide content and a supported image soft-token budget")
         }
-        let c = configuration
-        var prompt: String
-        switch purpose {
-        case .query(let task): prompt = "task: \(try checkedText(task)) | query: "
-        case .document(let title): prompt = "title: \(try checkedText(title)) | text: "
+        guard dimension.rawValue <= configuration.embeddingDim else {
+            throw EmbeddingGemma2Error.invalidConfiguration(
+                "dimension exceeds the checkpoint embedding size")
         }
-        var media = [Media]()
-        var minimumMediaTokens = 0
+        let limit = resources.maximumTokens
+        var text: String
+        switch purpose {
+        case .query(let task): text = "task: \(try checkedText(task)) | query: "
+        case .document(let title): text = "title: \(try checkedText(title)) | text: "
+        }
+
+        // Prepare every item and check the sequence length before any encoder runs.
+        var parts = [Part]()
         var hasContent = false
-        func appendImage(_ image: EmbeddingGemma2PreparedImage, video: Bool) throws {
-            prompt += try tokenString(c.beginImage)
-            prompt += String(
-                repeating: try tokenString(video ? c.videoToken : c.imageToken),
-                count: image.tokenCount)
-            prompt += try tokenString(c.endImage)
-            media.append(.image(image, video: video))
-            minimumMediaTokens += image.tokenCount + 2
+        func flushText() throws {
+            guard !text.isEmpty else { return }
+            parts.append(.text(try tokenizer.encode(text: text, addSpecialTokens: false)))
+            text = ""
         }
         for item in content {
             try Task.checkCancellation()
             switch item {
             case .text(let string):
-                prompt += try checkedText(string)
+                text += try checkedText(string)
                 hasContent = hasContent || !string.isEmpty
+                continue
             case .image(let image):
-                try appendImage(
-                    EmbeddingGemma2MediaProcessor.image(
-                        image, softTokenBudget: imageSoftTokenBudget), video: false)
-                hasContent = true
+                try flushText()
+                parts.append(
+                    .media(
+                        .image(
+                            try EmbeddingGemma2MediaProcessor.image(
+                                image, processor: try images(), budget: imageSoftTokenBudget))))
             case .video(let video):
-                for frame in try await EmbeddingGemma2MediaProcessor.video(video) {
-                    try appendImage(frame, video: true)
-                }
-                hasContent = true
+                try flushText()
+                parts.append(
+                    .media(
+                        .video(
+                            try await EmbeddingGemma2MediaProcessor.video(
+                                video, images: try images(), video: try videos()))))
             case .audio(let input):
-                let prepared = try await EmbeddingGemma2MediaProcessor.audio(
-                    input,
-                    maximumTokens: max(0, weights.resources.maximumTokens - minimumMediaTokens - 2))
-                prompt += try tokenString(c.beginAudio)
-                prompt += String(
-                    repeating: try tokenString(c.audioToken), count: prepared.tokenCount)
-                prompt += try tokenString(c.endAudio)
-                media.append(.audio(prepared))
-                minimumMediaTokens += prepared.tokenCount + 2
-                hasContent = true
+                try flushText()
+                let processor = try audio()
+                let samples = try await EmbeddingGemma2Waveform.samples(input)
+                let features = processor.features(samples: MLXArray(samples))
+                try checkedEval(features)
+                guard features.dim(0) > 0 else {
+                    throw EmbeddingGemma2Error.invalidInput(
+                        "Audio requires at least one feature frame")
+                }
+                parts.append(
+                    .media(.audio(features, tokens: Self.audioTokens(frames: features.dim(0)))))
             }
-            guard minimumMediaTokens <= weights.resources.maximumTokens else {
-                throw EmbeddingGemma2Error.tokenLimit(
-                    count: minimumMediaTokens, limit: weights.resources.maximumTokens)
-            }
-            // Tokenize the whole prefix so interleaved text keeps its exact boundary behavior.
-            let count = try tokenizer.encode(text: prompt, addSpecialTokens: true).count
-            guard count <= weights.resources.maximumTokens else {
-                throw EmbeddingGemma2Error.tokenLimit(
-                    count: count, limit: weights.resources.maximumTokens)
+            hasContent = true
+            let count = try length(parts)
+            guard count <= limit else {
+                throw EmbeddingGemma2Error.tokenLimit(count: count, limit: limit)
             }
         }
+        try flushText()
         guard hasContent else { throw EmbeddingGemma2Error.invalidInput("empty content") }
-        let tokens = try tokenizer.encode(text: prompt, addSpecialTokens: true)
-        guard !tokens.isEmpty, tokens.allSatisfy({ (0 ..< c.text.vocabularySize).contains($0) })
-        else {
-            throw EmbeddingGemma2Error.invalidInput(
-                "tokenizer produced an empty sequence or invalid token ID")
+        let expected = try length(parts)
+        guard expected <= limit else {
+            throw EmbeddingGemma2Error.tokenLimit(count: expected, limit: limit)
         }
-        try loadText()
-        guard let text else {
-            throw EmbeddingGemma2Error.invalidWeights("text encoder unavailable")
-        }
-        let mediaIds = Set([c.imageToken, c.audioToken, c.videoToken])
-        let textIds = tokens.map { mediaIds.contains($0) ? c.text.padTokenId : $0 }
-        var embeddings = text.encoder.embedTokens(MLXArray(textIds).expandedDimensions(axis: 0))
-        embeddings =
-            embeddings * MLXArray(pow(Float(c.text.hiddenSize), 0.5), dtype: embeddings.dtype)
-        var featuresById = [Int: [MLXArray]]()
-        for item in media {
+
+        // Encode one media item at a time so only one encoder's activations are alive.
+        let model = try await loadModel()
+        var segments = [EmbeddingGemma2Sequence.Segment]()
+        var softTokens = [MLXArray]()
+        for part in parts {
             try Task.checkCancellation()
-            let id: Int
-            let features: MLXArray
-            switch item {
-            case .image(let image, let video):
-                try loadVision()
-                guard let vision else {
-                    throw EmbeddingGemma2Error.invalidWeights("vision encoder unavailable")
-                }
-                features = try vision(image)
-                id = video ? c.videoToken : c.imageToken
-            case .audio(let input):
-                try loadAudio()
-                guard let audio else {
-                    throw EmbeddingGemma2Error.invalidWeights("audio encoder unavailable")
-                }
-                features = try audio(input)
-                id = c.audioToken
+            let features: MLXArray?
+            switch part {
+            case .text(let tokens):
+                segments.append(.text(tokens))
+                continue
+            case .media(.image(let pixels)), .media(.video(let pixels)):
+                try await model.loadMediaComponents([.vision])
+                features = try model.imageFeatures(pixels)
+            case .media(.audio(let frames, _)):
+                try await model.loadMediaComponents([.audio])
+                features = try model.audioFeatures(frames)
             }
-            guard features.shape == [item.count, c.text.hiddenSize] else {
-                throw EmbeddingGemma2Error.featureCount(
-                    modality: "media", expected: item.count, actual: features.dim(0))
+            guard let features else {
+                throw EmbeddingGemma2Error.invalidWeights("media encoder unavailable")
             }
             try checkedEval(features)
-            featuresById[id, default: []].append(features)
+            switch part {
+            case .media(.image): segments.append(.image(tokens: features.dim(1)))
+            case .media(.video):
+                segments.append(.video(frames: features.dim(0), tokensPerFrame: features.dim(1)))
+            default: segments.append(.audio(tokens: features.dim(1)))
+            }
+            softTokens.append(features.reshaped(-1, features.dim(-1)))
         }
-        for id in [c.imageToken, c.audioToken, c.videoToken] {
-            let indices = tokens.enumerated().compactMap {
-                $0.element == id ? Int32($0.offset) : nil
-            }
-            let parts = featuresById[id] ?? []
-            let count = parts.reduce(0) { $0 + $1.dim(0) }
-            guard indices.count == count else {
-                throw EmbeddingGemma2Error.featureCount(
-                    modality: "token \(id)", expected: indices.count, actual: count)
-            }
-            if !indices.isEmpty {
-                embeddings[0, MLXArray(indices), 0...] = concatenated(parts, axis: 0).asType(
-                    embeddings.dtype)
+
+        let (begin, end) = try tokenizer.sequenceBoundaries()
+        let tokens = try EmbeddingGemma2Sequence.tokens(
+            segments, configuration: configuration, beginOfSequence: begin,
+            endOfSequence: end, limit: limit)
+        let textTokens = segments.reduce(0) { total, segment in
+            if case .text(let tokens) = segment { return total + tokens.count }
+            return total
+        }
+        let mediaTokens = softTokens.reduce(0) { $0 + $1.dim(0) }
+        let blocks = segments.reduce(0) { total, segment in
+            switch segment {
+            case .text: return total
+            case .video(let frames, _): return total + 2 * frames
+            case .image, .audio: return total + 2
             }
         }
-        let valid = MLXArray.ones([1, tokens.count], dtype: .bool)
-        let hidden = try text.encoder(embeddings, validMask: valid)
-        // Prompt, delimiter, and media tokens all participate in the masked mean.
-        let mask = valid.asType(.float32).expandedDimensions(axis: -1)
-        let pooled = sum(hidden * mask, axis: 1) / sum(mask, axis: 1)
-        let truncated = pooled[0, ..<dimension.rawValue].asType(.float32)
-        let normalized = truncated / sqrt(sum(truncated.square()))
-        try checkedEval(normalized)
-        let values = normalized.asArray(Float.self)
-        let norm = values.reduce(0.0) { $0 + Double($1) * Double($1) }
-        guard values.count == dimension.rawValue, values.allSatisfy(\.isFinite),
-            norm.isFinite, abs(norm - 1) <= 1e-4
-        else { throw EmbeddingGemma2Error.nonFiniteEmbedding }
+        // The sequence builder trims text to fit; embedding input must never change silently.
+        guard tokens.count == 2 + textTokens + mediaTokens + blocks else {
+            throw EmbeddingGemma2Error.tokenLimit(
+                count: 2 + textTokens + mediaTokens + blocks, limit: limit)
+        }
+        guard tokens.allSatisfy({ (0 ..< configuration.vocabularySize).contains($0) }) else {
+            throw EmbeddingGemma2Error.invalidInput("tokenizer produced an invalid token ID")
+        }
+
+        let vector = model.embed(
+            inputIds: MLXArray(tokens.map(Int32.init), [1, tokens.count]), attentionMask: nil,
+            softTokens: softTokens.isEmpty ? nil : concatenated(softTokens, axis: 0))
+        try checkedEval(vector)
         try Task.checkCancellation()
+        let truncated = vector.asArray(Float.self).prefix(dimension.rawValue)
+        let norm = truncated.reduce(0.0) { $0 + Double($1) * Double($1) }.squareRoot()
+        guard truncated.count == dimension.rawValue, truncated.allSatisfy(\.isFinite),
+            norm.isFinite, norm > 0
+        else { throw EmbeddingGemma2Error.nonFiniteEmbedding }
+        let values = truncated.map { Float(Double($0) / norm) }
         return EmbeddingGemma2Result(
             values: values, dimension: dimension, artifact: artifact,
             referenceRevision: EmbeddingGemma2Artifact.referenceRevision, tokenCount: tokens.count)

@@ -159,7 +159,7 @@ public struct PromptLookupTokenIterator: TokenIteratorProtocol {
             }
             let token = base.step(previous: base.y)
             base.y = .init(tokens: token)
-            asyncEval([token] + base.cache.flatMap { $0.state })
+            asyncEval([token] + base.cache.flatMap(decodeEvaluationArrays))
             return emit(token.item(Int.self), speculative: false)
         }
     }

@@ -174,6 +174,12 @@ class DeepseekV3Attention: Module {
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
+        let projections = projectPreRope(x)
+        return oProj(attend(projections, mask: mask, cache: cache))
+    }
+
+    /// `[qNope, qPe, kNope, kPe, values]` in `[B, heads, L, dim]`, before rope.
+    func projectPreRope(_ x: MLXArray) -> [MLXArray] {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
         var q: MLXArray
@@ -185,27 +191,34 @@ class DeepseekV3Attention: Module {
 
         q = q.reshaped(B, L, self.numHeads, self.qHeadDim).transposed(0, 2, 1, 3)
         let splitQ = split(q, indices: [qkNopeHeadDim], axis: -1)
-        var (qNope, qPe) = (splitQ[0], splitQ[1])
         var compressedKv = self.kvAProjWithMqa(x)
         let splitCompressedKv = split(compressedKv, indices: [kvLoraRank], axis: -1)
         compressedKv = splitCompressedKv[0]
-        var kPe = splitCompressedKv[1]
-        kPe = kPe.reshaped(B, L, 1, self.qkRopeHeadDim).transposed(0, 2, 1, 3)
+        let kPe = splitCompressedKv[1].reshaped(B, L, 1, self.qkRopeHeadDim).transposed(0, 2, 1, 3)
         var kv = self.kvBProj(kvALayerNorm(compressedKv))
         kv = kv.reshaped(B, L, self.numHeads, -1).transposed(0, 2, 1, 3)
         let splitKv = split(kv, indices: [self.qkNopeHeadDim], axis: -1)
 
-        let (kNope, values) = (splitKv[0], splitKv[1])
+        return [splitQ[0], splitQ[1], splitKv[0], kPe, splitKv[1]]
+    }
+
+    /// Rope, cache update and attention, with heads merged for `oProj`.
+    func attend(
+        _ projections: [MLXArray], mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?
+    ) -> MLXArray {
+        let (qNope, kNope, values) = (projections[0], projections[2], projections[4])
+        let (B, L) = (qNope.dim(0), qNope.dim(2))
 
         let offset = cache?.ropeOffset
-        qPe = applyRotaryPosition(rope, to: qPe, offset: offset)
-        kPe = applyRotaryPosition(rope, to: kPe, offset: offset)
+        let qPe = applyRotaryPosition(rope, to: projections[1], offset: offset)
+        var kPe = applyRotaryPosition(rope, to: projections[3], offset: offset)
         kPe = repeated(kPe, count: numHeads, axis: 1)
 
         let keys = concatenated([kNope, kPe], axis: -1)
         let queries = concatenated([qNope, qPe], axis: -1)
 
-        let output = attentionWithCacheUpdate(
+        return attentionWithCacheUpdate(
             queries: queries,
             keys: keys,
             values: values,
@@ -215,8 +228,6 @@ class DeepseekV3Attention: Module {
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
-
-        return self.oProj(output)
     }
 }
 
@@ -332,7 +343,7 @@ class DeepseekV3MoE: Module, UnaryLayer {
     }
 }
 
-class DeepseekV3DecoderLayer: Module {
+class DeepseekV3DecoderLayer: Module, AttentionSplitDecoderLayer {
     @ModuleInfo(key: "self_attn") var selfAttn: DeepseekV3Attention
     var mlp: UnaryLayer
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
@@ -363,6 +374,19 @@ class DeepseekV3DecoderLayer: Module {
         let h = x + r
         let r2 = mlp(postAttentionLayerNorm(h))
         return h + r2
+    }
+
+    func decodeProjections(_ x: MLXArray) -> [MLXArray] {
+        selfAttn.projectPreRope(inputLayerNorm(x))
+    }
+
+    func decodeAttention(_ projections: [MLXArray], cache: KVCache) -> MLXArray {
+        selfAttn.attend(projections, mask: .none, cache: cache)
+    }
+
+    func decodeOutput(_ x: MLXArray, attention: MLXArray) -> MLXArray {
+        let h = x + selfAttn.oProj(attention)
+        return h + mlp(postAttentionLayerNorm(h))
     }
 }
 
@@ -407,21 +431,36 @@ public class DeepseekV3ModelInner: Module {
     }
 }
 
-public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAModel {
+public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAModel,
+    CompiledDecodeConfigurable
+{
     public var kvHeads: [Int]
 
     var args: DeepseekV3Configuration
     public var model: DeepseekV3ModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
+    package var compiledDecodeEnabled = true
+    let compiledDecode: CompiledAttentionDecoder<DeepseekV3Model>
+
     public init(_ args: DeepseekV3Configuration) {
         self.args = args
         self.kvHeads = Array(repeating: args.numKeyValueHeads, count: args.numHiddenLayers)
         self.model = DeepseekV3ModelInner(config: args)
         self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
+        self.compiledDecode = CompiledAttentionDecoder(
+            layerCount: args.numHiddenLayers,
+            layers: { $0.model.layers },
+            embed: { $0.model.embedTokens($1) },
+            head: { $0.lmHead($0.model.norm($1)) },
+            embedState: { [$0.model.embedTokens] },
+            headState: { [$0.model.norm, $0.lmHead] })
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        if compiledDecodeEnabled, let logits = compiledDecode(self, inputs: inputs, cache: cache) {
+            return logits
+        }
         let out = model(inputs, cache: cache)
         return lmHead(out)
     }

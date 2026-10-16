@@ -198,6 +198,8 @@ private final class ScheduledBlockLimitDrafter: Module, MTPDrafterModel {
         super.init()
     }
 
+    func isCompatible(with target: any LanguageModel) -> Bool { true }
+
     func draftBlock(
         target _: any LanguageModel, lastToken _: MLXArray, lastHidden _: MLXArray,
         sharedKV _: [String: (MLXArray, MLXArray)], positionDeltas _: MLXArray?,

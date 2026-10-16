@@ -52,6 +52,12 @@ class GLM4MoEAttention: Module {
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
+        let (queries, keys, values) = projectPreRope(x)
+        return wo(attend(queries: queries, keys: keys, values: values, mask: mask, cache: cache))
+    }
+
+    /// Queries, keys and values in `[B, heads, L, headDim]`, before rope.
+    func projectPreRope(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
         let (B, L) = (x.dim(0), x.dim(1))
 
         var queries = wq(x)
@@ -69,14 +75,19 @@ class GLM4MoEAttention: Module {
         queries = queries.transposed(0, 2, 1, 3)
         keys = keys.transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        return (queries, keys, values)
+    }
 
+    /// Rope, cache update and attention, with heads merged for `wo`.
+    func attend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        let (B, L) = (queries.dim(0), queries.dim(2))
         let offset = cache?.ropeOffset
-        queries = applyRotaryPosition(rope, to: queries, offset: offset)
-        keys = applyRotaryPosition(rope, to: keys, offset: offset)
-
-        let output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
+        return attentionWithCacheUpdate(
+            queries: applyRotaryPosition(rope, to: queries, offset: offset),
+            keys: applyRotaryPosition(rope, to: keys, offset: offset),
             values: values,
             cache: cache,
             scale: scale,
@@ -84,8 +95,6 @@ class GLM4MoEAttention: Module {
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
-
-        return wo(output)
     }
 }
 
@@ -222,7 +231,7 @@ class GLM4MoE: Module, UnaryLayer {
     }
 }
 
-class GLM4MoEDecoderLayer: Module {
+class GLM4MoEDecoderLayer: Module, AttentionSplitDecoderLayer {
     @ModuleInfo(key: "self_attn") var attention: GLM4MoEAttention
     let mlp: UnaryLayer
 
@@ -251,6 +260,22 @@ class GLM4MoEDecoderLayer: Module {
         let h = x + r
         let r2 = mlp(postAttentionLayerNorm(h))
         return h + r2
+    }
+
+    func decodeProjections(_ x: MLXArray) -> [MLXArray] {
+        let (queries, keys, values) = attention.projectPreRope(inputLayerNorm(x))
+        return [queries, keys, values]
+    }
+
+    func decodeAttention(_ projections: [MLXArray], cache: KVCache) -> MLXArray {
+        attention.attend(
+            queries: projections[0], keys: projections[1], values: projections[2],
+            mask: .none, cache: cache)
+    }
+
+    func decodeOutput(_ x: MLXArray, attention: MLXArray) -> MLXArray {
+        let h = x + self.attention.wo(attention)
+        return h + mlp(postAttentionLayerNorm(h))
     }
 }
 
@@ -286,7 +311,9 @@ public class GLM4MoEModelInner: Module {
     }
 }
 
-public class GLM4MoEModel: Module, LLMModel, KVCacheDimensionProvider {
+public class GLM4MoEModel: Module, LLMModel, KVCacheDimensionProvider,
+    CompiledDecodeConfigurable
+{
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -294,6 +321,9 @@ public class GLM4MoEModel: Module, LLMModel, KVCacheDimensionProvider {
     let configuration: GLM4MoEConfiguration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
+
+    package var compiledDecodeEnabled = true
+    let compiledDecode: CompiledAttentionDecoder<GLM4MoEModel>
 
     public init(_ args: GLM4MoEConfiguration) {
         self.configuration = args
@@ -304,14 +334,27 @@ public class GLM4MoEModel: Module, LLMModel, KVCacheDimensionProvider {
         if !args.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
         }
+        self.compiledDecode = CompiledAttentionDecoder(
+            layerCount: args.hiddenLayers,
+            layers: { $0.model.layers },
+            embed: { $0.model.embedTokens($1) },
+            head: { $0.logits($0.model.norm($1)) },
+            embedState: { [$0.model.embedTokens] },
+            headState: { [$0.model.norm, $0.lmHead ?? $0.model.embedTokens] })
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        let out = model(inputs, cache: cache)
-        if let lmHead {
-            return lmHead(out)
+        if compiledDecodeEnabled, let logits = compiledDecode(self, inputs: inputs, cache: cache) {
+            return logits
         }
-        return model.embedTokens.asLinear(out)
+        return logits(model(inputs, cache: cache))
+    }
+
+    private func logits(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead {
+            return lmHead(hidden)
+        }
+        return model.embedTokens.asLinear(hidden)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

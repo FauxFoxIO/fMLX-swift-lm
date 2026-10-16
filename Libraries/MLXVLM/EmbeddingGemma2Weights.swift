@@ -3,7 +3,6 @@
 import Foundation
 import MLX
 import MLXLMCommon
-import MLXNN
 
 /// Limits apply to the complete installed checkpoint, including unloaded media towers.
 public struct EmbeddingGemma2ResourceLimits: Sendable {
@@ -29,7 +28,8 @@ public enum EmbeddingGemma2Precision: String, Codable, Sendable {
     var dtype: DType { self == .bfloat16 ? .bfloat16 : .float32 }
 }
 
-final class EmbeddingGemma2WeightStore {
+/// Header-only accounting of the installed checkpoint, read before any tensor loads.
+final class EmbeddingGemma2CheckpointInventory: Sendable {
     private struct FileIdentity: Equatable {
         let size: UInt64
         let modified: Date
@@ -51,15 +51,6 @@ final class EmbeddingGemma2WeightStore {
         }
     }
 
-    private struct Tensor {
-        let rawName: String
-        let name: String
-        let url: URL
-        let shape: [Int]
-        let dtype: String
-        let bytes: UInt64
-    }
-
     private struct HeaderTensor: Decodable {
         let dtype: String
         let shape: [Int]
@@ -75,27 +66,21 @@ final class EmbeddingGemma2WeightStore {
         enum CodingKeys: String, CodingKey { case weights = "weight_map" }
     }
 
-    private let tensors: [String: Tensor]
     private let fileIdentities: [URL: FileIdentity]
-    private let quantization: BaseConfiguration.PerLayerQuantization?
-    let precision: EmbeddingGemma2Precision
     let resources: EmbeddingGemma2Resources
+    /// Safetensors dtypes of the floating tensors of each modality.
+    private let floatingDTypes: [EmbeddingGemma2Modality: Set<String>]
 
-    init(
-        directory: URL, configuration: EmbeddingGemma2Configuration,
-        base: BaseConfiguration, precision: EmbeddingGemma2Precision,
-        limits: EmbeddingGemma2ResourceLimits
-    ) throws {
+    init(directory: URL, limits: EmbeddingGemma2ResourceLimits) throws {
         guard directory.isFileURL, (1 ... 8192).contains(limits.maximumTokens),
             limits.maximumCheckpointBytes > 0
         else {
             throw EmbeddingGemma2Error.invalidConfiguration(
                 "invalid local directory or resource limits")
         }
-        self.precision = precision
-        quantization = base.perLayerQuantization
         let files = try Self.files(directory)
-        var found = [String: Tensor]()
+        var names = Set<String>()
+        var floating = [EmbeddingGemma2Modality: Set<String>]()
         var identities = [URL: FileIdentity]()
         var rawFiles = [String: String]()
         var total: UInt64 = 0
@@ -107,7 +92,6 @@ final class EmbeddingGemma2WeightStore {
                     throw EmbeddingGemma2Error.invalidWeights("duplicate tensor \(rawName)")
                 }
                 guard let name = Self.canonicalName(rawName) else { continue }
-                let shape = Self.canonicalShape(entry.shape, name: name)
                 let bytes = entry.offsets[1] - entry.offsets[0]
                 let (sum, overflow) = total.addingReportingOverflow(bytes)
                 guard !overflow, sum <= limits.maximumCheckpointBytes else {
@@ -120,14 +104,12 @@ final class EmbeddingGemma2WeightStore {
                         "\(rawName) uses \(entry.dtype); only BF16/FP32 and packed U32 are supported"
                     )
                 }
-                guard found[name] == nil else {
+                guard names.insert(name).inserted else {
                     throw EmbeddingGemma2Error.invalidWeights("sanitizer collision at \(name)")
                 }
                 let modality = try Self.modality(name)
                 byModality[modality, default: 0] += bytes
-                found[name] = Tensor(
-                    rawName: rawName, name: name, url: url,
-                    shape: shape, dtype: entry.dtype, bytes: bytes)
+                if entry.dtype != "U32" { floating[modality, default: []].insert(entry.dtype) }
             }
             guard try FileIdentity(url) == identity else {
                 throw EmbeddingGemma2Error.invalidWeights(
@@ -139,15 +121,27 @@ final class EmbeddingGemma2WeightStore {
             throw EmbeddingGemma2Error.invalidWeights(
                 "safetensors index does not match shard headers")
         }
-        tensors = found
         fileIdentities = identities
+        floatingDTypes = floating
         resources = EmbeddingGemma2Resources(
             checkpointBytes: total,
             weightBytesByModality: byModality, maximumTokens: limits.maximumTokens)
-        // These modules are lazy shape descriptors; validation does not evaluate random weights.
-        try validate(EmbeddingGemma2TextComponent(configuration), modality: .text)
-        try validate(EmbeddingGemma2VisionComponent(configuration), modality: .vision)
-        try validate(EmbeddingGemma2AudioComponent(configuration), modality: .audio)
+    }
+
+    /// Whether every floating tensor already has the dtype of `precision`.
+    func stores(_ precision: EmbeddingGemma2Precision) -> Bool {
+        let expected = precision == .bfloat16 ? "BF16" : "F32"
+        return floatingDTypes.values.allSatisfy { $0.isSubset(of: [expected]) }
+    }
+
+    /// Throws if a checkpoint file changed since the container loaded.
+    func verifyFiles() throws {
+        for (url, expected) in fileIdentities {
+            guard try FileIdentity(url) == expected else {
+                throw EmbeddingGemma2Error.invalidWeights(
+                    "checkpoint changed; reload the embedding container")
+            }
+        }
     }
 
     private static func files(_ directory: URL) throws -> (urls: [URL], index: Index?) {
@@ -237,112 +231,14 @@ final class EmbeddingGemma2WeightStore {
         return name
     }
 
-    private static func canonicalShape(_ shape: [Int], name: String) -> [Int] {
-        if name.contains("subsample_conv_projection"), name.hasSuffix("conv.weight"),
-            shape.count == 4
-        {
-            let channels = name.contains(".layer0.") ? 1 : 128
-            if shape[3] != channels { return [shape[0], shape[2], shape[3], shape[1]] }
-        }
-        if name.hasSuffix("depthwise_conv1d.weight"), shape.count == 3, shape[2] != 1 {
-            return [shape[0], shape[2], shape[1]]
-        }
-        return shape
-    }
-
     private static func modality(_ name: String) throws -> EmbeddingGemma2Modality {
-        if name.hasPrefix("language_model.") { return .text }
+        let text = [
+            "language_model.", "embed_tokens.", "embedding_projection.", "ple.", "layers.",
+            "norm.",
+        ]
+        if text.contains(where: name.hasPrefix) { return .text }
         if name.hasPrefix("vision_tower.") || name.hasPrefix("embed_vision.") { return .vision }
         if name.hasPrefix("audio_tower.") || name.hasPrefix("embed_audio.") { return .audio }
         throw EmbeddingGemma2Error.invalidWeights("unexpected tensor \(name)")
-    }
-
-    private func selected(_ modality: EmbeddingGemma2Modality) -> [String: Tensor] {
-        tensors.filter { (try? Self.modality($0.key)) == modality }
-    }
-
-    private func configureQuantization(_ module: Module) throws {
-        for path in module.leafModules().flattened().map({ $0.0 })
-        where tensors["\(path).scales"] != nil {
-            guard quantizationForPath(path) != nil
-            else {
-                throw EmbeddingGemma2Error.invalidWeights(
-                    "missing quantization configuration for \(path)")
-            }
-        }
-        quantize(model: module) { path, _ in
-            guard self.tensors["\(path).scales"] != nil else { return nil }
-            return self.quantizationForPath(path)?.asTuple
-        }
-    }
-
-    private func quantizationForPath(_ path: String) -> BaseConfiguration.Quantization? {
-        guard let quantization else { return nil }
-        if quantization.perLayerQuantization[path] != nil {
-            return quantization.quantization(layer: path)
-        }
-        if quantization.perLayerQuantization["model.\(path)"] != nil {
-            return quantization.quantization(layer: "model.\(path)")
-        }
-        return quantization.quantization
-    }
-
-    private func validate(_ module: Module, modality: EmbeddingGemma2Modality) throws {
-        try configureQuantization(module)
-        let expected = Dictionary(uniqueKeysWithValues: module.parameters().flattened())
-        let provided = selected(modality)
-        let missing = Set(expected.keys).subtracting(provided.keys).sorted()
-        let extra = Set(provided.keys).subtracting(expected.keys).sorted()
-        guard missing.isEmpty, extra.isEmpty else {
-            throw EmbeddingGemma2Error.invalidWeights(
-                "\(modality.rawValue): missing \(missing), unused \(extra)")
-        }
-        for (name, parameter) in expected {
-            guard let tensor = provided[name], parameter.shape == tensor.shape,
-                (parameter.dtype == .uint32) == (tensor.dtype == "U32")
-            else {
-                throw EmbeddingGemma2Error.invalidWeights(
-                    "shape or packed dtype mismatch at \(name)")
-            }
-        }
-    }
-
-    func load(_ module: Module, modality: EmbeddingGemma2Modality) throws {
-        try configureQuantization(module)
-        let selected = selected(modality)
-        var weights = [String: MLXArray]()
-        let urls = Set(selected.values.map(\.url)).sorted(by: { $0.path < $1.path })
-        for url in urls {
-            try Task.checkCancellation()
-            try verifyFile(url)
-            // MLX reads tensor payloads lazily; unloaded towers never get evaluated.
-            let (arrays, _) = try loadArraysAndMetadata(url: url, stream: .cpu)
-            for tensor in selected.values where tensor.url == url {
-                guard var array = arrays[tensor.rawName] else {
-                    throw EmbeddingGemma2Error.invalidWeights("missing tensor \(tensor.rawName)")
-                }
-                guard [.bfloat16, .float32, .uint32].contains(array.dtype) else {
-                    throw EmbeddingGemma2Error.invalidWeights(
-                        "checkpoint dtype changed at \(tensor.rawName)")
-                }
-                if array.shape != tensor.shape {
-                    array =
-                        array.ndim == 4 ? array.transposed(0, 2, 3, 1) : array.transposed(0, 2, 1)
-                }
-                if array.dtype != .uint32 { array = array.asType(precision.dtype) }
-                weights[tensor.name] = array
-            }
-        }
-        try module.update(parameters: ModuleParameters.unflattened(weights), verify: .all)
-        module.train(false)
-        try checkedEval(module)
-        for url in urls { try verifyFile(url) }
-    }
-
-    private func verifyFile(_ url: URL) throws {
-        guard let expected = fileIdentities[url], try FileIdentity(url) == expected else {
-            throw EmbeddingGemma2Error.invalidWeights(
-                "checkpoint changed; reload the embedding container")
-        }
     }
 }

@@ -51,9 +51,11 @@ class LlamaAttention: Module {
         var values = wv(x)
 
         // Prepare the queries, keys and values for the attention computation
-        queries = queries.reshaped(B, L, args.attentionHeads, -1).transposed(0, 2, 1, 3)
-        keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        // the head count comes from the projection, so a tensor-parallel shard works too
+        let headDim = args.resolvedHeadDimensions
+        queries = queries.reshaped(B, L, -1, headDim).transposed(0, 2, 1, 3)
+        keys = keys.reshaped(B, L, -1, headDim).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, -1, headDim).transposed(0, 2, 1, 3)
 
         let offset = cache?.ropeOffset
         queries = applyRotaryPosition(rope, to: queries, offset: offset)
@@ -153,11 +155,12 @@ public class LlamaModelInner: Module {
 public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider, ScheduledTextModel {
 
     public let vocabularySize: Int
-    public let kvHeads: [Int]
+    public private(set) var kvHeads: [Int]
+    public private(set) var tensorParallelGroup: MLXDistributed.Group?
 
     public var scheduledCacheBytesPerToken: Int {
-        configuration.hiddenLayers * configuration.kvHeads * configuration.resolvedHeadDimensions
-            * 8
+        configuration.hiddenLayers * (kvHeads.first ?? configuration.kvHeads)
+            * configuration.resolvedHeadDimensions * 8
     }
 
     public nonisolated(nonsending) func scheduledForward(
@@ -352,6 +355,28 @@ public struct LlamaConfiguration: Codable, Sendable {
                     debugDescription: "rope_scaling must contain either 'type' or 'rope_type'")
             }
         }
+    }
+}
+
+// MARK: - Tensor parallelism
+
+extension LlamaModel: ShardableModel {
+    public func shard(group: MLXDistributed.Group) throws {
+        try validateHeadSharding(
+            heads: configuration.attentionHeads, kvHeads: configuration.kvHeads, group: group)
+        for layer in model.layers {
+            try shardLinears(
+                in: layer.attention, group: group,
+                [
+                    "q_proj": .allToSharded, "k_proj": .allToSharded, "v_proj": .allToSharded,
+                    "o_proj": .shardedToAll,
+                ])
+            try shardLinears(
+                in: layer.mlp, group: group,
+                ["gate_proj": .allToSharded, "up_proj": .allToSharded, "down_proj": .shardedToAll])
+        }
+        kvHeads = kvHeads.map { $0 / group.size }
+        tensorParallelGroup = group
     }
 }
 

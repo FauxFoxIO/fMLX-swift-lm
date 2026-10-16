@@ -10,6 +10,8 @@ MLX Swift LM is a Swift package to build tools and applications with large langu
 > [!IMPORTANT]
 > We use `swift-format` to keep the code formatting consistent.  CI has this pinned to `603.0.0` right now. 
 
+[View Current Release Planning](https://github.com/ml-explore/mlx-swift-lm/issues?q=is%3Aissue+is%3Aopen+label%3Arelease-planning) and read about [Contributing](#contributing).
+
 Some key features include:
 
 - Model loading with integrations for a variety of tokenizer and model downloading packages.
@@ -19,10 +21,6 @@ Some key features include:
 For some example applications and tools that use MLX Swift LM, check out [MLX Swift Examples](https://github.com/ml-explore/mlx-swift-examples).
 
 ## Documentation
-
-- [FMLXText: model-specific tokenizer and native runtime pairing](docs/checkpoint-text.md)
-- [Bonsai PTQ1 and DFlash2 native artifacts](docs/bonsai-dflash.md)
-- [Native EmbeddingGemma 2](docs/embeddinggemma2.md)
 
 Developers can use these examples in their own programs -- just import the swift package!
 
@@ -35,6 +33,8 @@ Developers can use these examples in their own programs -- just import the swift
 - [MLXDecision](Libraries/MLXDecision/README.md): Decision models (Liquid d1-omni-600M, Fastino GLiNER2.5-Decide) that answer typed questions with a probability per outcome in one forward pass.
 - [MLXGuidedGeneration](Libraries/MLXGuidedGeneration/README.md): Grammar-constrained generation (JSON Schema or EBNF) for any MLX model.
 - [MLXFoundationModels](Libraries/MLXFoundationModels/README.md): Bridge MLX models into Apple's `FoundationModels.LanguageModel` for use with `LanguageModelSession`. (Requires the macOS/iOS/visionOS 27.0 SDK.)
+- [MLXScriptedLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxscriptedlm): Scripted tokenizers and language models -- good for tests or stubbing out behavior without weights
+
 
 ## Usage
 
@@ -51,7 +51,7 @@ See documentation on [how to integrate mlx-swift-lm and downloaders/tokenizers](
 Add the core package to your `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.3")),
+.package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "3.32.3")),
 ```
 
 Then chose an [integration package for downloaders and tokenizers](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/using#Integration-Packages).
@@ -69,7 +69,7 @@ See also [MLXLMCommon](Libraries/MLXLMCommon). The simplest way to get started i
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.3")),
+    .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "3.32.3")),
     .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
     .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
 ],
@@ -107,7 +107,7 @@ print(try await session.respond(to: "How about a great place to eat?"))
 For alternative integration approaches (custom downloaders, alternative tokenizer packages, local-only weights), see the [using documentation](Libraries/MLXLMCommon/Documentation.docc/using.md).
 
 Applications that need an in-process installed-model catalog, resumable downloads, and persistent
-cache management can use [`FMLXModelManagement`](docs/model-management.md).
+cache management can use `FMLXModelManagement`.
 
 ## `FoundationModels` integration
 
@@ -151,3 +151,9 @@ if #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) {
 Here, we combine `MLXFoundationModels` with [`MLXGuidedGeneration`](Libraries/MLXGuidedGeneration/README.md) by requesting a `@Generable` type: the response is grammar-constrained to that type's schema. `MLXGuidedGeneration` is a standalone primitive that constrains any MLX model's output to a schema.
 
 Other capabilities include `.vision`, `.toolCalling`, and `.reasoning`. See [Libraries/MLXFoundationModels](Libraries/MLXFoundationModels/README.md) for the full capability set, custom weights and loaders, and more information about using MLXFoundationModels.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build, test, and submit changes.
+
+Smaller, focused PRs are easier and quicker to review. Sometimes larger PRs can't be helped. If you want to discuss, feel free to open an issue or ask questions in a PR. If responses are slow, feel free to @ `davidkoski` - there is a lot of activity and it probably just got past me. I will do my best to respond!

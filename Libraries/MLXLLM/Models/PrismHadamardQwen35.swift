@@ -248,7 +248,7 @@ public final class PrismHadamardQwen35Model: Qwen35Model, ModelArtifactPreparing
         }
     }
 
-    public override func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+    public override func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
         if !contracts.isEmpty {
             for record in artifactConfiguration.modules {
                 let key = "language_model.\(record.path).signs"
@@ -264,7 +264,7 @@ public final class PrismHadamardQwen35Model: Qwen35Model, ModelArtifactPreparing
                 }
             }
         }
-        return super.sanitize(weights: weights).filter { !$0.key.hasSuffix(".signs") }
+        return try super.sanitize(weights: weights).filter { !$0.key.hasSuffix(".signs") }
     }
 
     public func prepareLoadedWeights() throws {
