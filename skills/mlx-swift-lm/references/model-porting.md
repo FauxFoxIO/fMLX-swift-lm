@@ -374,6 +374,17 @@ extension YourModel: ShardableModel {
   different order and deadlock. `MLXDistributed.broadcast` keeps this property.
 - Generate with `TensorParallelGenerator` (rank 0 leads, others follow); launch ranks with
   `scripts/fmlx-launch.py`. `ConcurrentTextRuntime` rejects sharded models.
+- Absorbed MLA (`GLMMoEDSAModel`): shard `q_b_proj` and the per-head `embed_q` / `unembed_out`
+  by head (axis 0, with `shardInPlace(_:predicate:group:)`). Keep `q_a_proj`, the KV latent and
+  the DSA indexer whole, so every rank selects the same keys.
+- A norm that runs per expert output (Muse's post-expert norm) is not linear, so sum the
+  expert shards before it, not after the combine.
+- Follow the Python `shard()` for the LM head. Muse splits it by vocabulary and gathers the
+  logits (`allGather`) before the soft cap; most models keep it whole.
+- Shard an MTP drafter like the target layers (conform it to `ShardableModel` and load it
+  with the same group), then pass it to `TensorParallelGenerator(model:drafter:)`.
+  `MTPSpeculativeTokenIterator` takes rank 0's drafts, accepted count and final token every
+  round, so all ranks run the same forwards.
 
 ## Compiled decode paths
 

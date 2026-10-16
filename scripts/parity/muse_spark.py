@@ -10,8 +10,12 @@ Writes three fixtures that share one set of random weights:
 
 The layers alternate sliding (RoPE) and full (NoPE) attention. The prompt is longer than the
 sliding window.
+
+With `--tensor-parallel`, writes only `muse_spark_nvfp4_tp`: the nvfp4 fixture with a routed
+hidden width of 64, so each of two ranks holds whole 16-wide nvfp4 groups of `w2`.
 """
 
+import argparse
 import json
 from pathlib import Path
 
@@ -30,7 +34,11 @@ VOCAB = 128
 EXPERTS = 8
 TOP_K = 3
 EXPERT_DIM = 32
-EXPERT_HIDDEN = 48
+parser = argparse.ArgumentParser()
+parser.add_argument("--tensor-parallel", action="store_true")
+TENSOR_PARALLEL = parser.parse_args().tensor_parallel
+
+EXPERT_HIDDEN = 64 if TENSOR_PARALLEL else 48
 WINDOW = 4
 ROPE_THETA = 10000.0
 SOFT_CAP = 4.0
@@ -266,7 +274,7 @@ def to_hf(weights):
 
 
 # Pick weights whose routing is far from ties in both references.
-for seed in range(100):
+for seed in range(1000 if TENSOR_PARALLEL else 100):
     raw = make_raw(seed)
     margins = (
         routing_margin(build_model(raw)),
@@ -278,9 +286,10 @@ else:
     raise RuntimeError("no seed with a clear routing margin")
 print(f"seed {seed}: routing margins {margins[0]:.4f} (bf16) {margins[1]:.4f} (nvfp4)")
 
-logits = run(build_model(raw))
-write("muse_spark_meta", meta_config, raw, logits)
-write("muse_spark_hf", hf_config, to_hf(raw), logits)
+if not TENSOR_PARALLEL:
+    logits = run(build_model(raw))
+    write("muse_spark_meta", meta_config, raw, logits)
+    write("muse_spark_hf", hf_config, to_hf(raw), logits)
 
 # Meta's NVFP4 checkpoint layout: packed uint8 weights, e4m3 block scales, and the global
 # scale stored divided by 6 * 448.
@@ -305,4 +314,6 @@ for i in range(1, LAYERS - 1):
     nvfp4[p + "w13_input_scale"] = mx.ones((EXPERTS, 2), dtype=mx.float32)
     nvfp4[p + "w2_input_scale"] = mx.ones((EXPERTS,), dtype=mx.float32)
 assert any("global_scale" in k for k, _ in tree_flatten(model.parameters()))
-write("muse_spark_nvfp4", meta_config, nvfp4, run(model))
+write(
+    "muse_spark_nvfp4_tp" if TENSOR_PARALLEL else "muse_spark_nvfp4", meta_config, nvfp4, run(model)
+)

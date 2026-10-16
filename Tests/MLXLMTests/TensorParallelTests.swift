@@ -92,6 +92,45 @@ enum TensorParallelFixture: String, CaseIterable, Codable {
     }
 }
 
+/// Parity fixtures from `scripts/parity` whose heads and expert widths split across two ranks.
+enum TensorParallelParityFixture: String, CaseIterable, Codable {
+    case glmMoEDSA = "glm_moe_dsa"
+    case museSparkMeta = "muse_spark_meta"
+    case museSparkNVFP4 = "muse_spark_nvfp4_tp"
+
+    var hasMTP: Bool { self == .glmMoEDSA }
+
+    /// mlx-lm's two-rank sharded logits and greedy tokens, from `scripts/parity/muse_spark_tp.py`.
+    ///
+    /// Muse runs its branches in bf16, and a sharded layer sums bf16 partial products. On these
+    /// tiny fixtures that rounding moves near-tied expert choices, so the sharded model is
+    /// compared with mlx-lm's sharded model rather than with the unsharded one. GLM runs in
+    /// float32 and is compared with the unsharded model.
+    func shardedReference() throws -> (logits: MLXArray, greedy: [Int])? {
+        let url = try ParityFixture(rawValue).directory
+            .appending(component: "expected_tp2.safetensors")
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let arrays = try loadArrays(url: url)
+        guard let logits = arrays["logits"], let greedy = arrays["greedy"] else {
+            throw ParityFixtureError.missing("\(rawValue)/expected_tp2.safetensors")
+        }
+        return (logits, greedy[0].asArray(Int.self))
+    }
+
+    func loadModel(group: MLXDistributed.Group?) async throws -> any LanguageModel {
+        let fixture = try ParityFixture(rawValue)
+        guard let group else { return try await fixture.loadLanguageModel() }
+        let data = try Data(contentsOf: fixture.directory.appending(component: "config.json"))
+        let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
+        let model = try await LLMTypeRegistry.shared.createModel(
+            configuration: data, modelType: base.modelType)
+        try await loadWeights(
+            modelDirectory: fixture.directory, model: model, tensorParallelGroup: group,
+            perLayerQuantization: base.perLayerQuantization)
+        return model
+    }
+}
+
 /// What one rank observed, written for the launching test to compare across ranks.
 struct TensorParallelRankReport: Codable {
     struct FixtureReport: Codable {
@@ -102,9 +141,39 @@ struct TensorParallelRankReport: Codable {
         var sampled: [Int]
     }
 
+    struct ParityReport: Codable {
+        var fixture: TensorParallelParityFixture
+        /// Against mlx-lm's sharded logits when the fixture has them, else the unsharded model.
+        var maxLogitDifference: Float
+        var unshardedLogitDifference: Float
+        /// mlx-lm's sharded greedy tokens when the fixture has them, else the unsharded model's.
+        var referenceGreedy: [Int]
+        var shardedGreedy: [Int]
+        var sampled: [Int]
+        var mtp: MTPReport?
+    }
+
+    struct MTPReport: Codable {
+        /// Sharded against unsharded MTP head logits on the target's hidden states.
+        var maxHeadLogitDifference: Float
+        var greedy: [Int]
+        var proposed: Int
+        var accepted: Int
+        var passthroughReason: String?
+        var generatorGreedy: [Int]
+        var generatorSampled: [Int]
+        /// With a head that agrees with the target, so that rounds accept drafts.
+        var agreeingExpected: [Int]
+        var agreeingGreedy: [Int]
+        var agreeingProposed: Int
+        var agreeingAccepted: Int
+        var agreeingSampled: [Int]
+    }
+
     var rank: Int
     var size: Int
     var fixtures: [FixtureReport]
+    var parity: [ParityReport] = []
 }
 
 /// Prompt long enough that the MoE sorts its 2 x 40 expert assignments.
@@ -180,9 +249,170 @@ final class TensorParallelRankTests: XCTestCase {
                     sampled: sampledTokens))
         }
 
+        for fixture in TensorParallelParityFixture.allCases {
+            log("\(fixture): load")
+            report.parity.append(try await runParity(fixture, group: group))
+        }
+
         let url = URL(fileURLWithPath: resultDirectory)
             .appendingPathComponent("rank-\(group.rank).json")
         try JSONEncoder().encode(report).write(to: url)
+    }
+}
+
+extension TensorParallelRankTests {
+    /// Runs on every rank in the same order, since the sharded model communicates.
+    fileprivate func runParity(
+        _ fixture: TensorParallelParityFixture, group: MLXDistributed.Group
+    ) async throws -> TensorParallelRankReport.ParityReport {
+        let parity = try ParityFixture(fixture.rawValue)
+        let reference = try await fixture.loadModel(group: nil)
+        let sharded = try await fixture.loadModel(group: group)
+        XCTAssertTrue((sharded as? any ShardableModel)?.tensorParallelGroup === group)
+
+        let logits = sharded(parity.inputIDs, cache: nil).asType(.float32)
+        let unshardedDifference = abs(
+            reference(parity.inputIDs, cache: nil).asType(.float32) - logits
+        ).max().item(Float.self)
+
+        let prompt = parity.inputIDs[0].asArray(Int.self)
+        var difference = unshardedDifference
+        var referenceGreedy = [Int]()
+        if let shardedReference = try fixture.shardedReference() {
+            difference = abs(shardedReference.logits - logits).max().item(Float.self)
+            referenceGreedy = shardedReference.greedy
+        } else {
+            var iterator = try TokenIterator(
+                input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })), model: reference,
+                parameters: GenerateParameters(maxTokens: 12, temperature: 0))
+            while let token = iterator.next() {
+                referenceGreedy.append(token)
+            }
+        }
+
+        let greedy = TensorParallelGenerationRequest(promptTokens: prompt, maxTokens: 12)
+        let sampled = TensorParallelGenerationRequest(
+            promptTokens: prompt, maxTokens: 12, temperature: 1)
+        let (shardedGreedy, sampledTokens) = try generate(
+            TensorParallelGenerator(model: sharded), greedy, sampled)
+
+        var mtp: TensorParallelRankReport.MTPReport?
+        if fixture.hasMTP, let target = sharded as? GLMMoEDSAModel,
+            let referenceTarget = reference as? GLMMoEDSAModel
+        {
+            mtp = try await runMTP(
+                parity, target: target, referenceTarget: referenceTarget, prompt: prompt,
+                greedy: greedy, sampled: sampled, group: group)
+        }
+        return .init(
+            fixture: fixture, maxLogitDifference: difference,
+            unshardedLogitDifference: unshardedDifference, referenceGreedy: referenceGreedy,
+            shardedGreedy: shardedGreedy, sampled: sampledTokens, mtp: mtp)
+    }
+
+    private func runMTP(
+        _ parity: ParityFixture, target: GLMMoEDSAModel, referenceTarget: GLMMoEDSAModel,
+        prompt: [Int], greedy: TensorParallelGenerationRequest,
+        sampled: TensorParallelGenerationRequest, group: MLXDistributed.Group
+    ) async throws -> TensorParallelRankReport.MTPReport {
+        let loadedReference = try await GLMMoEDSAMTPDraftModel.load(directory: parity.directory)
+        let referenceDrafter = try XCTUnwrap(loadedReference)
+        let loaded = try await GLMMoEDSAMTPDraftModel.load(
+            directory: parity.directory, tensorParallelGroup: group)
+        let drafter = try XCTUnwrap(loaded)
+        XCTAssertTrue(drafter.tensorParallelGroup === group)
+
+        // The head on the same hidden states, sharded and not.
+        var state = LMOutput.State()
+        state[mtpEmitFlagKey] = true
+        let hidden = try XCTUnwrap(
+            referenceTarget(LMInput.Text(tokens: parity.inputIDs), cache: nil, state: state)
+                .state?[mtpLastHiddenStatesKey])
+        let embeddings = referenceTarget.mtpEmbedding(parity.inputIDs)
+        let expected = referenceTarget.lmHead(
+            referenceDrafter(inputEmbeddings: embeddings, hidden: hidden, cache: KVCacheSimple()))
+        let actual = target.lmHead(
+            drafter(inputEmbeddings: embeddings, hidden: hidden, cache: KVCacheSimple()))
+        let headDifference = abs(expected - actual).max().item(Float.self)
+
+        var speculative = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })), mainModel: target,
+            drafter: drafter, parameters: greedy.generateParameters, blockSize: 3)
+        var speculativeGreedy = [Int]()
+        while let token = speculative.next() {
+            speculativeGreedy.append(token)
+        }
+
+        let (generatorGreedy, generatorSampled) = try generate(
+            TensorParallelGenerator(model: target, drafter: drafter, draftBlockSize: 3),
+            greedy, sampled)
+
+        makeBigram(referenceTarget, drafter: referenceDrafter)
+        makeBigram(target, drafter: drafter)
+        var baseline = try TokenIterator(
+            input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })), model: referenceTarget,
+            parameters: greedy.generateParameters)
+        var agreeingExpected = [Int]()
+        while let token = baseline.next() {
+            agreeingExpected.append(token)
+        }
+        var agreeing = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray(prompt.map { Int32($0) })), mainModel: target,
+            drafter: drafter, parameters: greedy.generateParameters, blockSize: 4)
+        var agreeingGreedy = [Int]()
+        while let token = agreeing.next() {
+            agreeingGreedy.append(token)
+        }
+        let (_, agreeingSampled) = try generate(
+            TensorParallelGenerator(model: target, drafter: drafter, draftBlockSize: 4),
+            greedy, sampled)
+
+        return .init(
+            maxHeadLogitDifference: headDifference, greedy: speculativeGreedy,
+            proposed: speculative.proposedCount, accepted: speculative.acceptedCount,
+            passthroughReason: speculative.passthroughReason, generatorGreedy: generatorGreedy,
+            generatorSampled: generatorSampled, agreeingExpected: agreeingExpected,
+            agreeingGreedy: agreeingGreedy, agreeingProposed: agreeing.proposedCount,
+            agreeingAccepted: agreeing.acceptedCount, agreeingSampled: agreeingSampled)
+    }
+
+    /// As `GLMMoEDSAMTPTests`: the target predicts from the current token only, and the MTP
+    /// head becomes the same function of its input token.
+    private func makeBigram(_ model: GLMMoEDSAModel, drafter: GLMMoEDSAMTPDraftModel) {
+        func zeroOutputs(_ module: Module) {
+            let zeroed = module.parameters().flattened().compactMap { key, value in
+                key.hasSuffix("o_proj.weight") || key.hasSuffix("down_proj.weight")
+                    ? (key, MLXArray.zeros(like: value)) : nil
+            }
+            module.update(parameters: ModuleParameters.unflattened(zeroed))
+        }
+        zeroOutputs(model)
+        zeroOutputs(drafter)
+        let hidden = model.configuration.hiddenSize
+        drafter.update(
+            parameters: ModuleParameters.unflattened([
+                "eh_proj.weight": concatenated(
+                    [MLXArray.eye(hidden), MLXArray.zeros([hidden, hidden])], axis: 1),
+                "enorm.weight": MLXArray.ones([hidden]),
+                "shared_head.norm.weight": model.model.norm.weight,
+            ]))
+        eval(model, drafter)
+    }
+
+    /// Rank 0 leads both requests; the others follow.
+    private func generate(
+        _ generator: TensorParallelGenerator, _ first: TensorParallelGenerationRequest,
+        _ second: TensorParallelGenerationRequest
+    ) throws -> ([Int], [Int]) {
+        if generator.isLeader {
+            let tokens = (try generator.generate(first), try generator.generate(second))
+            try generator.shutdown()
+            return tokens
+        }
+        var results = [[Int]]()
+        try generator.followRequests { _, tokens in results.append(tokens) }
+        XCTAssertEqual(results.count, 2)
+        return (results.first ?? [], results.last ?? [])
     }
 }
 
@@ -209,6 +439,38 @@ final class TensorParallelTests: XCTestCase {
         }
     }
 
+    /// Shards the parity fixtures across a group of one, which must change nothing.
+    func testParityFixturesShardAcrossOneRank() async throws {
+        let group = try MLXDistributed.initialize(backend: .ring, strict: false)
+        XCTAssertEqual(group.size, 1)
+
+        for fixture in TensorParallelParityFixture.allCases {
+            let parity = try ParityFixture(fixture.rawValue)
+            let reference = try await fixture.loadModel(group: nil)
+            let sharded = try await fixture.loadModel(group: nil)
+            try XCTUnwrap(sharded as? any ShardableModel).shard(group: group)
+            XCTAssertTrue(
+                allClose(
+                    reference(parity.inputIDs, cache: nil), sharded(parity.inputIDs, cache: nil)
+                )
+                .item(Bool.self),
+                "\(fixture)")
+        }
+
+        let parity = try ParityFixture(TensorParallelParityFixture.glmMoEDSA.rawValue)
+        let loadedDrafter = try await GLMMoEDSAMTPDraftModel.load(directory: parity.directory)
+        let loadedReference = try await GLMMoEDSAMTPDraftModel.load(directory: parity.directory)
+        let drafter = try XCTUnwrap(loadedDrafter)
+        let reference = try XCTUnwrap(loadedReference)
+        try drafter.shard(group: group)
+        let tokens = MLXArray.zeros([1, 4, 32])
+        XCTAssertTrue(
+            allClose(
+                reference(inputEmbeddings: tokens, hidden: tokens + 1, cache: KVCacheSimple()),
+                drafter(inputEmbeddings: tokens, hidden: tokens + 1, cache: KVCacheSimple())
+            ).item(Bool.self))
+    }
+
     func testRequestRoundTripsThroughJSON() throws {
         let request = TensorParallelGenerationRequest(
             promptTokens: [1, 2, 3], maxTokens: 9, temperature: 0.7, topP: 0.9, seed: 5,
@@ -221,7 +483,8 @@ final class TensorParallelTests: XCTestCase {
     }
 
     /// Starts two copies of ``TensorParallelRankTests/testRank()`` over the ring backend on
-    /// localhost, then compares what each rank saw.
+    /// localhost, then compares what each rank saw. Muse fixtures compare with mlx-lm's sharded
+    /// model instead of the unsharded one (see ``TensorParallelParityFixture``).
     func testTwoRanksOverRingBackendMatchUnshardedModel() throws {
         let environment = ProcessInfo.processInfo.environment
         guard environment["FMLX_TP_RESULT_DIR"] == nil else {
@@ -299,6 +562,54 @@ final class TensorParallelTests: XCTestCase {
                 "tensor parallel \(name): max |logit diff| rank0=\(leader.maxLogitDifference) "
                     + "rank1=\(follower.maxLogitDifference) greedy=\(leader.shardedGreedy) "
                     + "sampled=\(leader.sampled)")
+        }
+
+        XCTAssertEqual(
+            reports.map { $0.parity.map(\.fixture) },
+            Array(repeating: TensorParallelParityFixture.allCases, count: 2))
+        for (leader, follower) in zip(reports[0].parity, reports[1].parity) {
+            let name = leader.fixture.rawValue
+            for report in [leader, follower] {
+                XCTAssertLessThan(report.maxLogitDifference, 1e-4, name)
+                XCTAssertEqual(report.shardedGreedy, report.referenceGreedy, name)
+            }
+            XCTAssertEqual(leader.referenceGreedy.count, 12, name)
+            XCTAssertEqual(leader.sampled.count, 12, name)
+            XCTAssertEqual(follower.sampled, leader.sampled, name)
+            print(
+                "tensor parallel \(name): max |logit diff| rank0=\(leader.maxLogitDifference) "
+                    + "rank1=\(follower.maxLogitDifference) "
+                    + "(unsharded \(leader.unshardedLogitDifference)) "
+                    + "greedy=\(leader.shardedGreedy) sampled=\(leader.sampled)")
+
+            guard leader.fixture.hasMTP else { continue }
+            let mtp = try XCTUnwrap(leader.mtp, name)
+            let followerMTP = try XCTUnwrap(follower.mtp, name)
+            for report in [mtp, followerMTP] {
+                XCTAssertLessThan(report.maxHeadLogitDifference, 1e-4, name)
+                XCTAssertEqual(report.greedy, leader.referenceGreedy, name)
+                XCTAssertEqual(report.generatorGreedy, leader.referenceGreedy, name)
+                XCTAssertNil(report.passthroughReason, name)
+                XCTAssertGreaterThan(report.proposed, 0, name)
+            }
+            XCTAssertEqual(followerMTP.accepted, mtp.accepted, name)
+            XCTAssertEqual(followerMTP.proposed, mtp.proposed, name)
+            XCTAssertEqual(mtp.generatorSampled.count, 12, name)
+            XCTAssertEqual(followerMTP.generatorSampled, mtp.generatorSampled, name)
+            for report in [mtp, followerMTP] {
+                XCTAssertEqual(report.agreeingGreedy, report.agreeingExpected, name)
+                XCTAssertGreaterThanOrEqual(
+                    report.agreeingAccepted * 10, report.agreeingProposed * 9)
+            }
+            XCTAssertEqual(followerMTP.agreeingAccepted, mtp.agreeingAccepted, name)
+            XCTAssertEqual(mtp.agreeingSampled.count, 12, name)
+            XCTAssertEqual(followerMTP.agreeingSampled, mtp.agreeingSampled, name)
+            print(
+                "tensor parallel \(name) MTP: head |logit diff| rank0=\(mtp.maxHeadLogitDifference) "
+                    + "rank1=\(followerMTP.maxHeadLogitDifference) greedy=\(mtp.greedy) "
+                    + "accepted \(mtp.accepted)/\(mtp.proposed) sampled=\(mtp.generatorSampled); "
+                    + "agreeing head accepted \(mtp.agreeingAccepted)/\(mtp.agreeingProposed) "
+                    + "sampled=\(mtp.agreeingSampled)")
         }
     }
 }
