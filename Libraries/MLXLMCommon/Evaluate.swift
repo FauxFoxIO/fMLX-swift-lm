@@ -974,6 +974,9 @@ public struct TokenIterator: TokenIteratorProtocol {
     let logProbabilityTopK: Int?
     private var deferredLogProbabilities: DeferredTokenLogProbabilities?
 
+    /// Rank 0's sampled token replaces every rank's own when the model is sharded.
+    private let tokenBroadcastGroup: MLXDistributed.Group?
+
     /// Log probabilities for the token returned by the most recent ``next()`` call.
     public private(set) var lastLogProbabilities: DeferredTokenLogProbabilities?
 
@@ -1063,6 +1066,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.sampler = parameters.sampler()
         self.logProbabilityTopK = parameters.logProbabilities.map { Swift.max($0, 0) }
         self.maxTokens = parameters.maxTokens
+        self.tokenBroadcastGroup = tensorParallelTokenGroup(of: model)
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, prefill: parameters.prefill)
@@ -1098,6 +1102,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.sampler = sampler
         self.logProbabilityTopK = nil
         self.maxTokens = maxTokens
+        self.tokenBroadcastGroup = tensorParallelTokenGroup(of: model)
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, prefill: prefill)
@@ -1165,7 +1170,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         logits = processor?.process(logits: logits) ?? logits
 
         // Filtered sampling already normalizes logits, so reuse that distribution.
-        let y: MLXArray
+        var y: MLXArray
         if let logProbabilityTopK {
             let distribution = LogProbabilityDistribution(logits: logits)
             if let sampler = sampler as? TopPSampler {
@@ -1175,16 +1180,24 @@ public struct TokenIterator: TokenIteratorProtocol {
             } else {
                 y = sampler.sample(logits: logits)
             }
+            y = broadcastSampledToken(y)
             self.deferredLogProbabilities = distribution.recording(
                 token: y, topK: logProbabilityTopK)
         } else {
             self.deferredLogProbabilities = nil
-            y = sampler.sample(logits: logits)
+            y = broadcastSampledToken(sampler.sample(logits: logits))
         }
 
         processor?.didSample(token: y)
 
         return y
+    }
+
+    /// Every rank continues with rank 0's token, so ranks agree even when sampling is not
+    /// seeded identically. The broadcast is lazy and stays inside the `asyncEval` pipeline.
+    private func broadcastSampledToken(_ token: MLXArray) -> MLXArray {
+        guard let tokenBroadcastGroup else { return token }
+        return MLXDistributed.broadcast(token, group: tokenBroadcastGroup)
     }
 
     private func evaluateTokenAndLogProbabilities(_ token: MLXArray) {
