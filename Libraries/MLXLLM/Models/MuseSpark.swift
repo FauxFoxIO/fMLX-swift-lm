@@ -380,8 +380,9 @@ private func museNormAdd(
 // MARK: - Attention
 
 final class MuseSparkAttention: Module {
-    let heads: Int
-    let kvHeads: Int
+    /// Heads on this rank.
+    var heads: Int
+    var kvHeads: Int
     let headDim: Int
     let scale: Float
     let queryScale: Float
@@ -471,6 +472,9 @@ final class MuseSparkMoE: Module {
     @ModuleInfo(key: "post_expert_norm") var postExpertNorm: RMSNorm
     @ModuleInfo var unpooler: Linear
 
+    /// Set when the experts are sharded; their outputs are summed before the post-expert norm.
+    var shardingGroup: MLXDistributed.Group?
+
     init(_ config: MuseSparkConfiguration) {
         topK = config.numExpertsPerToken
         routerMultiplier = config.outputMultiplier
@@ -508,7 +512,11 @@ final class MuseSparkMoE: Module {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, weights) = route(x)
-        let h = switchMLP(preExpertNorm(pooler(x)), indices)
+        var h = switchMLP(preExpertNorm(pooler(x)), indices)
+        if let shardingGroup {
+            // The norm below is per expert, so the partial sums meet before it.
+            h = MLXDistributed.allSum(h, group: shardingGroup)
+        }
 
         // Norm each expert output, then add them in order, rounding after each add.
         let v = h.asType(.float32) * postExpertNorm.weight.asType(.float32)
@@ -623,8 +631,9 @@ public final class MuseSparkModel: Module, LLMModel, KVCacheDimensionProvider,
     WeightTensorSelecting
 {
     public let vocabularySize: Int
-    public let kvHeads: [Int]
+    public private(set) var kvHeads: [Int]
     public let configuration: MuseSparkConfiguration
+    public private(set) var tensorParallelGroup: MLXDistributed.Group?
 
     @ModuleInfo(key: "model") var model: MuseSparkModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
@@ -645,7 +654,12 @@ public final class MuseSparkModel: Module, LLMModel, KVCacheDimensionProvider,
         if !(lmHead is Quantized) {
             out = out.asType(lmHead.weight.dtype)
         }
-        let logits = lmHead(out).asType(.float32) * configuration.outputMultiplier
+        var logits = lmHead(out)
+        if let tensorParallelGroup {
+            // The head is split by vocabulary; the soft cap applies to the gathered logits.
+            logits = gatherLastAxis(logits, group: tensorParallelGroup)
+        }
+        logits = logits.asType(.float32) * configuration.outputMultiplier
         let cap = configuration.softCap
         return tanh(logits / cap) * cap
     }
@@ -683,6 +697,50 @@ public final class MuseSparkModel: Module, LLMModel, KVCacheDimensionProvider,
             ModelCheckpoint(weights: weights), configuration: configuration
         ).weights
     }
+}
+
+// MARK: - Tensor parallelism
+
+extension MuseSparkModel: ShardableModel {
+    /// Shards as mlx-lm's `muse_spark_open.shard`: attention by heads, the experts in place
+    /// with one sum before the post-expert norm, and the LM head by vocabulary.
+    ///
+    /// The router, the latent `pooler` / `unpooler`, the norms, the residual gates and the
+    /// embedding stay whole. Every layer sums twice per forward (`o_proj` and the experts),
+    /// and the head gathers once.
+    public func shard(group: MLXDistributed.Group) throws {
+        let size = group.size
+        try validateHeadSharding(
+            heads: configuration.attentionHeads, kvHeads: configuration.kvHeads, group: group)
+        guard configuration.vocabularySize % size == 0 else {
+            throw TensorParallelError.indivisible(
+                name: "vocabulary", dimension: configuration.vocabularySize, groupSize: size)
+        }
+        for layer in model.layers {
+            let attention = layer.selfAttention
+            try shardLinears(
+                in: attention, group: group,
+                [
+                    "q_proj": .allToSharded, "k_proj": .allToSharded, "v_proj": .allToSharded,
+                    "o_gate_proj": .allToSharded, "o_proj": .shardedToAll,
+                ])
+            attention.heads /= size
+            attention.kvHeads /= size
+            try layer.feedForward.switchMLP.shard(group: group)
+            layer.feedForward.shardingGroup = group
+        }
+        try shardLinears(in: self, group: group, ["lm_head": .allToSharded])
+        kvHeads = kvHeads.map { $0 / size }
+        tensorParallelGroup = group
+    }
+}
+
+/// Gathers the last axis of `x`, which is split across `group` in rank order.
+private func gatherLastAxis(_ x: MLXArray, group: MLXDistributed.Group) -> MLXArray {
+    let (n, width) = (group.size, x.dim(-1))
+    let parts = MLXDistributed.allGather(x.reshaped(-1, width), group: group)
+    return parts.reshaped(n, -1, width).transposed(1, 0, 2)
+        .reshaped(Array(x.shape.dropLast()) + [n * width])
 }
 
 // MARK: - Checkpoint names

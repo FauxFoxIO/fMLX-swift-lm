@@ -18,7 +18,7 @@ import MLXNN
 /// - dense MLP: `gate`/`up` are all-to-sharded, `down` is sharded-to-all
 /// - MoE: every expert is split the same way with ``SwitchGLU/shard(group:)``, and the
 ///   MoE block sums its output across the group once
-/// - embeddings, norms, routers and the LM head stay whole on every rank
+/// - embeddings, norms, routers and (usually) the LM head stay whole on every rank
 ///
 /// Every rank must call ``shard(group:)`` with the same group, and every forward must run on
 /// every rank in the same order, since the sharded layers communicate.
@@ -172,7 +172,19 @@ extension SwitchLinear {
             }
         }
 
-        try shardInPlace(self, sharding: sharding, group: group)
+        // As shardInPlace(_:sharding:), but the per-expert nvfp4 global scale covers every slice.
+        try shardInPlace(
+            self,
+            predicate: { path, weight in
+                if path.hasSuffix("global_scale") { return nil }
+                switch sharding {
+                case .allToSharded:
+                    return path.hasSuffix("bias")
+                        ? (-1, .count(1)) : (Swift.max(weight.ndim - 2, 0), .count(1))
+                case .shardedToAll:
+                    return path.hasSuffix("bias") ? nil : (-1, .count(1))
+                }
+            }, group: group)
 
         switch sharding {
         case .allToSharded:
