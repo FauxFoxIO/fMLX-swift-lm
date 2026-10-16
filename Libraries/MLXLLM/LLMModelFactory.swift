@@ -776,10 +776,11 @@ public final class LLMModelFactory: GenericModelFactory {
             from: configuration.tokenizerDirectory)
 
         try await loadWeights(
-            modelDirectory: modelDirectory, model: model,
+            modelDirectory: modelDirectory, model: model, tensorNameSelection: .all,
             perLayerQuantization: baseConfig.perLayerQuantization,
             weightFileSelection: configuration.weightFileSelection,
-            excludedComponents: configuration.excludedComponents)
+            excludedComponents: configuration.excludedComponents,
+            tensorParallelGroup: configuration.tensorParallelGroup)
 
         let tokenizer = try await tokenizerTask
 
@@ -796,7 +797,7 @@ public final class LLMModelFactory: GenericModelFactory {
             configuration.tokenizerDirectory == modelDirectory
             ? nil
             : .directory(configuration.tokenizerDirectory)
-        let modelConfig = ModelConfiguration(
+        var modelConfig = ModelConfiguration(
             directory: modelDirectory,
             tokenizerSource: tokenizerSource,
             defaultPrompt: configuration.defaultPrompt,
@@ -806,6 +807,7 @@ public final class LLMModelFactory: GenericModelFactory {
             toolCallFormat: mutableConfiguration.toolCallFormat,
             reasoningConfig: mutableConfiguration.reasoningConfig,
             messageGenerator: mutableConfiguration.messageGenerator)
+        modelConfig.tensorParallelGroup = configuration.tensorParallelGroup
 
         let processor = LLMUserInputProcessor(
             tokenizer: tokenizer, configuration: modelConfig,

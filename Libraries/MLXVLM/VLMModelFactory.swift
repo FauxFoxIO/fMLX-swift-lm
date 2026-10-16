@@ -483,10 +483,11 @@ public final class VLMModelFactory: GenericModelFactory {
             registry: processorLoadingRegistry)
 
         try await loadWeights(
-            modelDirectory: modelDirectory, model: model,
+            modelDirectory: modelDirectory, model: model, tensorNameSelection: .all,
             perLayerQuantization: baseConfig.perLayerQuantization,
             weightFileSelection: configuration.weightFileSelection,
-            excludedComponents: configuration.excludedComponents)
+            excludedComponents: configuration.excludedComponents,
+            tensorParallelGroup: configuration.tensorParallelGroup)
 
         let tokenizer = try await tokenizerTask
         let processorConfiguration: VLMProcessorConfiguration

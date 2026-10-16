@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 
 /// A protocol for downloading model repository snapshots to local directories.
 ///
@@ -90,6 +91,12 @@ public struct ResolvedModelConfiguration: Sendable {
     /// - ``ModelConfiguration/excludedComponents``
     public var excludedComponents: Set<ModelComponent>
 
+    /// The group to shard the model across.
+    ///
+    /// ## See Also
+    /// - ``ModelConfiguration/tensorParallelGroup``
+    public var tensorParallelGroup: MLXDistributed.Group?
+
     public init(
         modelDirectory: URL,
         tokenizerDirectory: URL,
@@ -102,7 +109,8 @@ public struct ResolvedModelConfiguration: Sendable {
         reasoningConfig: ReasoningConfig? = nil,
         messageGenerator: (any MessageGenerator)? = nil,
         weightFileSelection: WeightFileSelection = .automatic,
-        excludedComponents: Set<ModelComponent> = []
+        excludedComponents: Set<ModelComponent> = [],
+        tensorParallelGroup: MLXDistributed.Group? = nil
     ) {
         self.modelDirectory = modelDirectory
         self.tokenizerDirectory = tokenizerDirectory
@@ -116,6 +124,7 @@ public struct ResolvedModelConfiguration: Sendable {
         self.messageGenerator = messageGenerator
         self.weightFileSelection = weightFileSelection
         self.excludedComponents = excludedComponents
+        self.tensorParallelGroup = tensorParallelGroup
     }
 }
 

@@ -395,8 +395,9 @@ open class SwitchLinear: Module, Quantizable {
     @ModuleInfo(key: "weight") var weight: MLXArray
     @ModuleInfo(key: "bias") var bias: MLXArray?
 
-    let inputDims: Int
-    let outputDims: Int
+    // var so that tensor-parallel sharding can record this rank's slice
+    var inputDims: Int
+    var outputDims: Int
     let numExperts: Int
 
     public init(inputDims: Int, outputDims: Int, numExperts: Int, bias: Bool = true) {

@@ -1,6 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
 import Foundation
+import MLX
 
 /// Configuration for a given model:  at least an org/name identifier or a directory with the model files.
 ///
@@ -146,6 +147,12 @@ public struct ModelConfiguration: Sendable {
     /// `nil` keeps the model's own default.
     public var messageGenerator: (any MessageGenerator)? = nil
 
+    /// Shard the model across this group when it loads. See ``ShardableModel``.
+    ///
+    /// Every rank in the group must load the same model with the same group. `nil`, or a group
+    /// of one, loads the whole model.
+    public var tensorParallelGroup: MLXDistributed.Group? = nil
+
     public init(
         id: String, revision: String = "main",
         tokenizerSource: TokenizerSource? = nil,
@@ -210,7 +217,8 @@ public struct ModelConfiguration: Sendable {
             reasoningConfig: reasoningConfig,
             messageGenerator: messageGenerator,
             weightFileSelection: weightFileSelection,
-            excludedComponents: excludedComponents)
+            excludedComponents: excludedComponents,
+            tensorParallelGroup: tensorParallelGroup)
     }
 
 }
@@ -230,6 +238,7 @@ extension ModelConfiguration: Equatable {
             && lhs.reasoningConfig == rhs.reasoningConfig
             && lhs.weightFileSelection == rhs.weightFileSelection
             && lhs.excludedComponents == rhs.excludedComponents
+            && lhs.tensorParallelGroup === rhs.tensorParallelGroup
             && sameMessageGenerator(lhs.messageGenerator, rhs.messageGenerator)
     }
 

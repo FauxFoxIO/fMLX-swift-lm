@@ -72,9 +72,10 @@ class Qwen3MoEAttention: Module {
         var values = wv(x)
 
         // prepare the queries, keys and values for the attention computation
-        queries = qNorm(queries.reshaped(B, L, args.attentionHeads, -1)).transposed(0, 2, 1, 3)
-        keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        // the head count comes from the projection, so a tensor-parallel shard works too
+        queries = qNorm(queries.reshaped(B, L, -1, args.headDim)).transposed(0, 2, 1, 3)
+        keys = kNorm(keys.reshaped(B, L, -1, args.headDim)).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, -1, args.headDim).transposed(0, 2, 1, 3)
 
         let offset = cache?.ropeOffset
         queries = applyRotaryPosition(rope, to: queries, offset: offset)
@@ -119,6 +120,9 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
     @ModuleInfo(key: "gate") var gate: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
 
+    /// Set when the experts are sharded; their partial outputs are summed across it.
+    var shardingGroup: MLXDistributed.Group?
+
     init(_ args: Qwen3MoEConfiguration) {
         self.numExperts = args.numExperts
         self.topK = args.numExpertsPerToken
@@ -150,8 +154,11 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
             scores = selected
         }
 
-        let y = switchMLP(x, inds)
-        return weightedExpertSum(y, scores)
+        let y = weightedExpertSum(switchMLP(x, inds), scores)
+        if let shardingGroup {
+            return MLXDistributed.allSum(y, group: shardingGroup)
+        }
+        return y
     }
 }
 
@@ -231,7 +238,8 @@ public class Qwen3MoEModelInner: Module {
 
 public class Qwen3MoEModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
-    public let kvHeads: [Int]
+    public private(set) var kvHeads: [Int]
+    public private(set) var tensorParallelGroup: MLXDistributed.Group?
 
     public let model: Qwen3MoEModelInner
     let configuration: Qwen3MoEConfiguration
@@ -361,6 +369,40 @@ public struct Qwen3MoEConfiguration: Codable, Sendable {
 extension Qwen3MoEConfiguration: ModelConfigurationValidating {
     public func validateModelConfiguration() throws {
         try validateRoPEConfiguration(ropeScaling, context: "Qwen3MoEConfiguration.rope_scaling")
+    }
+}
+
+// MARK: - Tensor parallelism
+
+extension Qwen3MoEModel: ShardableModel {
+    public func shard(group: MLXDistributed.Group) throws {
+        try validateHeadSharding(
+            heads: configuration.attentionHeads, kvHeads: configuration.kvHeads, group: group)
+        for layer in model.layers {
+            try shardLinears(
+                in: layer.selfAttn, group: group,
+                [
+                    "q_proj": .allToSharded, "k_proj": .allToSharded, "v_proj": .allToSharded,
+                    "o_proj": .shardedToAll,
+                ])
+            switch layer.mlp {
+            case let moe as Qwen3MoESparseMoeBlock:
+                // the router stays whole; the block sums the expert shards once
+                try moe.switchMLP.shard(group: group)
+                moe.shardingGroup = group
+            case let mlp as Qwen3MoEMLP:
+                try shardLinears(
+                    in: mlp, group: group,
+                    [
+                        "gate_proj": .allToSharded, "up_proj": .allToSharded,
+                        "down_proj": .shardedToAll,
+                    ])
+            default:
+                throw TensorParallelError.modelNotShardable(String(describing: type(of: layer.mlp)))
+            }
+        }
+        kvHeads = kvHeads.map { $0 / group.size }
+        tensorParallelGroup = group
     }
 }
 

@@ -213,8 +213,11 @@ func loadModelCheckpoint(urls: [URL], excludedNamespaces: [String] = []) throws
     return try loadModelCheckpoint(urls: urls) { exclusions.mapName($0) != nil }
 }
 
-/// Only tensors whose names pass `isRead` are read.
-func loadModelCheckpoint(urls: [URL], isRead: @escaping @Sendable (String) -> Bool) throws
+/// Only tensors whose names pass `isRead` are read. With `materialize` false the arrays stay
+/// lazy, so a tensor-parallel rank can slice them before any bytes are read.
+func loadModelCheckpoint(
+    urls: [URL], materialize: Bool = true, isRead: @escaping @Sendable (String) -> Bool
+) throws
     -> ModelCheckpoint
 {
     struct WorkItem {
@@ -276,7 +279,7 @@ func loadModelCheckpoint(urls: [URL], isRead: @escaping @Sendable (String) -> Bo
                 }
 
                 // force this range's I/O here, on this stream, in file-offset order
-                if !selected.isEmpty { eval(Array(selected.values)) }
+                if materialize, !selected.isEmpty { eval(Array(selected.values)) }
                 state.merge(file: item.file, weights: selected, metadata: metadata)
             }
         } catch {
@@ -512,8 +515,16 @@ package func loadWeights(
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
     weightFileSelection: WeightFileSelection = .automatic,
     excludedComponents: Set<ModelComponent> = [],
-    componentLoading: ComponentLoading = .onFirstUse
+    componentLoading: ComponentLoading = .onFirstUse,
+    tensorParallelGroup: MLXDistributed.Group? = nil
 ) throws {
+    // a group of one runs the unsharded model
+    let shardingGroup = tensorParallelGroup.flatMap { $0.size > 1 ? $0 : nil }
+    let shardable = model as? any ShardableModel
+    if shardingGroup != nil, shardable == nil {
+        throw TensorParallelError.modelNotShardable(String(describing: type(of: model)))
+    }
+
     if let preparing = model as? any ModelArtifactPreparing {
         try preparing.prepareArtifact(in: modelDirectory)
     }
@@ -542,7 +553,9 @@ package func loadWeights(
             loading: componentLoading, perLayerQuantization: perLayerQuantization)
         + model.excludedCheckpointNamespaces
     let exclusions = CheckpointNameMapping(excludedNamespaces.map { .excludePrefix($0) })
-    var checkpoint = try loadModelCheckpoint(urls: weightURLs) {
+    var checkpoint = try loadModelCheckpoint(
+        urls: weightURLs, materialize: shardingGroup == nil
+    ) {
         [effectiveTensorNameSelection] name in
         exclusions.mapName(name) != nil && effectiveTensorNameSelection.contains(name)
     }
@@ -552,6 +565,13 @@ package func loadWeights(
     // Derived fused projections replace their source modules. Drop loader-owned
     // references first so each replaced source can be reclaimed immediately.
     checkpoint.weights.removeAll(keepingCapacity: false)
+
+    if let shardingGroup, let shardable {
+        // Slice the lazy weights, then read them in batches. Each full tensor is freed once
+        // its slice is copied, so a rank never holds the whole model.
+        try shardable.shard(group: shardingGroup)
+        evaluateInBatches(model.parameters().flattened().map(\.1))
+    }
 
     if let preparing = model as? any LoadedWeightsPreparing {
         try preparing.prepareLoadedWeights()
@@ -563,6 +583,11 @@ package func loadWeights(
     // Fused projections replace materialized checkpoint buffers with larger
     // concatenations. Return the retired buffers instead of retaining them in MLX's cache.
     MLX.Memory.clearCache()
+
+    if let shardingGroup {
+        // ranks finish loading at different times; meet before the first collective forward
+        MLXDistributed.barrier(group: shardingGroup)
+    }
 }
 
 /// Quantize the layers `checkpoint` has scales for, then update `module` with strict validation.
@@ -599,6 +624,28 @@ public func loadWeights(
         componentLoading: componentLoading)
 }
 
+/// Load model weights and shard them across a tensor-parallel group.
+///
+/// Every rank in `tensorParallelGroup` calls this with the same checkpoint. The checkpoint is
+/// loaded lazily, the model's ``ShardableModel/shard(group:)`` slices it, and only this
+/// rank's slice is read into memory. A group of size one loads the whole model.
+///
+/// Throws ``TensorParallelError/modelNotShardable(_:)`` when the group has more than one rank
+/// and the model does not conform to ``ShardableModel``.
+public func loadWeights(
+    modelDirectory: URL, model: BaseLanguageModel,
+    tensorParallelGroup: MLXDistributed.Group,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    weightFileSelection: WeightFileSelection = .automatic,
+    excludedComponents: Set<ModelComponent> = []
+) async throws {
+    try await loadWeights(
+        modelDirectory: modelDirectory, model: model, tensorNameSelection: .all,
+        perLayerQuantization: perLayerQuantization,
+        weightFileSelection: weightFileSelection, excludedComponents: excludedComponents,
+        tensorParallelGroup: tensorParallelGroup)
+}
+
 /// Async package-internal variant of the selective weight loader.
 package func loadWeights(
     modelDirectory: URL, model: BaseLanguageModel,
@@ -607,7 +654,8 @@ package func loadWeights(
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
     weightFileSelection: WeightFileSelection = .automatic,
     excludedComponents: Set<ModelComponent> = [],
-    componentLoading: ComponentLoading = .onFirstUse
+    componentLoading: ComponentLoading = .onFirstUse,
+    tensorParallelGroup: MLXDistributed.Group? = nil
 ) async throws {
     let model = SendableBox(model)
     try await withCheckedThrowingContinuation {
@@ -624,7 +672,8 @@ package func loadWeights(
                             perLayerQuantization: perLayerQuantization,
                             weightFileSelection: weightFileSelection,
                             excludedComponents: excludedComponents,
-                            componentLoading: componentLoading)
+                            componentLoading: componentLoading,
+                            tensorParallelGroup: tensorParallelGroup)
                     }
                 })
         }

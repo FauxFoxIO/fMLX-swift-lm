@@ -63,9 +63,10 @@ class Qwen3Attention: Module {
         var values = wv(x)
 
         // prepare the queries, keys and values for the attention computation
-        queries = qNorm(queries.reshaped(B, L, args.attentionHeads, -1)).transposed(0, 2, 1, 3)
-        keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        // the head count comes from the projection, so a tensor-parallel shard works too
+        queries = qNorm(queries.reshaped(B, L, -1, args.headDim)).transposed(0, 2, 1, 3)
+        keys = kNorm(keys.reshaped(B, L, -1, args.headDim)).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, -1, args.headDim).transposed(0, 2, 1, 3)
 
         // Apply RoPE positioning
         let offset = cache?.ropeOffset
@@ -213,7 +214,8 @@ public class Qwen3ModelInner: Module {
 
 public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
-    public let kvHeads: [Int]
+    public private(set) var kvHeads: [Int]
+    public private(set) var tensorParallelGroup: MLXDistributed.Group?
 
     public let model: Qwen3ModelInner
     let configuration: Qwen3Configuration
@@ -331,6 +333,28 @@ public struct Qwen3Configuration: Codable, Sendable {
 extension Qwen3Configuration: ModelConfigurationValidating {
     public func validateModelConfiguration() throws {
         try validateRoPEConfiguration(ropeScaling, context: "Qwen3Configuration.rope_scaling")
+    }
+}
+
+// MARK: - Tensor parallelism
+
+extension Qwen3Model: ShardableModel {
+    public func shard(group: MLXDistributed.Group) throws {
+        try validateHeadSharding(
+            heads: configuration.attentionHeads, kvHeads: configuration.kvHeads, group: group)
+        for layer in model.layers {
+            try shardLinears(
+                in: layer.attention, group: group,
+                [
+                    "q_proj": .allToSharded, "k_proj": .allToSharded, "v_proj": .allToSharded,
+                    "o_proj": .shardedToAll,
+                ])
+            try shardLinears(
+                in: layer.mlp, group: group,
+                ["gate_proj": .allToSharded, "up_proj": .allToSharded, "down_proj": .shardedToAll])
+        }
+        kvHeads = kvHeads.map { $0 / group.size }
+        tensorParallelGroup = group
     }
 }
 
