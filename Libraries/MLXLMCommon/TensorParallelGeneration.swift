@@ -63,6 +63,8 @@ public struct TensorParallelGenerationRequest: Codable, Sendable, Equatable {
 /// same forwards until rank 0 shuts it down.
 ///
 /// Each rank runs its own ``TokenIterator``, which continues with rank 0's sampled token.
+/// With a `drafter`, each rank runs an ``MTPSpeculativeTokenIterator`` instead, which also
+/// takes rank 0's drafts and its accepted count every round.
 /// Rank 0 alone decides when to stop (EOS, a stop string, cancellation) and sends that
 /// decision one step behind the tokens, so the pipeline never waits on it. Each rank then
 /// runs one extra forward at the end of a request; that keeps the collectives matched.
@@ -71,6 +73,10 @@ public struct TensorParallelGenerationRequest: Codable, Sendable, Equatable {
 public final class TensorParallelGenerator {
     public let model: any LanguageModel
     public let group: MLXDistributed.Group
+    /// The MTP drafter, sharded across ``group`` if it is a ``ShardableModel``.
+    public let drafter: (any MTPDrafterModel)?
+    /// Positions per speculative round: one bonus token plus `draftBlockSize - 1` drafts.
+    public let draftBlockSize: Int
 
     public var isLeader: Bool { group.rank == 0 }
 
@@ -83,14 +89,22 @@ public final class TensorParallelGenerator {
     ///   - model: a model sharded with ``ShardableModel/shard(group:)``, or any model when
     ///     `group` has one rank
     ///   - group: the group, defaulting to the one the model was sharded across
-    public init(model: any LanguageModel, group: MLXDistributed.Group? = nil) throws {
+    ///   - drafter: an MTP drafter for speculative decoding, loaded the same way on every rank
+    ///   - draftBlockSize: positions per speculative round, at least 2
+    public init(
+        model: any LanguageModel, group: MLXDistributed.Group? = nil,
+        drafter: (any MTPDrafterModel)? = nil, draftBlockSize: Int = 3
+    ) throws {
         guard
             let group = group ?? (model as? any ShardableModel)?.tensorParallelGroup
         else {
             throw TensorParallelError.modelNotShardable(String(describing: type(of: model)))
         }
+        precondition(draftBlockSize >= 2, "draftBlockSize must be at least 2")
         self.model = model
         self.group = group
+        self.drafter = drafter
+        self.draftBlockSize = draftBlockSize
     }
 
     /// Rank 0: generate for `request` on every rank.
@@ -141,9 +155,22 @@ public final class TensorParallelGenerator {
         _ request: TensorParallelGenerationRequest, leaderDecides: (Int) -> Bool
     ) throws -> [Int] {
         let input = LMInput(tokens: MLXArray(request.promptTokens.map { Int32($0) }))
-        var iterator = try TokenIterator(
-            input: input, model: model, parameters: request.generateParameters)
+        let parameters = request.generateParameters
+        if let drafter {
+            // Rounds evaluate as they decide, so no forward is left in flight.
+            var iterator = try MTPSpeculativeTokenIterator(
+                input: input, mainModel: model, drafter: drafter, parameters: parameters,
+                blockSize: draftBlockSize)
+            return lockstep(&iterator, leaderDecides: leaderDecides) { _ in [] }
+        }
+        var iterator = try TokenIterator(input: input, model: model, parameters: parameters)
+        return lockstep(&iterator, leaderDecides: leaderDecides) { [$0.y.tokens] }
+    }
 
+    private func lockstep<Iterator: TokenIteratorProtocol>(
+        _ iterator: inout Iterator, leaderDecides: (Int) -> Bool,
+        inFlight: (Iterator) -> [MLXArray]
+    ) -> [Int] {
         var tokens = [Int]()
         var stopping = false
         var pendingStop: MLXArray?
@@ -166,7 +193,7 @@ public final class TensorParallelGenerator {
             pendingStop = stop
         }
         // settle the last forward and decision so no collective is left in flight
-        eval([iterator.y.tokens] + (pendingStop.map { [$0] } ?? []))
+        eval(inFlight(iterator) + (pendingStop.map { [$0] } ?? []))
         return tokens
     }
 
