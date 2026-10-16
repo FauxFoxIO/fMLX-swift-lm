@@ -50,8 +50,9 @@ final class GLM5NextMTPLayer: Module, MTPDecoderBlock {
 ///
 /// `index_share_for_mtp_iteration` lets serving stacks reuse the first step's top-k on later
 /// drafted positions; this drafter recomputes the indexer at every step.
-public final class GLM5NextMTPDraftModel: DeepSeekMTPDraftModel {
+public final class GLM5NextMTPDraftModel: DeepSeekMTPDraftModel, ShardableModel {
     let configuration: GLM5NextConfiguration
+    public private(set) var tensorParallelGroup: MLXDistributed.Group?
 
     public init(_ configuration: GLM5NextConfiguration) {
         self.configuration = configuration
@@ -61,6 +62,17 @@ public final class GLM5NextMTPDraftModel: DeepSeekMTPDraftModel {
             targetArchitectureID:
                 "glm5_next:\(configuration.hiddenSize):\(configuration.vocabularySize)",
             cacheBytesPerToken: (configuration.kvLoraRank + 2 * configuration.indexHeadDim) * 2)
+    }
+
+    /// Shards the MTP layer as the target shards its sparse layers. `eh_proj` and the norms
+    /// stay whole; the embedding and output head are the target's.
+    public func shard(group: MLXDistributed.Group) throws {
+        guard let layer = mtpBlock as? GLM5NextMTPLayer else {
+            throw TensorParallelError.modelNotShardable(String(describing: type(of: mtpBlock)))
+        }
+        try layer.attention.shard(group: group)
+        try layer.mlp.shard(group: group)
+        tensorParallelGroup = group
     }
 
     static func layerPrefixes(_ configuration: GLM5NextConfiguration) -> [String] {
@@ -96,8 +108,11 @@ public final class GLM5NextMTPDraftModel: DeepSeekMTPDraftModel {
     }
 
     /// Loads the MTP head from a `glm5_next` checkpoint directory, or returns `nil` when the
-    /// checkpoint has none.
-    public static func load(directory: URL) async throws -> GLM5NextMTPDraftModel? {
+    /// checkpoint has none. Pass the target's `tensorParallelGroup` to shard the head the same
+    /// way.
+    public static func load(
+        directory: URL, tensorParallelGroup: MLXDistributed.Group? = nil
+    ) async throws -> GLM5NextMTPDraftModel? {
         let data = try Data(contentsOf: directory.appending(component: "config.json"))
         let base = try JSONDecoder.json5().decode(BaseConfiguration.self, from: data)
         guard base.modelType == "glm5_next" else { return nil }
@@ -113,7 +128,8 @@ public final class GLM5NextMTPDraftModel: DeepSeekMTPDraftModel {
         let drafter = GLM5NextMTPDraftModel(configuration)
         try await loadWeights(
             modelDirectory: directory, model: drafter, tensorNameSelection: selection,
-            perLayerQuantization: base.perLayerQuantization)
+            perLayerQuantization: base.perLayerQuantization,
+            tensorParallelGroup: tensorParallelGroup)
         return drafter
     }
 }

@@ -364,9 +364,10 @@ final class GLM5NextHyperConnection: Module {
 // MARK: - Kimi Delta Attention
 
 final class GLM5NextLinearAttention: Module {
-    let heads: Int
+    /// Heads and `heads * headDim` on this rank.
+    var heads: Int
     let headDim: Int
-    let projectionDim: Int
+    var projectionDim: Int
     let convKernel: Int
     let lowerBound: Float?
     let normEps: Float
@@ -638,7 +639,8 @@ final class GLM5NextIndexer: Module {
 /// Absorbed MLA without RoPE. The cache stores the normalized KV latent as keys and the
 /// indexer rows as values.
 final class GLM5NextSparseAttention: Module {
-    let numHeads: Int
+    /// Heads on this rank.
+    var numHeads: Int
     let qkNopeHeadDim: Int
     let kvLoraRank: Int
     let scale: Float
@@ -841,6 +843,9 @@ final class GLM5NextMoE: Module, UnaryLayer {
     @ModuleInfo(key: "switch_mlp") var switchMLP: GLM5NextSwitchGLU
     @ModuleInfo(key: "shared_experts") var sharedExperts: GLM5NextMLP?
 
+    /// Set when the experts are sharded; the combined output is summed across it.
+    var shardingGroup: MLXDistributed.Group?
+
     init(_ config: GLM5NextConfiguration) {
         _gate.wrappedValue = GLM5NextGate(config)
         _switchMLP.wrappedValue = GLM5NextSwitchGLU(
@@ -861,6 +866,9 @@ final class GLM5NextMoE: Module, UnaryLayer {
         var y = weightedExpertSum(routed, scores).asType(routed.dtype)
         if let sharedExperts {
             y = y + sharedExperts(x)
+        }
+        if let shardingGroup {
+            return MLXDistributed.allSum(y, group: shardingGroup)
         }
         return y
     }
@@ -975,6 +983,7 @@ public final class GLM5NextModel: Module, LLMModel {
     public let vocabularySize: Int
     public let model: GLM5NextModelInner
     let configuration: GLM5NextConfiguration
+    public private(set) var tensorParallelGroup: MLXDistributed.Group?
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
@@ -1251,5 +1260,104 @@ enum GLM5NextCheckpoint {
             weights["\(prefix).\(name).biases"] = biases
             quantization?.perLayerQuantization["\(prefix).\(name)"] = .quantize(option)
         }
+    }
+}
+
+// MARK: - Tensor parallelism
+
+extension GLM5NextLinearAttention {
+    /// Shards Kimi Delta Attention by heads. Each rank keeps its heads' projections, short-conv
+    /// channels, decay, gate and recurrent state; `o_proj` sums across `group`.
+    func shard(group: MLXDistributed.Group) throws {
+        let size = group.size
+        guard heads % size == 0 else {
+            throw TensorParallelError.indivisible(
+                name: "linear attention heads", dimension: heads, groupSize: size)
+        }
+        try shardLinears(
+            in: self, group: group,
+            [
+                "q_proj": .allToSharded, "k_proj": .allToSharded, "v_proj": .allToSharded,
+                "f_b_proj": .allToSharded, "b_proj": .allToSharded, "g_b_proj": .allToSharded,
+                "o_proj": .shardedToAll,
+            ])
+        // The depthwise conv runs over [q | k | v] channels, so keep this rank's third of each.
+        try shardInPlace(conv1d, predicate: { _, _ in (0, .count(3)) }, group: group)
+        try shardInPlace(
+            self,
+            predicate: { path, _ in
+                path == "A_log" || path == "dt_bias" ? (0, .count(1)) : nil
+            }, group: group)
+        heads /= size
+        projectionDim /= size
+    }
+}
+
+extension GLM5NextSparseAttention {
+    /// Shards absorbed MLA by heads. The query and KV latents and the indexer stay whole, so
+    /// every rank selects the same keys; `o_proj` sums across `group`.
+    func shard(group: MLXDistributed.Group) throws {
+        let size = group.size
+        guard numHeads % size == 0 else {
+            throw TensorParallelError.indivisible(
+                name: "attention heads", dimension: numHeads, groupSize: size)
+        }
+        try shardLinears(
+            in: self, group: group, ["q_b_proj": .allToSharded, "o_proj": .shardedToAll])
+        let byHead: ShardingPredicate = { _, _ in (0, .count(1)) }
+        try shardInPlace(embedQ, predicate: byHead, group: group)
+        try shardInPlace(unembedOut, predicate: byHead, group: group)
+        numHeads /= size
+    }
+}
+
+extension GLM5NextMoE {
+    /// Shards every routed and shared expert in place; the block sums its output once.
+    func shard(group: MLXDistributed.Group) throws {
+        try switchMLP.gateProj.shard(.allToSharded, group: group)
+        try switchMLP.upProj.shard(.allToSharded, group: group)
+        try switchMLP.downProj.shard(.shardedToAll, group: group)
+        if let shared = sharedExperts {
+            try shardInPlace(shared.gateProj, sharding: .allToSharded, group: group)
+            try shardInPlace(shared.upProj, sharding: .allToSharded, group: group)
+            try shardInPlace(shared.downProj, sharding: .shardedToAll, group: group)
+        }
+        shardingGroup = group
+    }
+}
+
+extension GLM5NextDecoderLayer {
+    /// Hyper-connections, norms and the router stay whole. Attention and the MLP each sum
+    /// across `group` once.
+    func shard(group: MLXDistributed.Group) throws {
+        switch attention {
+        case let linear as GLM5NextLinearAttention: try linear.shard(group: group)
+        case let sparse as GLM5NextSparseAttention: try sparse.shard(group: group)
+        default:
+            throw TensorParallelError.modelNotShardable(String(describing: type(of: attention)))
+        }
+        switch mlp {
+        case let moe as GLM5NextMoE:
+            try moe.shard(group: group)
+        case let dense as GLM5NextMLP:
+            try shardLinears(
+                in: dense, group: group,
+                [
+                    "gate_proj": .allToSharded, "up_proj": .allToSharded,
+                    "down_proj": .shardedToAll,
+                ])
+        default:
+            throw TensorParallelError.modelNotShardable(String(describing: type(of: mlp)))
+        }
+    }
+}
+
+extension GLM5NextModel: ShardableModel {
+    /// Embeddings, norms and the LM head stay whole on every rank.
+    public func shard(group: MLXDistributed.Group) throws {
+        for layer in model.layers {
+            try layer.shard(group: group)
+        }
+        tensorParallelGroup = group
     }
 }
