@@ -686,12 +686,9 @@ public final class DFlash2DraftModel: Module, IncrementalMTPDrafterModel,
     }
 
     private func targetEmbeddingAndHead(_ target: any LanguageModel) -> (Embedding, Linear?) {
-        if let model = target as? Qwen35Model {
-            return (model.languageModel.model.embedTokens, model.languageModel.lmHead)
+        guard let target = target as? any MTPTargetModel else {
+            fatalError("DFlash2 requires a Qwen3.5 target, got \(type(of: target))")
         }
-        if let model = target as? Qwen35TextModel {
-            return (model.model.embedTokens, model.lmHead)
-        }
-        fatalError("DFlash2 requires a Qwen3.5 target, got \(type(of: target))")
+        return (target.mtpEmbedding, target.mtpOutputHead)
     }
 }
