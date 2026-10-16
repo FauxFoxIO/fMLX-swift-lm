@@ -174,6 +174,30 @@ open class SwitchGLU: Module {
         super.init()
     }
 
+    /// Uses `activationProduct(gate, up)` in place of `silu(gate) * up`.
+    public init(
+        inputDims: Int,
+        hiddenDims: Int,
+        numExperts: Int,
+        activationProduct: @escaping @Sendable (MLXArray, MLXArray) -> MLXArray,
+        bias: Bool = false
+    ) {
+        self.inputDims = inputDims
+        self.hiddenDims = hiddenDims
+        self.numExperts = numExperts
+        self.activation = MLXNN.silu
+        self.activationProduct = activationProduct
+
+        self._gateProj.wrappedValue = SwitchLinear(
+            inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
+        self._upProj.wrappedValue = SwitchLinear(
+            inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
+        self._downProj.wrappedValue = SwitchLinear(
+            inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
+
+        super.init()
+    }
+
     /// Transform the expanded input ahead of the expert gather/sort.
     ///
     /// This pair of hooks exists so subclasses can wrap the expert
