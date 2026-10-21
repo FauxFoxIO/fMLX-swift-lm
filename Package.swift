@@ -67,7 +67,11 @@ let package = Package(
             description:
                 "Enables the MLXLanguageModel adapter for Apple's FoundationModels framework. Disabling removes the MLXLanguageModel / MLXLanguageModel.Executor types."
         ),
-        .default(enabledTraits: ["FoundationModelsIntegration"]),
+        .trait(
+            name: "AutomaticModelFactoryDiscovery",
+            description: "Registers the full LLM and VLM factories for automatic Objective-C discovery. Disable when supplying factories explicitly."
+        ),
+        .default(enabledTraits: ["FoundationModelsIntegration", "AutomaticModelFactoryDiscovery"]),
     ],
     dependencies: [
         .package(url: "https://github.com/FauxFoxIO/swift-tokenizers.git", branch: "main"),

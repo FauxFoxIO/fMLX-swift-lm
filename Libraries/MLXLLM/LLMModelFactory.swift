@@ -826,8 +826,10 @@ public final class LLMModelFactory: GenericModelFactory {
 
 }
 
+#if AutomaticModelFactoryDiscovery
 public class TrampolineModelFactory: NSObject, ModelFactoryTrampoline {
     public static func modelFactory() -> (any MLXLMCommon.ModelFactory)? {
         LLMModelFactory.shared
     }
 }
+#endif

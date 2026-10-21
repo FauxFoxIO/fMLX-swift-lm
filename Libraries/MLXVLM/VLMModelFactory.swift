@@ -635,8 +635,10 @@ private func readProcessorConfig(from url: URL) throws -> LoadedVLMProcessorConf
     }
 }
 
+#if AutomaticModelFactoryDiscovery
 public class TrampolineModelFactory: NSObject, ModelFactoryTrampoline {
     public static func modelFactory() -> (any MLXLMCommon.ModelFactory)? {
         VLMModelFactory.shared
     }
 }
+#endif
