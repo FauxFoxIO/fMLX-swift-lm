@@ -969,7 +969,9 @@ package func saveModelConversionWeights(
         let url = outputDirectory.appendingPathComponent(filename)
         let arrays = Dictionary(uniqueKeysWithValues: shard)
         eval(Array(arrays.values))
-        try save(arrays: arrays, metadata: modelConversionSafetensorsMetadata(metadata), url: url)
+        // page-aligned layout, so the converted model can load with `.memoryMapped`
+        try saveSafetensorsForMapping(
+            arrays: arrays, metadata: modelConversionSafetensorsMetadata(metadata), url: url)
 
         for (key, _) in shard {
             weightMap[key] = filename
