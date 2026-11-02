@@ -145,6 +145,9 @@ final class D1LFM3Layer: Module {
 
 final class D1LFM3Text: Module {
     let configuration: D1LFM3Configuration.Text
+    /// Evaluate the residual stream every this many layers (0: one graph per row). Bounds how many
+    /// layers' intermediates are in flight at once, which sets peak memory.
+    var evaluationInterval = 0
 
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     @ModuleInfo var layers: [D1LFM3Layer]
@@ -212,6 +215,9 @@ final class D1LFM3Text: Module {
                 h = h[0..., slots]
             }
             h = layer.feed(h)
+            if evaluationInterval > 0, (index + 1) % evaluationInterval == 0 {
+                eval(h)
+            }
         }
         return embeddingNorm(h[0])
     }

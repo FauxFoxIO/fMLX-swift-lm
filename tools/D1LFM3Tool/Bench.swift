@@ -48,6 +48,7 @@ func bench(_ arguments: Arguments) throws {
         directory: try arguments.url("model"), dtype: arguments.dtype,
         weightLoading: arguments.weightLoading)
     let loadMs = milliseconds(since: loadStart)
+    engine.evaluationInterval = arguments.int("eval-every") ?? 0
     let loaded = footprint()
 
     func call(_ entry: EvalSet.Entry, pad: Int?) throws -> (vision: Double, trunk: Double) {
@@ -94,7 +95,11 @@ func bench(_ arguments: Arguments) throws {
     results["screenshot_grid"] = screenshot.grids[0]
     results["text_tokens"] = text.sequence.ids.count
     results["model"] = engine.directory.path
+    results["mapped_mb"] = Double(engine.mappedBytes) / 1_048_576
+    results["copied_tensors"] = engine.copiedTensors.count
+    results["weight_loading"] = arguments.flags.contains("mapped") ? "memoryMapped" : "copy"
     results["dtype"] = String(describing: engine.dtype)
+    results["evaluation_interval"] = engine.evaluationInterval
 
     // `footprint` splits the process's memory into file-backed and anonymous regions.
     let process = Process()

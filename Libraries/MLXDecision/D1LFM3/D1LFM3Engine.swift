@@ -69,6 +69,9 @@ public final class D1LFM3Engine {
     public let directory: URL
     /// The floating-point type of activations and unquantized weights.
     public let dtype: DType
+    /// Memory-mapped loads: tensors MLX had to copy, and bytes used in place from the files.
+    public internal(set) var copiedTensors: [String] = []
+    public internal(set) var mappedBytes = 0
     let network: D1LFM3Network
 
     init(configuration: D1LFM3Configuration, directory: URL, dtype: DType, network: D1LFM3Network) {
@@ -79,6 +82,13 @@ public final class D1LFM3Engine {
     }
 
     public var readsImages: Bool { network.visionTower != nil }
+
+    /// Evaluates the trunk every this many layers (0: one lazy graph per row). Smaller intervals
+    /// lower peak memory.
+    public var evaluationInterval: Int {
+        get { network.text.evaluationInterval }
+        set { network.text.evaluationInterval = newValue }
+    }
 
     /// Loads an MLX export, or the merged PyTorch checkpoint, from a local directory.
     /// `dtype` casts floating-point weights (default: the stored type). `.memoryMapped` uses the
@@ -93,20 +103,28 @@ public final class D1LFM3Engine {
         let files = try DecisionWeights.files(in: directory)
         let wanted = { (name: String) in vision || name.contains("language_model.") }
         var raw = [String: MLXArray]()
+        var copied = [String]()
+        var mapped = 0
         switch weightLoading {
         case .copy:
             raw = try DecisionWeights.load(files).filter { wanted($0.key) }
         case .memoryMapped:
             for file in files {
-                raw.merge(try loadMappedSafetensors(url: file, isRead: wanted).arrays) { a, _ in a }
+                let loaded = try loadMappedSafetensors(url: file, isRead: wanted)
+                raw.merge(loaded.arrays) { a, _ in a }
+                copied += loaded.copiedTensorNames
+                mapped += loaded.mappedBytes
             }
         }
         let weights = D1LFM3Network.sanitize(raw)
         let stored = weights["language_model.embedding_norm.weight"]?.dtype ?? .bfloat16
         let target = dtype ?? stored
         try apply(weights, to: network, quantization: configuration.quantization, dtype: target)
-        return D1LFM3Engine(
+        let engine = D1LFM3Engine(
             configuration: configuration, directory: directory, dtype: target, network: network)
+        engine.copiedTensors = copied
+        engine.mappedBytes = mapped
+        return engine
     }
 
     /// Swaps in quantized layers for the paths that ship `.scales`, casts floating-point weights,
