@@ -16,6 +16,7 @@ let package = Package(
         .library(name: "FMLXText", targets: ["FMLXText"]),
         .library(name: "FMLXModelManagement", targets: ["FMLXModelManagement"]),
         .executable(name: "fmlx-tp-generate", targets: ["TensorParallelGenerate"]),
+        .executable(name: "fmlx-d1", targets: ["D1LFM3Tool"]),
         .library(
             name: "MLXLLM",
             targets: ["MLXLLM"]),
@@ -96,6 +97,15 @@ let package = Package(
                 "FMLXText", "MLXLLM", "MLXLMCommon", .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "tools/TensorParallelGenerate"
+        ),
+        // Liquid d1-2B conversion, quantization, evaluation and benchmarks.
+        .executableTarget(
+            name: "D1LFM3Tool",
+            dependencies: [
+                "MLXDecision", .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "tools/D1LFM3Tool"
         ),
         .testTarget(
             name: "FMLXModelManagementTests",
