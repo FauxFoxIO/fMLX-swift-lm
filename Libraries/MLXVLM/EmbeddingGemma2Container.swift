@@ -64,12 +64,13 @@ public enum EmbeddingGemma2Loader {
         from directory: URL,
         artifact: EmbeddingGemma2Artifact,
         precision: EmbeddingGemma2Precision = .bfloat16,
-        limits: EmbeddingGemma2ResourceLimits = .init()
+        limits: EmbeddingGemma2ResourceLimits = .init(),
+        weightLoading: WeightLoading = .copy
     ) async throws -> EmbeddingGemma2Container {
         let tokenizer = try await EmbeddingGemma2Tokenizer.load(from: directory)
         return try await loadContainer(
             from: directory, tokenizer: tokenizer, artifact: artifact,
-            precision: precision, limits: limits)
+            precision: precision, limits: limits, weightLoading: weightLoading)
     }
 
     /// Loads tokenizer and text weights from an already installed complete multimodal checkpoint.
@@ -79,7 +80,8 @@ public enum EmbeddingGemma2Loader {
         using tokenizerLoader: any TokenizerLoader,
         artifact: EmbeddingGemma2Artifact,
         precision: EmbeddingGemma2Precision = .bfloat16,
-        limits: EmbeddingGemma2ResourceLimits = .init()
+        limits: EmbeddingGemma2ResourceLimits = .init(),
+        weightLoading: WeightLoading = .copy
     ) async throws -> EmbeddingGemma2Container {
         let assets = try EmbeddingGemma2Tokenizer.checkedAssets(directory)
         let tokenizer = try await tokenizerLoader.load(from: directory)
@@ -89,13 +91,13 @@ public enum EmbeddingGemma2Loader {
         }
         return try await loadContainer(
             from: directory, tokenizer: EmbeddingGemma2Tokenizer(tokenizer),
-            artifact: artifact, precision: precision, limits: limits)
+            artifact: artifact, precision: precision, limits: limits, weightLoading: weightLoading)
     }
 
     private static func loadContainer(
         from directory: URL, tokenizer: EmbeddingGemma2Tokenizer,
         artifact: EmbeddingGemma2Artifact, precision: EmbeddingGemma2Precision,
-        limits: EmbeddingGemma2ResourceLimits
+        limits: EmbeddingGemma2ResourceLimits, weightLoading: WeightLoading
     ) async throws -> EmbeddingGemma2Container {
         guard directory.isFileURL, !artifact.identifier.isEmpty, !artifact.revision.isEmpty,
             artifact.revision != "main", artifact.revision != "latest"
@@ -110,7 +112,8 @@ public enum EmbeddingGemma2Loader {
         let runtime = EmbeddingGemma2Runtime(
             directory: directory, configuration: configuration,
             perLayerQuantization: base.perLayerQuantization, tokenizer: tokenizer,
-            inventory: inventory, artifact: artifact, precision: precision)
+            inventory: inventory, artifact: artifact, precision: precision,
+            weightLoading: weightLoading)
         try runtime.validateTokenizer()
         _ = try await runtime.loadModel()
         return EmbeddingGemma2Container(runtime)
@@ -138,6 +141,8 @@ private final class EmbeddingGemma2Runtime {
     let inventory: EmbeddingGemma2CheckpointInventory
     let artifact: EmbeddingGemma2Artifact
     let precision: EmbeddingGemma2Precision
+    /// `.memoryMapped` keeps weights as clean file pages; it applies only when no cast is needed.
+    let weightLoading: WeightLoading
     private var model: EmbeddingGemma2?
     /// Media encoders load with the text model when the checkpoint dtype needs a cast.
     private var loadsMediaWithText = false
@@ -151,7 +156,8 @@ private final class EmbeddingGemma2Runtime {
         directory: URL, configuration: EmbeddingGemma2Configuration,
         perLayerQuantization: BaseConfiguration.PerLayerQuantization?,
         tokenizer: EmbeddingGemma2Tokenizer, inventory: EmbeddingGemma2CheckpointInventory,
-        artifact: EmbeddingGemma2Artifact, precision: EmbeddingGemma2Precision
+        artifact: EmbeddingGemma2Artifact, precision: EmbeddingGemma2Precision,
+        weightLoading: WeightLoading
     ) {
         self.directory = directory
         self.configuration = configuration
@@ -160,6 +166,7 @@ private final class EmbeddingGemma2Runtime {
         self.inventory = inventory
         self.artifact = artifact
         self.precision = precision
+        self.weightLoading = weightLoading
     }
 
     private var markerTokenIDs: [Int] {
@@ -191,8 +198,10 @@ private final class EmbeddingGemma2Runtime {
         let model = EmbeddingGemma2(configuration)
         let casts = !inventory.stores(precision)
         try await loadWeights(
-            modelDirectory: directory, model: model, perLayerQuantization: perLayerQuantization,
-            componentLoading: casts ? .immediate : .onFirstUse)
+            modelDirectory: directory, model: model, tensorNameSelection: .all,
+            perLayerQuantization: perLayerQuantization,
+            componentLoading: casts ? .immediate : .onFirstUse,
+            weightLoading: casts ? .copy : weightLoading)
         if casts {
             let parameters = model.parameters().flattened().map { name, value in
                 (name, value.dtype == .uint32 ? value : value.asType(precision.dtype))
