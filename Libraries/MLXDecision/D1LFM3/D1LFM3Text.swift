@@ -5,8 +5,9 @@ import Foundation
 import MLX
 import MLXNN
 
-// One forward over the whole row: no KV cache and no decode. Full-attention layers read d1's `set`
-// mask, sliding layers a causal window. The trunk returns final-norm hidden states at the answer slots.
+// One forward over the row, or over new tokens after a prefix cache (`D1LFM3PrefixCache.swift`). No
+// decode. Full-attention layers read d1's `set` mask (or causal state), sliding layers a causal window.
+// The trunk returns final-norm hidden states at the answer slots.
 
 final class D1LFM3Attention: Module {
     let heads: Int
@@ -39,18 +40,32 @@ final class D1LFM3Attention: Module {
 
     /// `x` [1, L, D]; `freqs` the layer type's RoPE wavelengths; `mask` [L, L] bool.
     func callAsFunction(_ x: MLXArray, freqs: MLXArray, mask: MLXArray) -> MLXArray {
+        let (q, k, v) = project(x, freqs: freqs, offset: 0)
+        return attend(x, queries: q, keys: k, values: v, mask: mask)
+    }
+
+    /// Rotated queries [1, H, L, hd] and keys, and values [1, KV, L, hd], for positions from `offset`.
+    func project(_ x: MLXArray, freqs: MLXArray, offset: Int) -> (MLXArray, MLXArray, MLXArray) {
         let (b, l) = (x.dim(0), x.dim(1))
         var q = qNorm(qProj(x).reshaped(b, l, heads, headDim)).transposed(0, 2, 1, 3)
         var k = kNorm(kProj(x).reshaped(b, l, keyValueHeads, headDim)).transposed(0, 2, 1, 3)
         let v = vProj(x).reshaped(b, l, keyValueHeads, headDim).transposed(0, 2, 1, 3)
         q = MLXFast.RoPE(
-            q, dimensions: headDim, traditional: false, base: nil, scale: 1, offset: 0, freqs: freqs
-        )
+            q, dimensions: headDim, traditional: false, base: nil, scale: 1, offset: offset,
+            freqs: freqs)
         k = MLXFast.RoPE(
-            k, dimensions: headDim, traditional: false, base: nil, scale: 1, offset: 0, freqs: freqs
-        )
+            k, dimensions: headDim, traditional: false, base: nil, scale: 1, offset: offset,
+            freqs: freqs)
+        return (q, k, v)
+    }
+
+    /// `x`'s queries over `keys` and `values` (which may start before `x`); `mask` [L, keys] bool.
+    func attend(
+        _ x: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
+        let (b, l) = (x.dim(0), x.dim(1))
         var y = MLXFast.scaledDotProductAttention(
-            queries: q, keys: k, values: v, scale: scale, mask: .array(mask))
+            queries: queries, keys: keys, values: values, scale: scale, mask: .array(mask))
         let gate = sigmoid(gateProj(x)).transposed(0, 2, 1)[.ellipsis, .newAxis]
         y = (y * gate).transposed(0, 2, 1, 3).reshaped(b, l, -1)
         return oProj(y)
@@ -76,6 +91,19 @@ final class D1LFM3ShortConv: Module {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         outProj(D1LFM3Kernels.shortConvolution(inProj(x), weight: convWeight))
+    }
+
+    /// `x` after `past` (the previous positions' last taps − 1 rows of [B | C | X]): the output, and
+    /// the last taps − 1 input rows ending at new position `through`, for the next call.
+    func callAsFunction(_ x: MLXArray, past: MLXArray?, through: Int) -> (MLXArray, MLXArray) {
+        let length = x.dim(1)
+        let bcx = past.map { concatenated([$0, inProj(x)], axis: 1) } ?? inProj(x)
+        let total = bcx.dim(1)
+        var y = D1LFM3Kernels.shortConvolution(bcx, weight: convWeight)
+        if total > length { y = y[0..., (total - length)...] }
+        let end = total - length + through
+        let tail = bcx[0..., max(0, end - (convWeight.dim(0) - 1)) ..< end]
+        return (outProj(y), tail)
     }
 }
 
@@ -148,6 +176,8 @@ final class D1LFM3Text: Module {
     /// Evaluate the residual stream every this many layers (0: one graph per row). Bounds how many
     /// layers' intermediates are in flight at once, which sets peak memory.
     var evaluationInterval = 0
+    /// How full-attention layers treat the state. `.causalState` is what prefix caching needs.
+    var stateAttention = D1LFM3StateAttention.set
 
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     @ModuleInfo var layers: [D1LFM3Layer]
@@ -183,12 +213,20 @@ final class D1LFM3Text: Module {
 
     /// d1 `set` attention for full layers and a causal window for sliding layers, both [L, L] bool.
     /// `groups` [L] holds each position's question; the state (`< stateLength`) sees and is seen by all.
-    /// Keys at or past `real` (right padding) are never seen.
+    /// Under `.causalState` the state sees only earlier state, and questions see the state and their own
+    /// group. Keys at or past `real` (right padding) are never seen.
     func masks(length: Int, real: Int, stateLength: Int, groups: MLXArray) -> (MLXArray, MLXArray) {
         let q = MLXArray(Int32(0) ..< Int32(length))[0..., .newAxis]
         let k = MLXArray(Int32(0) ..< Int32(length))[.newAxis]
         let state = Int32(stateLength)
-        var full = (q .< state) .|| (k .< state) .|| (groups[0..., .newAxis] .== groups[.newAxis])
+        let sameGroup = groups[0..., .newAxis] .== groups[.newAxis]
+        var full: MLXArray
+        switch stateAttention {
+        case .set:
+            full = (q .< state) .|| (k .< state) .|| sameGroup
+        case .causalState:
+            full = which(q .< state, k .<= q, (k .< state) .|| sameGroup)
+        }
         if real < length {
             full = full .&& (k .< Int32(real))
         }

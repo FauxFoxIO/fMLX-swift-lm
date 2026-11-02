@@ -90,6 +90,13 @@ public final class D1LFM3Engine {
         set { network.text.evaluationInterval = newValue }
     }
 
+    /// How full-attention layers treat the state: the export's `d1_attention`, or set here (a benchmark
+    /// can time a `.set` export under `.causalState`). Prefix caching needs `.causalState`.
+    public var stateAttention: D1LFM3StateAttention {
+        get { network.text.stateAttention }
+        set { network.text.stateAttention = newValue }
+    }
+
     /// Loads an MLX export, or the merged PyTorch checkpoint, from a local directory.
     /// `dtype` casts floating-point weights (default: the stored type). `.memoryMapped` uses the
     /// file's pages in place: an export in its own dtype then stays file-backed, outside the
@@ -122,6 +129,7 @@ public final class D1LFM3Engine {
         try apply(weights, to: network, quantization: configuration.quantization, dtype: target)
         let engine = D1LFM3Engine(
             configuration: configuration, directory: directory, dtype: target, network: network)
+        engine.stateAttention = configuration.stateAttention ?? .set
         engine.copiedTensors = copied
         engine.mappedBytes = mapped
         return engine

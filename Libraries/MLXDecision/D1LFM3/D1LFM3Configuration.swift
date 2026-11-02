@@ -184,10 +184,29 @@ public struct D1LFM3Configuration: Codable, Sendable {
     public static func load(_ directory: URL) throws -> D1LFM3Configuration {
         let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
         let configuration = try JSONDecoder().decode(D1LFM3Configuration.self, from: data)
-        guard configuration.attention == nil || configuration.attention == "set" else {
+        guard configuration.stateAttention != nil else {
             throw DecisionError.invalidConfiguration(
-                "d1 attention \(configuration.attention ?? "") is not supported; only `set` is")
+                "d1 attention \(configuration.attention ?? "") is not supported; `set` and `causal_state` are"
+            )
         }
         return configuration
     }
+
+    /// `d1_attention`: absent or `set` → `.set`; `causal_state` → `.causalState`; anything else nil.
+    public var stateAttention: D1LFM3StateAttention? {
+        switch attention {
+        case nil, "set": .set
+        case "causal_state": .causalState
+        default: nil
+        }
+    }
+}
+
+/// How d1's full-attention layers treat the state. `.set` (round 1): the state reads every position,
+/// questions included, so nothing can be cached. `.causalState`: the state reads only earlier state, and
+/// each question reads the state and its own group, so a state prefix can be cached
+/// (``D1LFM3PrefixCache``).
+public enum D1LFM3StateAttention: String, Sendable {
+    case set
+    case causalState = "causal_state"
 }
