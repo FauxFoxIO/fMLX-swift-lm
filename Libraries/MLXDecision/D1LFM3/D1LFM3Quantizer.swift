@@ -30,6 +30,9 @@ public struct D1LFM3Recipe: Codable, Sendable {
     public var defaults: D1LFM3Configuration.Quantization.Setting?
     public var rules: [Rule]
     public var method: Method
+    /// Fold activation-aware channel scales into the trunk before quantizing (needs an
+    /// importance matrix).
+    public var scaling: Bool?
 
     public init(
         defaults: D1LFM3Configuration.Quantization.Setting?, rules: [Rule] = [],

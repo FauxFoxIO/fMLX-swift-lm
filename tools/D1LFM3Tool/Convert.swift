@@ -27,7 +27,16 @@ func convert(_ arguments: Arguments) throws {
     log(
         "wrote \(report.bytes / 1_048_576) MB in \(Int(milliseconds(since: start) / 1000)) s: \(counts)"
     )
+    if !report.alphas.isEmpty {
+        let scaled = report.alphas.values.filter { $0 > 0 }.count
+        log(
+            "activation scales on \(scaled) of \(report.alphas.count) folds; mean α \(report.alphas.values.reduce(0, +) / Float(report.alphas.count))"
+        )
+    }
     if arguments.flags.contains("verbose") {
+        for (path, alpha) in report.alphas.sorted(by: { $0.key < $1.key }) {
+            log("  α \(path): \(alpha)")
+        }
         for (path, kind) in report.tensors.sorted(by: { $0.key < $1.key }) {
             log("  \(path): \(kind)")
         }

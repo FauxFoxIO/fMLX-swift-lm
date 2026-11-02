@@ -99,13 +99,27 @@ func runSet(_ arguments: Arguments) throws {
     )
     var set = try EvalSet(try arguments.url("data"))
     let out = try arguments.url("out")
-    FileManager.default.createFile(atPath: out.path, contents: nil)
+    // --resume keeps the records already written and skips their sequences.
+    var done = Set<Int>()
+    if arguments.flags.contains("resume"), let text = try? String(contentsOf: out, encoding: .utf8)
+    {
+        struct Key: Decodable { let key: Int }
+        for line in text.split(separator: "\n") {
+            if let k = try? JSONDecoder().decode(Key.self, from: Data(line.utf8)) {
+                done.insert(k.key)
+            }
+        }
+    } else {
+        FileManager.default.createFile(atPath: out.path, contents: nil)
+    }
     let handle = try FileHandle(forWritingTo: out)
+    try handle.seekToEnd()
     let encoder = JSONEncoder()
     let pad = arguments.int("pad")
     var saved = [String: MLXArray]()
     var items = set.items
     if let limit = arguments.int("limit") { items = Array(items.prefix(limit)) }
+    items = items.filter { !done.contains($0.key) }
     var times = [Double]()
     for (i, item) in items.enumerated() {
         let entry = try set.entry(item)

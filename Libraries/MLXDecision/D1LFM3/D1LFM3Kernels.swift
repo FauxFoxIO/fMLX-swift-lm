@@ -4,6 +4,13 @@ import Foundation
 import MLX
 
 enum D1LFM3Kernels {
+    /// `silu(a) * b` as one fused kernel.
+    nonisolated(unsafe) static let swiglu: (MLXArray, MLXArray) -> MLXArray = compile(
+        shapeless: true
+    ) { a, b in
+        a * sigmoid(a) * b
+    }
+
     /// One Metal pass for `C * conv(B * X)`: each thread reads its channel's window, accumulates in float32.
     nonisolated(unsafe) static let shortConvolutionKernel = MLXFast.metalKernel(
         name: "d1_lfm3_short_conv",

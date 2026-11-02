@@ -8,8 +8,9 @@ generating text.
 |---|---|---|---|
 | Liquid d1-omni-600M (`d1_omni`) | `LiquidAI/d1-omni-600M`, `-MLX-fp16`, `-MLX-8bit` | text, images, 16 kHz audio | `D1OmniLoader` |
 | Fastino GLiNER2.5-Decide (`gliner2`, DeBERTa-v3) | `fastino/GLiNER2.5-Decide` | text | `GLiNER2Loader` |
+| Liquid d1-2B (`lfm3_vl`) and its fine-tunes | merged checkpoints and their `fmlx-d1` exports | rendered rows, images | `D1LFM3Model` |
 
-Both conform to `DecisionModel`:
+d1-omni and GLiNER2 conform to `DecisionModel`:
 
 ```swift
 import MLXDecision
@@ -79,6 +80,39 @@ artifact identity and revision.
   labels, and a yes/no question uses `yes` and `no`. The question ID is the task
   name and the instructions are the prompt.
 - Text words past `maximumTokens` are dropped; the schema always stays whole.
+
+## d1-2B
+
+Liquid d1-2B is LFM3 text (24 layers: short convolutions, full attention with
+d1's `set` mask, and sliding-window attention) with the LFM3-VL vision tower.
+`D1LFM3Model` runs it as a stateless trunk for a host that renders d1's prompt
+itself, as C0 in Mirage does: one forward per row, no KV cache, and the
+final-norm hidden state at each answer slot.
+
+```swift
+let model = try D1LFM3Model.load(directory: exportDirectory)  // memory-mapped
+let sequence = D1LFM3Sequence(
+    ids: ids, stateLength: stateLength, groups: questionGroups, slots: answerSlots)
+let images = [D1LFM3Image(pixels: patches, rows: 26, columns: 38)]
+let logits = try await model.optionLogits(sequence, images: images, readout: readout)
+// readout[k][option] = the option's token forms; softmax(logits[k] / model.temperature!)
+```
+
+- `groups` gives each position's question; the state (`stateLength` positions)
+  sees and is seen by every position. Images fill the `<|image|>` placeholders
+  in order; `pixels` are the processor's patches in merge-block order.
+- `hidden(_:images:)` returns the hidden states instead. `optionLogits` reads
+  the tied head from the model's own embedding table, so the host keeps no
+  separate copy.
+- Rows run at their own length; there are no buckets. Right padding
+  (`D1LFM3Engine.hidden(_:features:paddedLength:)`) is exact.
+- `fmlx-d1 convert` writes exports from the merged PyTorch checkpoint, in one
+  floating-point type, with per-tensor quantization from a recipe. Quantized
+  exports are MLX affine (`QuantizedLinear`, `QuantizedEmbedding`); the
+  scales and minimums come from llama.cpp's importance-weighted search, with an
+  importance matrix from `fmlx-d1 imatrix`. `fmlx-d1 sensitivity` measures
+  each tensor group's error at 4 bits, to choose which tensors keep more bits.
+- Exports load memory-mapped by default, so their weights stay file-backed.
 
 ## d1-3B
 

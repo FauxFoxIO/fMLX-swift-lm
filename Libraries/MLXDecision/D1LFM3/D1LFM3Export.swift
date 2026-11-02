@@ -17,6 +17,8 @@ public enum D1LFM3Export {
     public struct Report: Sendable {
         public var tensors: [String: String] = [:]
         public var bytes: Int64 = 0
+        /// The activation-scaling exponent chosen for each fold, keyed by its importance layer.
+        public var alphas: [String: Float] = [:]
     }
 
     /// The module paths a recipe may quantize: every linear layer and the token embeddings.
@@ -37,7 +39,14 @@ public enum D1LFM3Export {
         if !includeVision {
             weights = weights.filter { $0.key.hasPrefix("language_model.") }
         }
+        var importance = importance
         var report = Report()
+        if let recipe, recipe.scaling == true, !importance.isEmpty {
+            report.alphas = D1LFM3Scaling.apply(
+                &weights, importance: &importance, configuration: configuration.text,
+                recipe: recipe,
+                scaleType: dtype)
+        }
         var result = [String: MLXArray]()
         var overrides = [String: D1LFM3Configuration.Quantization.Setting?]()
         var used = [D1LFM3Configuration.Quantization.Setting: Int]()

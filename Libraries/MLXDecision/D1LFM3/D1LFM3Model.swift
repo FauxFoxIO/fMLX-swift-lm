@@ -58,11 +58,14 @@ public final class D1LFM3Model: Sendable {
     /// Runs a text row and a one-image row once, so the first request runs warm.
     public func prepare() async throws {
         try await state.read { engine in
-            let sequence = D1LFM3Sequence(ids: [1, 2, 3], stateLength: 1, groups: [], slots: [2])
-            eval(try engine.hidden(sequence, features: nil))
-            if engine.readsImages {
-                let patches = MLXArray.zeros([16, engine.configuration.vision!.patchValues])
-                eval(try engine.imageFeatures(patches, rows: 4, columns: 4))
+            try withError {
+                let sequence = D1LFM3Sequence(
+                    ids: [1, 2, 3], stateLength: 1, groups: [], slots: [2])
+                eval(try engine.hidden(sequence, features: nil))
+                if engine.readsImages {
+                    let patches = MLXArray.zeros([16, engine.configuration.vision!.patchValues])
+                    eval(try engine.imageFeatures(patches, rows: 4, columns: 4))
+                }
             }
         }
     }
@@ -93,8 +96,9 @@ public final class D1LFM3Model: Sendable {
             var results = [[Float]]()
             for (k, options) in readout.enumerated() {
                 let tokens = options.flatMap { $0 }
-                let scores = engine.scores(hidden[k ..< k + 1], tokens: tokens)[0].asArray(
-                    Float.self)
+                let scores = try withError {
+                    engine.scores(hidden[k ..< k + 1], tokens: tokens)[0].asArray(Float.self)
+                }
                 var start = 0
                 results.append(
                     options.map { forms in
@@ -107,11 +111,19 @@ public final class D1LFM3Model: Sendable {
         }
     }
 
+    /// MLX reports failures (a Metal command-buffer timeout under GPU contention, say) through a
+    /// handler that exits the process by default; inside `withError` they throw instead.
     private static func run(
         _ engine: D1LFM3Engine, _ sequence: D1LFM3Sequence, _ images: [D1LFM3Image]
     )
         throws -> MLXArray
     {
+        try withError { try forward(engine, sequence, images) }
+    }
+
+    private static func forward(
+        _ engine: D1LFM3Engine, _ sequence: D1LFM3Sequence, _ images: [D1LFM3Image]
+    ) throws -> MLXArray {
         let patchValues = engine.configuration.vision?.patchValues ?? 0
         let features = try images.map { image -> MLXArray in
             guard image.pixels.count == image.rows * image.columns * patchValues else {

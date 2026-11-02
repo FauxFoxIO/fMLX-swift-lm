@@ -11,6 +11,16 @@ MIT license and attribution remain unchanged.
   The Swift port changes these files: it rewrites them for MLX Swift, loads both
   the PyTorch checkpoint and its MLX exports, and replaces PIL, torchvision, and
   NumPy preprocessing with native image and audio code.
+- Liquid AI d1-2B reference model code (`modeling_lfm3.py`, `modeling_lfm3_vl.py`,
+  `modeling_d1_lfm3_vl.py`, `attention.py`, `depthwise.py`, `prompt.py`), copyright
+  Liquid AI, Inc., LFM Open License v1.0, as shipped with the d1-2B checkpoint
+  (base model `LiquidAI/LFM3-VL-2B`). The Swift port (`D1LFM3`) rewrites the LFM3
+  text model and the LFM3-VL vision tower and projector for MLX Swift as a
+  stateless decision trunk.
+- llama.cpp (`ggml-quants.c`), copyright the ggml authors, MIT license. The
+  importance-weighted scale and minimum search of `make_qkx2_quants` that
+  `D1LFM3Quantizer` reimplements for MLX's affine format:
+  https://github.com/ggml-org/llama.cpp
 - MLX-VLM, copyright © 2025 Prince Canuma, MIT license, implementation revision
   `4623cf9d2633c5ee2b1ac125eeae51423447c41f`. The `d1_omni`, `lfm2_vl` vision,
   `nemotron_h_nano_omni` Parakeet audio, `gliner2_5` DeBERTa, and interpolation
@@ -33,6 +43,6 @@ The license texts are retained alongside this notice as
 and `EmbeddingGemma2-PyTorch-BSD.txt`.
 
 Model weights are installed separately and keep their own licenses: d1-omni
-weights under the LFM Open License v1.0 (commercial use limited to entities
+and d1-2B weights under the LFM Open License v1.0 (commercial use limited to entities
 below the license's revenue threshold), GLiNER2.5-Decide weights under Apache
 License 2.0.

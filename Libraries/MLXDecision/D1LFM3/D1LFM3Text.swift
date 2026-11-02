@@ -91,7 +91,7 @@ final class D1LFM3MLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        w2(silu(w1(x)) * w3(x))
+        w2(D1LFM3Kernels.swiglu(w1(x), w3(x)))
     }
 }
 
