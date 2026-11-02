@@ -25,6 +25,8 @@ public struct D1LFM3Recipe: Codable, Sendable {
         case minMax = "minmax"
         /// llama.cpp's weighted search over scale and minimum, with importance weights when given.
         case search
+        /// GPTQ error compensation with input Hessians; group scales from the weighted search.
+        case gptq
     }
 
     public var defaults: D1LFM3Configuration.Quantization.Setting?
@@ -33,6 +35,8 @@ public struct D1LFM3Recipe: Codable, Sendable {
     /// Fold activation-aware channel scales into the trunk before quantizing (needs an
     /// importance matrix).
     public var scaling: Bool?
+    /// GPTQ's Hessian damping, a fraction of its mean diagonal (default 0.01).
+    public var damping: Float?
 
     public init(
         defaults: D1LFM3Configuration.Quantization.Setting?, rules: [Rule] = [],
@@ -65,7 +69,7 @@ public enum D1LFM3Quantizer {
         method: D1LFM3Recipe.Method, importance: MLXArray? = nil, scaleType: DType
     ) -> Quantized {
         let mode = setting.quantizationMode
-        guard mode == .affine, method == .search else {
+        guard mode == .affine, method != .minMax else {
             let (q, s, b) = MLX.quantized(
                 w.asType(scaleType), groupSize: setting.groupSize, bits: setting.bits, mode: mode)
             return Quantized(weight: q, scales: s, biases: b)
@@ -100,12 +104,26 @@ public enum D1LFM3Quantizer {
         let groups = i / groupSize
         let x = w.asType(.float32).reshaped(o, groups, groupSize)
         let nmax = Float((1 << bits) - 1)
+        let (scale, minimum) = fitAffine(
+            x, weight: importance?.asType(.float32).reshaped(1, groups, groupSize), bits: bits,
+            scaleType: scaleType)
+        let codes = clip(round((x - minimum) / scale), min: 0, max: nmax).asType(.uint32)
+        return (
+            pack(codes.reshaped(o, i), bits: bits), scale.reshaped(o, groups).asType(scaleType),
+            minimum.reshaped(o, groups).asType(scaleType)
+        )
+    }
+
+    /// The scale and minimum of each group of `x` [O, G, g], float32 values already rounded to
+    /// `scaleType`. `importance` broadcasts against `x`.
+    static func fitAffine(_ x: MLXArray, weight importance: MLXArray?, bits: Int, scaleType: DType)
+        -> (MLXArray, MLXArray)
+    {
+        let nmax = Float((1 << bits) - 1)
         // llama.cpp: weights = qw * sqrt(sigma2 + x²) with an importance matrix, else sqrt(sigma2 + x²).
         let sigma2 = (x * x).mean(axis: -1, keepDims: true)
         var weight = sqrt(sigma2 + x * x)
-        if let importance {
-            weight = weight * importance.asType(.float32).reshaped(1, groups, groupSize)
-        }
+        if let importance { weight = weight * importance }
         let lo = x.min(axis: -1, keepDims: true)
         let hi = x.max(axis: -1, keepDims: true)
         let range = maximum(hi - lo, MLXArray(Float(1e-12)))
@@ -141,16 +159,10 @@ public enum D1LFM3Quantizer {
             bestMin = MLX.where(better, minimum, bestMin)
             bestError = MLX.where(better, error, bestError)
         }
-        // Store in `scaleType`, then choose codes against the stored values.
+        // Stored in `scaleType`; codes are chosen against the stored values.
         var scale = bestScale.asType(scaleType).asType(.float32)
         scale = MLX.where(abs(scale) .< 1e-30, MLXArray(Float(1e-8)), scale)
-        let minimum = bestMin.asType(scaleType).asType(.float32)
-        let codes = clip(round((x - minimum) / scale), min: 0, max: nmax).asType(.uint32)
-        let packedCodes = pack(codes.reshaped(o, i), bits: bits)
-        return (
-            packedCodes, scale.reshaped(o, groups).asType(scaleType),
-            minimum.reshaped(o, groups).asType(scaleType)
-        )
+        return (scale, bestMin.asType(scaleType).asType(.float32))
     }
 
     /// MLX's affine packing: codes LSB first, `32 / bits` per word for powers of two, else a bit stream.

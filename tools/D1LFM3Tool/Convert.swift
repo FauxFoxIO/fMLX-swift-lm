@@ -17,10 +17,20 @@ func convert(_ arguments: Arguments) throws {
         try arguments.options["imatrix"].map {
             try loadArrays(url: URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath))
         } ?? [:]
+    var hessians = [String: MLXArray]()
+    if let dir = arguments.options["hessians"] {
+        let url = URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
+        for file in try FileManager.default.contentsOfDirectory(
+            at: url, includingPropertiesForKeys: nil)
+        where file.pathExtension == "safetensors" {
+            hessians.merge(try loadArrays(url: file)) { a, _ in a }
+        }
+    }
     let start = DispatchTime.now().uptimeNanoseconds
     let report = try D1LFM3Export.convert(
         checkpoint: try arguments.url("checkpoint"), output: try arguments.url("out"),
         dtype: arguments.dtype ?? .bfloat16, recipe: recipe, importance: importance,
+        hessians: hessians,
         includeVision: !arguments.flags.contains("text-only"))
     var counts = [String: Int]()
     for kind in report.tensors.values { counts[kind, default: 0] += 1 }
@@ -65,4 +75,41 @@ func collectImportance(_ arguments: Arguments) throws {
     }
     try save(arrays: importance, url: try arguments.url("out"))
     log("wrote importance for \(importance.count) layers over \(tokens) tokens")
+}
+
+/// `hessian --model DIR --data DIR --out DIR [--layers 0-7] [--limit N]`: the mean `x xᵀ` of the
+/// inputs of each text layer's linear layers (one per shared input), for GPTQ.
+func collectHessians(_ arguments: Arguments) throws {
+    let engine = try D1LFM3Engine.load(
+        directory: try arguments.url("model"), dtype: arguments.dtype,
+        weightLoading: arguments.weightLoading)
+    var set = try EvalSet(try arguments.url("data"))
+    var items = set.items
+    if let limit = arguments.int("limit") { items = Array(items.prefix(limit)) }
+    let range = (arguments.options["layers"] ?? "0-23").split(separator: "-").compactMap { Int($0) }
+    let layers = range[0] ... range[range.count - 1]
+    let paths = Set(
+        engine.linearPaths.filter { path in
+            let parts = path.split(separator: ".")
+            guard parts.count > 2, parts[0] == "language_model", let layer = Int(parts[2]) else {
+                return false
+            }
+            return layers.contains(layer) && D1LFM3Quantizer.hessianOwner(path) == path
+        })
+    let hessians = try engine.collectHessians(paths) {
+        for (i, item) in items.enumerated() {
+            let entry = try set.entry(item)
+            let features = try imageFeatures(engine, entry)
+            if let features { eval(features) }
+            eval(try engine.hidden(entry.sequence, features: features))
+            if (i + 1) % 50 == 0 { log("\(i + 1)/\(items.count)") }
+        }
+    }
+    let out = try arguments.url("out")
+    try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+    try save(
+        arrays: hessians,
+        url: out.appendingPathComponent(
+            "hessians-\(layers.lowerBound)-\(layers.upperBound).safetensors"))
+    log("wrote \(hessians.count) Hessians for layers \(layers)")
 }

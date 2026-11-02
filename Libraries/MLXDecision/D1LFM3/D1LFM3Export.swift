@@ -31,7 +31,8 @@ public enum D1LFM3Export {
     /// `importance` maps module paths to the mean square of their input channels.
     public static func convert(
         checkpoint: URL, output: URL, dtype: DType, recipe: D1LFM3Recipe?,
-        importance: [String: MLXArray] = [:], includeVision: Bool = true
+        importance: [String: MLXArray] = [:], hessians: [String: MLXArray] = [:],
+        includeVision: Bool = true
     ) throws -> Report {
         var configuration = try D1LFM3Configuration.load(checkpoint)
         var weights = D1LFM3Network.sanitize(
@@ -55,9 +56,17 @@ public enum D1LFM3Export {
             if value.dtype.isFloatingPoint { value = value.asType(dtype) }
             let path = String(key.dropLast(".weight".count))
             if let recipe, quantizable(key, value), let setting = recipe.setting(for: path) {
-                let q = D1LFM3Quantizer.quantize(
-                    weights[key]!, setting: setting, method: recipe.method,
-                    importance: importance[path], scaleType: dtype)
+                let hessian = hessians[D1LFM3Quantizer.hessianOwner(path)]
+                let q: D1LFM3Quantizer.Quantized
+                if recipe.method == .gptq, setting.quantizationMode == .affine, let hessian {
+                    q = D1LFM3Quantizer.gptq(
+                        weights[key]!, hessian: hessian, setting: setting, scaleType: dtype,
+                        damping: recipe.damping ?? 0.01)
+                } else {
+                    q = D1LFM3Quantizer.quantize(
+                        weights[key]!, setting: setting, method: recipe.method,
+                        importance: importance[path], scaleType: dtype)
+                }
                 result[key] = q.weight
                 result["\(path).scales"] = q.scales
                 if let biases = q.biases { result["\(path).biases"] = biases }

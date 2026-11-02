@@ -75,6 +75,7 @@ do {
     case "bench": try bench(arguments)
     case "sensitivity": try sensitivity(arguments)
     case "profile": try profile(arguments)
+    case "hessian": try collectHessians(arguments)
     default:
         log("usage: fmlx-d1 run|convert|imatrix|bench|sensitivity …")
         exit(2)
