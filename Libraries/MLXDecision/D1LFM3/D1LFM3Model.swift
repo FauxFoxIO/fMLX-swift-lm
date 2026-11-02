@@ -42,13 +42,16 @@ public final class D1LFM3Model: Sendable {
     /// Loads an MLX export (or the merged checkpoint) from a local directory. `dtype` overrides the
     /// activation type; float16 matches the fp32 reference best. `evaluationInterval` 4 lowers peak
     /// memory by about a third for a few percent of latency (for devices under 12 GB).
+    /// `stateAttention` overrides the export's (a benchmark times a `.set` export under `.causalState`).
     public static func load(
         directory: URL, dtype: DType? = nil, vision: Bool = true,
-        weightLoading: WeightLoading = .memoryMapped, evaluationInterval: Int = 0
+        weightLoading: WeightLoading = .memoryMapped, evaluationInterval: Int = 0,
+        stateAttention: D1LFM3StateAttention? = nil
     ) throws -> D1LFM3Model {
         let engine = try D1LFM3Engine.load(
             directory: directory, dtype: dtype, vision: vision, weightLoading: weightLoading)
         engine.evaluationInterval = evaluationInterval
+        if let stateAttention { engine.stateAttention = stateAttention }
         struct Calibration: Decodable { let `default`: Double? }
         let temperature =
             (try? Data(contentsOf: directory.appendingPathComponent("calibration.json")))
@@ -82,6 +85,32 @@ public final class D1LFM3Model: Sendable {
             let width = hidden.dim(1)
             let values = hidden.asArray(Float.self)
             return (0 ..< hidden.dim(0)).map { Array(values[$0 * width ..< ($0 + 1) * width]) }
+        }
+    }
+
+    /// Computes a state prefix after `cache` and returns the extended cache (`.causalState` only).
+    public func prefill(_ ids: [Int32], after cache: D1LFM3PrefixCache? = nil) async throws
+        -> D1LFM3PrefixCache
+    {
+        try await state.read { engine in try withError { try engine.prefill(ids, after: cache) } }
+    }
+
+    /// ``hidden(_:images:)`` for `sequence`'s tokens after `cache`, computing only those tokens; also
+    /// returns the cache extended by `sequence`'s state (`.causalState` only).
+    public func hidden(_ sequence: D1LFM3Sequence, after cache: D1LFM3PrefixCache) async throws
+        -> (hidden: [[Float]], cache: D1LFM3PrefixCache)
+    {
+        try await state.read { engine in
+            try withError {
+                let (hidden, next) = try engine.hidden(sequence, after: cache)
+                eval(hidden)
+                let width = hidden.dim(1)
+                let values = hidden.asArray(Float.self)
+                return (
+                    (0 ..< hidden.dim(0)).map { Array(values[$0 * width ..< ($0 + 1) * width]) },
+                    next
+                )
+            }
         }
     }
 
