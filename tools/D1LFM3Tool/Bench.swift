@@ -80,6 +80,15 @@ func bench(_ arguments: Arguments) throws {
         results["\(name)_ms_median"] = median(times)
         results["\(name)_ms_min"] = times.min() ?? 0
     }
+    // `--pads 4096,8192`: the text call padded to each length, for the context-window sweep.
+    for pad in (arguments.options["pads"] ?? "").split(separator: ",").compactMap({ Int($0) }) {
+        var times = [Double]()
+        for _ in 0 ..< max(3, runs / 2) {
+            times.append(try call(text, pad: pad).trunk)
+        }
+        results["trunk_l\(pad)_ms_median"] = median(times)
+        results["peak_after_l\(pad)_mb"] = footprint().peak
+    }
     let end = footprint()
     results["warm_vision_ms_median"] = median(vision)
     results["load_ms"] = loadMs
