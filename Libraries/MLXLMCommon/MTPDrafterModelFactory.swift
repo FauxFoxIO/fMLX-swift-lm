@@ -113,7 +113,8 @@ public final class MTPDrafterModelFactory: GenericModelFactory {
             perLayerQuantization: baseConfig.perLayerQuantization,
             weightFileSelection: configuration.weightFileSelection,
             excludedComponents: configuration.excludedComponents,
-            tensorParallelGroup: configuration.tensorParallelGroup
+            tensorParallelGroup: configuration.tensorParallelGroup,
+            weightLoading: configuration.weightLoading
         )
 
         let modelConfig = ModelConfiguration(

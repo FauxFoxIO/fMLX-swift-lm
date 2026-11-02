@@ -85,6 +85,12 @@ public struct ResolvedModelConfiguration: Sendable {
     /// - ``ModelConfiguration/weightFileSelection``
     public var weightFileSelection: WeightFileSelection
 
+    /// How the model's weights get into memory.
+    ///
+    /// ## See Also
+    /// - ``ModelConfiguration/weightLoading``
+    public var weightLoading: WeightLoading
+
     /// Components to load the model without.
     ///
     /// ## See Also
@@ -109,6 +115,7 @@ public struct ResolvedModelConfiguration: Sendable {
         reasoningConfig: ReasoningConfig? = nil,
         messageGenerator: (any MessageGenerator)? = nil,
         weightFileSelection: WeightFileSelection = .automatic,
+        weightLoading: WeightLoading = .copy,
         excludedComponents: Set<ModelComponent> = [],
         tensorParallelGroup: MLXDistributed.Group? = nil
     ) {
@@ -123,6 +130,7 @@ public struct ResolvedModelConfiguration: Sendable {
         self.reasoningConfig = reasoningConfig
         self.messageGenerator = messageGenerator
         self.weightFileSelection = weightFileSelection
+        self.weightLoading = weightLoading
         self.excludedComponents = excludedComponents
         self.tensorParallelGroup = tensorParallelGroup
     }

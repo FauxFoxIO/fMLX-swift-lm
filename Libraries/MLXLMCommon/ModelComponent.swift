@@ -151,11 +151,13 @@ public class AnyOnDemandComponent: @unchecked Sendable {
         let urls: [URL]
         let namespaces: [String]
         let perLayerQuantization: BaseConfiguration.PerLayerQuantization?
+        let weightLoading: WeightLoading
         let prepare: (ModelCheckpoint) throws -> ModelCheckpoint
 
         func checkpoint() throws -> ModelCheckpoint {
             let namespaces = namespaces
-            var checkpoint = try loadModelCheckpoint(urls: urls) { name in
+            var checkpoint = try loadModelCheckpoint(urls: urls, weightLoading: weightLoading) {
+                name in
                 namespaces.contains { CheckpointNameMapping.relativeName(name, in: $0) != nil }
             }
             checkpoint.perLayerQuantization = perLayerQuantization
@@ -229,7 +231,8 @@ func loadOnDemandComponents(_ components: [AnyOnDemandComponent]) async throws {
 /// Returns the serialized namespaces the load must not read.
 func prepareComponents(
     of model: BaseLanguageModel, urls: [URL], excluded: Set<ModelComponent>,
-    loading: ComponentLoading, perLayerQuantization: BaseConfiguration.PerLayerQuantization?
+    loading: ComponentLoading, perLayerQuantization: BaseConfiguration.PerLayerQuantization?,
+    weightLoading: WeightLoading = .copy
 ) throws -> [String] {
     guard let model = model as? any ModelComponentsProviding else { return [] }
     let onDemand = Dictionary(
@@ -247,6 +250,7 @@ func prepareComponents(
                 ? .init(
                     urls: urls, namespaces: parts.flatMap(\.namespaces),
                     perLayerQuantization: perLayerQuantization,
+                    weightLoading: weightLoading,
                     prepare: { [weak model] checkpoint in
                         guard let model else { throw OnDemandComponentError.unavailable(component) }
                         return try model.prepareCheckpoint(checkpoint)

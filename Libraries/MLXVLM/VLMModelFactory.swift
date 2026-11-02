@@ -487,7 +487,8 @@ public final class VLMModelFactory: GenericModelFactory {
             perLayerQuantization: baseConfig.perLayerQuantization,
             weightFileSelection: configuration.weightFileSelection,
             excludedComponents: configuration.excludedComponents,
-            tensorParallelGroup: configuration.tensorParallelGroup)
+            tensorParallelGroup: configuration.tensorParallelGroup,
+            weightLoading: configuration.weightLoading)
 
         let tokenizer = try await tokenizerTask
         let processorConfiguration: VLMProcessorConfiguration

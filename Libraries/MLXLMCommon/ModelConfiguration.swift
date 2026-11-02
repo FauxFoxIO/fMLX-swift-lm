@@ -130,6 +130,12 @@ public struct ModelConfiguration: Sendable {
     /// that case before reaching for it.
     public var weightFileSelection: WeightFileSelection = .automatic
 
+    /// How the model's weights get into memory.
+    ///
+    /// ``WeightLoading/memoryMapped`` uses the safetensors files in place, so the weights do
+    /// not count toward the process's memory footprint.
+    public var weightLoading: WeightLoading = .copy
+
     /// Components to never load, such as ``ModelComponent/vision`` for text-only use.
     ///
     /// Their weights are never read, and inputs that need them fail. You do not need this to
@@ -217,6 +223,7 @@ public struct ModelConfiguration: Sendable {
             reasoningConfig: reasoningConfig,
             messageGenerator: messageGenerator,
             weightFileSelection: weightFileSelection,
+            weightLoading: weightLoading,
             excludedComponents: excludedComponents,
             tensorParallelGroup: tensorParallelGroup)
     }
@@ -237,6 +244,7 @@ extension ModelConfiguration: Equatable {
             && lhs.toolCallFormat == rhs.toolCallFormat
             && lhs.reasoningConfig == rhs.reasoningConfig
             && lhs.weightFileSelection == rhs.weightFileSelection
+            && lhs.weightLoading == rhs.weightLoading
             && lhs.excludedComponents == rhs.excludedComponents
             && lhs.tensorParallelGroup === rhs.tensorParallelGroup
             && sameMessageGenerator(lhs.messageGenerator, rhs.messageGenerator)

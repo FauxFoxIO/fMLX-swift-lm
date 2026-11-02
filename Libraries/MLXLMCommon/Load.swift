@@ -216,10 +216,15 @@ func loadModelCheckpoint(urls: [URL], excludedNamespaces: [String] = []) throws
 /// Only tensors whose names pass `isRead` are read. With `materialize` false the arrays stay
 /// lazy, so a tensor-parallel rank can slice them before any bytes are read.
 func loadModelCheckpoint(
-    urls: [URL], materialize: Bool = true, isRead: @escaping @Sendable (String) -> Bool
+    urls: [URL], materialize: Bool = true, weightLoading: WeightLoading = .copy,
+    isRead: @escaping @Sendable (String) -> Bool
 ) throws
     -> ModelCheckpoint
 {
+    if weightLoading == .memoryMapped {
+        return try loadMappedModelCheckpoint(urls: urls, isRead: isRead)
+    }
+
     struct WorkItem {
         let file: Int
         let url: URL
@@ -287,6 +292,23 @@ func loadModelCheckpoint(
         }
     }
     return try state.result()
+}
+
+/// Map every file in `urls` and use the tensors in place; see ``WeightLoading/memoryMapped``.
+/// Nothing is read here, so there is nothing to spread across threads.
+func loadMappedModelCheckpoint(urls: [URL], isRead: @escaping @Sendable (String) -> Bool)
+    throws -> ModelCheckpoint
+{
+    var weights = [String: MLXArray]()
+    var weightMetadata = [String: [String: String]]()
+    var metadata = [String: String]()
+    for url in urls {
+        let file = try loadMappedSafetensors(url: url, isRead: isRead)
+        weights.merge(file.arrays) { _, new in new }
+        for name in file.arrays.keys { weightMetadata[name] = file.metadata }
+        if metadata.isEmpty { metadata = file.metadata }
+    }
+    return ModelCheckpoint(weights: weights, metadata: metadata, weightMetadata: weightMetadata)
 }
 
 private struct SafetensorsIndex: Decodable {
@@ -516,7 +538,8 @@ package func loadWeights(
     weightFileSelection: WeightFileSelection = .automatic,
     excludedComponents: Set<ModelComponent> = [],
     componentLoading: ComponentLoading = .onFirstUse,
-    tensorParallelGroup: MLXDistributed.Group? = nil
+    tensorParallelGroup: MLXDistributed.Group? = nil,
+    weightLoading: WeightLoading = .copy
 ) throws {
     // a group of one runs the unsharded model
     let shardingGroup = tensorParallelGroup.flatMap { $0.size > 1 ? $0 : nil }
@@ -550,11 +573,12 @@ package func loadWeights(
     let excludedNamespaces =
         try prepareComponents(
             of: model, urls: weightURLs, excluded: excludedComponents,
-            loading: componentLoading, perLayerQuantization: perLayerQuantization)
+            loading: componentLoading, perLayerQuantization: perLayerQuantization,
+            weightLoading: weightLoading)
         + model.excludedCheckpointNamespaces
     let exclusions = CheckpointNameMapping(excludedNamespaces.map { .excludePrefix($0) })
     var checkpoint = try loadModelCheckpoint(
-        urls: weightURLs, materialize: shardingGroup == nil
+        urls: weightURLs, materialize: shardingGroup == nil, weightLoading: weightLoading
     ) {
         [effectiveTensorNameSelection] name in
         exclusions.mapName(name) != nil && effectiveTensorNameSelection.contains(name)
@@ -655,7 +679,8 @@ package func loadWeights(
     weightFileSelection: WeightFileSelection = .automatic,
     excludedComponents: Set<ModelComponent> = [],
     componentLoading: ComponentLoading = .onFirstUse,
-    tensorParallelGroup: MLXDistributed.Group? = nil
+    tensorParallelGroup: MLXDistributed.Group? = nil,
+    weightLoading: WeightLoading = .copy
 ) async throws {
     let model = SendableBox(model)
     try await withCheckedThrowingContinuation {
@@ -673,7 +698,8 @@ package func loadWeights(
                             weightFileSelection: weightFileSelection,
                             excludedComponents: excludedComponents,
                             componentLoading: componentLoading,
-                            tensorParallelGroup: tensorParallelGroup)
+                            tensorParallelGroup: tensorParallelGroup,
+                            weightLoading: weightLoading)
                     }
                 })
         }
