@@ -102,7 +102,7 @@ let package = Package(
         .executableTarget(
             name: "D1LFM3Tool",
             dependencies: [
-                "MLXDecision", .product(name: "MLX", package: "mlx-swift"),
+                "MLXDecision", "MLXLMCommon", .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
             ],
             path: "tools/D1LFM3Tool"

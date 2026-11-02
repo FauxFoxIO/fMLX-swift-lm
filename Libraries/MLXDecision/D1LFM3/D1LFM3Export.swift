@@ -2,6 +2,7 @@
 
 import Foundation
 import MLX
+import MLXLMCommon
 import MLXNN
 
 /// Writes MLX exports of an `lfm3_vl` d1 checkpoint: renamed and reshaped tensors in one
@@ -71,7 +72,7 @@ public enum D1LFM3Export {
 
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
         let weightsURL = output.appendingPathComponent("model.safetensors")
-        try save(arrays: result, metadata: ["format": "mlx"], url: weightsURL)
+        try saveSafetensorsForMapping(arrays: result, metadata: ["format": "mlx"], url: weightsURL)
         report.bytes =
             ((try? FileManager.default.attributesOfItem(atPath: weightsURL.path)[.size])
             as? NSNumber)?.int64Value ?? 0
@@ -166,8 +167,15 @@ extension D1LFM3Engine {
 
     /// Replaces linear layers in place: each path maps to a quantized layer or back to a float one.
     public func replaceLinear(_ layers: [String: Linear]) {
-        network.update(
-            modules: ModuleChildren.unflattened(layers.map { ($0.key, $0.value as Module) }))
+        let modules = Dictionary(uniqueKeysWithValues: network.namedModules())
+        for (path, layer) in layers {
+            guard let dot = path.lastIndex(of: "."), let parent = modules[String(path[..<dot])]
+            else { continue }
+            parent.update(
+                modules: ModuleChildren.unflattened([
+                    (String(path[path.index(after: dot)...]), layer)
+                ]))
+        }
     }
 
     /// The token embeddings' float weight, for quantization experiments.

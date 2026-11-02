@@ -41,10 +41,12 @@ public final class D1LFM3Model: Sendable {
 
     /// Loads an MLX export (or the merged checkpoint) from a local directory. `dtype` overrides the
     /// activation type; float16 matches the fp32 reference best.
-    public static func load(directory: URL, dtype: DType? = nil, vision: Bool = true) throws
-        -> D1LFM3Model
-    {
-        let engine = try D1LFM3Engine.load(directory: directory, dtype: dtype, vision: vision)
+    public static func load(
+        directory: URL, dtype: DType? = nil, vision: Bool = true,
+        weightLoading: WeightLoading = .memoryMapped
+    ) throws -> D1LFM3Model {
+        let engine = try D1LFM3Engine.load(
+            directory: directory, dtype: dtype, vision: vision, weightLoading: weightLoading)
         struct Calibration: Decodable { let `default`: Double? }
         let temperature =
             (try? Data(contentsOf: directory.appendingPathComponent("calibration.json")))

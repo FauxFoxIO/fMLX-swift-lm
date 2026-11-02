@@ -2,6 +2,7 @@
 
 import Foundation
 import MLX
+import MLXLMCommon
 import MLXNN
 
 /// One d1 row as the host renders it: token IDs, the state's length, each position's question
@@ -80,17 +81,27 @@ public final class D1LFM3Engine {
     public var readsImages: Bool { network.visionTower != nil }
 
     /// Loads an MLX export, or the merged PyTorch checkpoint, from a local directory.
-    /// `dtype` casts floating-point weights (default: the stored type).
-    public static func load(directory: URL, dtype: DType? = nil, vision: Bool = true) throws
-        -> D1LFM3Engine
-    {
+    /// `dtype` casts floating-point weights (default: the stored type). `.memoryMapped` uses the
+    /// file's pages in place: an export in its own dtype then stays file-backed, outside the
+    /// process's footprint.
+    public static func load(
+        directory: URL, dtype: DType? = nil, vision: Bool = true,
+        weightLoading: WeightLoading = .copy
+    ) throws -> D1LFM3Engine {
         let configuration = try D1LFM3Configuration.load(directory)
         let network = try D1LFM3Network(configuration, vision: vision)
-        var weights = D1LFM3Network.sanitize(
-            try DecisionWeights.load(DecisionWeights.files(in: directory)))
-        if !vision {
-            weights = weights.filter { $0.key.hasPrefix("language_model.") }
+        let files = try DecisionWeights.files(in: directory)
+        let wanted = { (name: String) in vision || name.contains("language_model.") }
+        var raw = [String: MLXArray]()
+        switch weightLoading {
+        case .copy:
+            raw = try DecisionWeights.load(files).filter { wanted($0.key) }
+        case .memoryMapped:
+            for file in files {
+                raw.merge(try loadMappedSafetensors(url: file, isRead: wanted).arrays) { a, _ in a }
+            }
         }
+        let weights = D1LFM3Network.sanitize(raw)
         let stored = weights["language_model.embedding_norm.weight"]?.dtype ?? .bfloat16
         let target = dtype ?? stored
         try apply(weights, to: network, quantization: configuration.quantization, dtype: target)

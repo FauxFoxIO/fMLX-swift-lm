@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXDecision
+import MLXLMCommon
 import MLXNN
 
 /// `sensitivity --model DIR --data DIR --out FILE.json [--bits 4] [--group 64] [--imatrix FILE]
@@ -10,7 +11,8 @@ import MLXNN
 /// option distributions move from the float model on the set.
 func sensitivity(_ arguments: Arguments) throws {
     let engine = try D1LFM3Engine.load(
-        directory: try arguments.url("model"), dtype: arguments.dtype)
+        directory: try arguments.url("model"), dtype: arguments.dtype,
+        weightLoading: arguments.weightLoading)
     var set = try EvalSet(try arguments.url("data"))
     var items = set.items
     if let limit = arguments.int("limit") { items = Array(items.prefix(limit)) }

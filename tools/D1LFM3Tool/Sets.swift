@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXDecision
+import MLXLMCommon
 
 /// Sequences exported by `export_sets.py`: safetensors shards plus `index.json`.
 struct EvalSet {
@@ -91,7 +92,8 @@ struct Record: Encodable {
 func runSet(_ arguments: Arguments) throws {
     let start = DispatchTime.now().uptimeNanoseconds
     let engine = try D1LFM3Engine.load(
-        directory: try arguments.url("model"), dtype: arguments.dtype)
+        directory: try arguments.url("model"), dtype: arguments.dtype,
+        weightLoading: arguments.weightLoading)
     log(
         "loaded \(engine.directory.lastPathComponent) dtype \(engine.dtype) in \(Int(milliseconds(since: start))) ms"
     )

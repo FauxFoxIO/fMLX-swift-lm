@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXDecision
+import MLXLMCommon
 
 /// `convert --checkpoint DIR --out DIR [--dtype bf16|fp16] [--recipe FILE.json] [--imatrix FILE]
 /// [--text-only]`
@@ -37,7 +38,8 @@ func convert(_ arguments: Arguments) throws {
 /// linear layer over the set's sequences.
 func collectImportance(_ arguments: Arguments) throws {
     let engine = try D1LFM3Engine.load(
-        directory: try arguments.url("model"), dtype: arguments.dtype)
+        directory: try arguments.url("model"), dtype: arguments.dtype,
+        weightLoading: arguments.weightLoading)
     var set = try EvalSet(try arguments.url("data"))
     var items = set.items
     if let limit = arguments.int("limit") { items = Array(items.prefix(limit)) }

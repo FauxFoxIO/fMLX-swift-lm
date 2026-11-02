@@ -4,6 +4,7 @@
 import Foundation
 import MLX
 import MLXDecision
+import MLXLMCommon
 
 struct Arguments {
     var positional = [String]()
@@ -35,6 +36,8 @@ struct Arguments {
     }
 
     func int(_ name: String) -> Int? { options[name].flatMap(Int.init) }
+
+    var weightLoading: WeightLoading { flags.contains("mapped") ? .memoryMapped : .copy }
 
     var dtype: DType? {
         switch options["dtype"] {

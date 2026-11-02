@@ -4,6 +4,7 @@ import Darwin
 import Foundation
 import MLX
 import MLXDecision
+import MLXLMCommon
 
 func footprint() -> (current: Double, peak: Double) {
     var info = rusage_info_v6()
@@ -44,7 +45,8 @@ func bench(_ arguments: Arguments) throws {
     guard let screenshot, let text else { throw ToolError("the set has no suitable sequences") }
     let loadStart = DispatchTime.now().uptimeNanoseconds
     let engine = try D1LFM3Engine.load(
-        directory: try arguments.url("model"), dtype: arguments.dtype)
+        directory: try arguments.url("model"), dtype: arguments.dtype,
+        weightLoading: arguments.weightLoading)
     let loadMs = milliseconds(since: loadStart)
     let loaded = footprint()
 
