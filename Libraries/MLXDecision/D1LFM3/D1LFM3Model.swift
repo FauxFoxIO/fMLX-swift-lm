@@ -114,6 +114,30 @@ public final class D1LFM3Model: Sendable {
         }
     }
 
+    /// Whether calls can run after a ``D1LFM3PrefixCache`` (the export reads `.causalState` attention).
+    public func cachesPrefixes() async -> Bool {
+        await state.read { $0.stateAttention == .causalState }
+    }
+
+    /// ``optionLogits(_:images:readout:)`` for `sequence`'s tokens after `cache` (`.causalState` only):
+    /// `sequence` holds only the new tokens, its slots index into them, and its state count is its own.
+    public func optionLogits(
+        _ sequence: D1LFM3Sequence, after cache: D1LFM3PrefixCache, readout: [[[Int32]]]
+    ) async throws -> [[Float]] {
+        guard readout.count == sequence.slots.count else {
+            throw DecisionError.invalidInput("one readout table per answer slot is required")
+        }
+        return try await state.read { engine in
+            let hidden = try withError {
+                let (hidden, _) = try engine.hidden(sequence, after: cache)
+                eval(hidden)
+                guard isFinite(hidden).all().item(Bool.self) else { throw DecisionError.nonFiniteOutput }
+                return hidden
+            }
+            return try Self.logits(engine, hidden, readout)
+        }
+    }
+
     /// Option logits per slot: for slot k, `readout[k][option]` lists the option's token forms, and an
     /// option scores the best of `hidden · embedding[form]`. Divide by ``temperature`` for the softmax.
     public func optionLogits(
@@ -123,23 +147,28 @@ public final class D1LFM3Model: Sendable {
             throw DecisionError.invalidInput("one readout table per answer slot is required")
         }
         return try await state.read { engine in
-            let hidden = try Self.run(engine, sequence, images)
-            var results = [[Float]]()
-            for (k, options) in readout.enumerated() {
-                let tokens = options.flatMap { $0 }
-                let scores = try withError {
-                    engine.scores(hidden[k ..< k + 1], tokens: tokens)[0].asArray(Float.self)
-                }
-                var start = 0
-                results.append(
-                    options.map { forms in
-                        defer { start += forms.count }
-                        return forms.isEmpty
-                            ? -.infinity : scores[start ..< start + forms.count].max()!
-                    })
-            }
-            return results
+            try Self.logits(engine, Self.run(engine, sequence, images), readout)
         }
+    }
+
+    private static func logits(_ engine: D1LFM3Engine, _ hidden: MLXArray, _ readout: [[[Int32]]])
+        throws -> [[Float]]
+    {
+        var results = [[Float]]()
+        for (k, options) in readout.enumerated() {
+            let tokens = options.flatMap { $0 }
+            let scores = try withError {
+                engine.scores(hidden[k ..< k + 1], tokens: tokens)[0].asArray(Float.self)
+            }
+            var start = 0
+            results.append(
+                options.map { forms in
+                    defer { start += forms.count }
+                    return forms.isEmpty
+                        ? -.infinity : scores[start ..< start + forms.count].max()!
+                })
+        }
+        return results
     }
 
     /// MLX reports failures (a Metal command-buffer timeout under GPU contention, say) through a
